@@ -627,7 +627,15 @@ jobs:
           # $INSTDIR (same list as installer/rsh.nsi's RSH_File
           # calls; makensis fails closed if a file is missing).
           $installedKb = [int]((Get-ChildItem target/release/rsh-daemon.exe, target/release/rsh-ui.exe, src-tauri/binaries/RshCoreHiDcr-x86_64-pc-windows-msvc.exe, src-tauri/binaries/HIDMaestro.Core.dll, tools/rsh-hm-sidecar/HIDMaestro-LICENSE.txt, firmware/.pio/build/esp32dev/firmware-signed.bin -File | Measure-Object Length -Sum).Sum / 1KB)
-          makensis -DESTIMATEDSIZEKB=$installedKb installer\rsh.nsi
+          # Run 45775988045: the bare -DESTIMATEDSIZEKB=$installedKb
+          # reached makensis as the literal "$installedKb" (NSIS
+          # warning 6000, EstimatedSize written as 0) — pass it as a
+          # double-quoted string, which expands (proven by the CI
+          # gate's git fetch "refs/tags/$tag" in this workflow).
+          # Fail closed on a non-positive value so a bad size can
+          # never silently ship again.
+          if (-not $installedKb -or $installedKb -le 0) { Write-Error "EstimatedSize computation produced '$installedKb' — failing closed."; exit 1 }
+          makensis "-DESTIMATEDSIZEKB=$installedKb" installer\rsh.nsi
           Get-ChildItem release-staging -File | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) B)" }
 
       # ---- Stage firmware assets (after the NSIS build) ----
