@@ -131,9 +131,12 @@ export component SteeringPage inherits HorizontalLayout {
                         accessible-label: "Reset to defaults";
                         accessible-role: button;
                         // FIX-4: keyboard activation for this text link.
+                        // P2-5: the FocusScope + TouchArea extend 4px
+                        // above/below the text (see "Open diagnostics").
                         fs := FocusScope {
+                            y: -4px;
                             width: 100%;
-                            height: 100%;
+                            height: parent.height + 8px;
                             key-pressed(event) => {
                                 if (event.text == Key.Return || event.text == Key.Space) {
                                     reset-defaults();
@@ -142,7 +145,19 @@ export component SteeringPage inherits HorizontalLayout {
                                 return reject;
                             }
                         }
-                        reset-ta := TouchArea { mouse-cursor: pointer; clicked => { reset-defaults(); } }
+                        // P1-4: visible focus ring — the colour change
+                        // alone is too subtle to show Tab focus (About
+                        // link pattern).
+                        if fs.has-focus : Rectangle {
+                            x: -6px;
+                            y: -3px;
+                            width: parent.width + 12px;
+                            height: parent.height + 6px;
+                            border-radius: 6px;
+                            border-width: 2px;
+                            border-color: Theme.accent-text;
+                        }
+                        reset-ta := TouchArea { y: -4px; width: 100%; height: parent.height + 8px; mouse-cursor: pointer; clicked => { reset-defaults(); } }
                     }
                     if unsaved : Text { text: "Unsaved changes"; font-size: Theme.fs-hint; color: Theme.warn; }
                 }

@@ -17,7 +17,7 @@
 import "../assets/Inter.ttf";
 import "../assets/JetBrainsMono.ttf";
 import { Theme } from "tokens.slint";
-import { SegmentedControl, ProfileButton, AutoProfileChip, Btn } from "components.slint";
+import { SegmentedControl, ProfileButton, AutoProfileChip, Btn, Modal } from "components.slint";
 import { Sidebar, AboutPage } from "shell.slint";
 import { OverviewPage, GameItem } from "screens/overview.slint";
 import { SteeringPage } from "screens/steering.slint";
@@ -67,11 +67,12 @@ export component MainWindow inherits Window {
     default-font-size: Theme.fs-label;
 
     in-out property <int> page: 0; // 0 Overview, 1 Steering, 2 Pedals, 3 Buttons, 4 Extras, 5 Settings, 6 About
-    // D4: page-switch fade — dips to 0.3 on every `page` change and
+    // D4: page-switch fade — dips to 0.7 on every `page` change and
     // the timer below restores it to 1; the content column animates
-    // its opacity over 150ms both ways.
+    // its opacity over 150ms both ways. (P3-9: the old 0.3 dip was
+    // a near-flash to almost-invisible on every tab switch.)
     property <float> page-opacity: 1;
-    changed page => { page-opacity = 0.3; }
+    changed page => { page-opacity = 0.7; }
     in-out property <bool> send-to-game: true;
     in-out property <bool> advanced: false;
     in-out property <bool> unsaved: false;
@@ -114,6 +115,11 @@ export component MainWindow inherits Window {
     // 1 Hz frame timer clears them); an empty label renders "Working…".
     in property <bool> busy: false;
     in property <string> busy-label: "";
+    // P1-6: elapsed time on the running job ("0:07", "1:23") —
+    // Rust writes it from the 1 Hz tick; empty while idle. Shown
+    // next to the busy label in the StatusBar so a long backend
+    // switch (UAC + service start) reads as progress, not a hang.
+    in property <string> busy-elapsed: "";
     // DS-54: which job kind the strip shows, as a JobKind::order
     // value (-1 = idle) — screens disable + dim the button that
     // started it while its job runs.
@@ -385,6 +391,11 @@ export component MainWindow inherits Window {
     in-out property <string> game-dialog-name: "";
     in-out property <string> game-dialog-exe: "";
     in property <string> game-dialog-profile-name: "No profile";
+    // P2-9: the bound profile's 1-based position and the total
+    // profile count (0 = no profile bound) — Rust drives these so
+    // the dialog can show "Profile: X (2 of 5)".
+    in property <int> game-dialog-profile-index: 0;
+    in property <int> game-dialog-profile-count: 0;
     // P1-7: the last game-dialog save error, shown inline in the
     // dialog ("" = none) — set from Rust on a failed save, cleared
     // when the dialog opens or a new save starts.
@@ -801,6 +812,9 @@ export component MainWindow inherits Window {
                         }
                         // DS-54: Save runs a ProfileOp job (8) — it
                         // disables + dims while the save is in flight.
+                        // P2-12: the reason sits next to it ("Saving…")
+                        // instead of a silently dead button.
+                        if busy-kind == 8 : Text { vertical-alignment: center; text: "Saving…"; font-size: Theme.fs-hint; color: Theme.mute; }
                         Btn { label: "Save"; primary: true; icon: @image-url("../assets/icons/save.svg"); has-icon: true; disabled: busy-kind == 8; clicked => { save-profile(); } }
                     }
                     BellButton {
@@ -898,6 +912,8 @@ export component MainWindow inherits Window {
             }
             if page == 2 : PedalsPage {
                 busy-kind: busy-kind;
+                // P2-11: the "Unsaved changes" line, like Steering.
+                unsaved: unsaved;
                 // Live values come from the window (Rust drives them);
                 // mV / feel / deadzone / curves come from get_tuning
                 // via the window props below — never literals (A1/A2).
@@ -992,6 +1008,8 @@ export component MainWindow inherits Window {
             }
             if page == 3 : ButtonsPage {
                 busy-kind: busy-kind;
+                // P2-11: the "Unsaved changes" line, like Steering.
+                unsaved: unsaved;
                 button-actions: button-actions;
                 pressed-index: pressed-index;
                 selected-index: selected-index;
@@ -1045,6 +1063,8 @@ export component MainWindow inherits Window {
             }
             if page == 4 : ExtrasScreen {
                 busy-kind: busy-kind;
+                // P2-11: the "Unsaved changes" line, like Steering.
+                unsaved: unsaved;
                 handbrake-pct: handbrake;
                 handbrake-up-mv: handbrake-up-mv;
                 handbrake-down-mv: handbrake-down-mv;
@@ -1190,6 +1210,9 @@ export component MainWindow inherits Window {
     // (setup-step) so Rust drives Back/Next; the wizard itself only
     // reads it. The notifications drawer below still overlays it.
     if setup-mode : SetupWizard {
+        // P1-2: full-window width too — the wizard used to pin
+        // itself to the 920 px design width (see setup.slint).
+        width: parent.width;
         // R2-12 (c): no 40px height reservation any more (see the
         // shell layout above) — the wizard is always full-height and
         // the status bar sits over the right column's 40px bottom
@@ -1258,6 +1281,8 @@ export component MainWindow inherits Window {
     if popover-open : ProfilePopover {
         x: parent.width - 320px;
         y: 64px;
+        // P2-3: the height cap (64px top offset + 12px margin).
+        height-cap: parent.height - 76px;
         busy-kind: busy-kind;
         presets: popover-presets;
         profiles: popover-profiles;
@@ -1291,6 +1316,10 @@ export component MainWindow inherits Window {
         name <=> game-dialog-name;
         exe <=> game-dialog-exe;
         profile-name: game-dialog-profile-name;
+        // P2-9: the bound profile's 1-based position + total count
+        // (0 = no profile bound) — shown as "Profile: X (2 of 5)".
+        profile-index: game-dialog-profile-index;
+        profile-count: game-dialog-profile-count;
         // P1-7 / P2-4: the save error + the running job kind.
         error-text: game-dialog-error;
         busy-kind: busy-kind;
@@ -1300,66 +1329,37 @@ export component MainWindow inherits Window {
         cycle-profile => { game-dialog-cycle-profile(); }
     }
     // D17: small confirm dialog for destructive actions (delete
-    // profile, remove game) — 360 px card, GameDialog pattern:
-    // backdrop + click-away closes it, Esc closes it (keyboard
-    // worker), Yes runs the pending action, No cancels. No
-    // destructive action runs without this confirm any more.
-    if confirm-open : Rectangle {
-        x: 0px; y: 0px; width: parent.width; height: parent.height;
-        background: #000000; opacity: 0.35;
-        TouchArea { width: parent.width; height: parent.height; clicked => { confirm-no(); } }
-    }
-    if confirm-open : Rectangle {
-        x: parent.width - 380px;
-        y: 64px;
-        width: 360px;
-        // B5 (PC-test Bug 5): an explicit content height — a
-        // height-less Rectangle parented by the window stretches
-        // to the window height (gate-measured 580 px), so the
-        // confirm used to render as a full-height panel. The
-        // layout's preferred height is content-driven (fixed
-        // 360 px width), so binding to it sizes the card to its
-        // content. (Binding to layout.height is a loop: a layout
-        // fills its parent, so layout.height IS the card height.)
-        height: confirm-layout.preferred-height;
-        border-radius: 14px;
-        border-width: 1px;
-        border-color: Theme.line;
-        background: Theme.panel;
-        // D5: overlay depth — blur 24, y 8, 25% black.
-        drop-shadow-blur: Theme.shadow-blur;
-        drop-shadow-offset-y: Theme.shadow-offset-y;
-        drop-shadow-color: Theme.shadow-color;
-        // P2-5: a blocking TouchArea over the whole card, FIRST so
-        // the content paints above it — clicks on card background
-        // stop here instead of falling through to the backdrop
-        // TouchArea above (which cancelled the confirm). Same
-        // pattern as the Modal card (P1-2).
-        TouchArea { width: 100%; height: 100%; }
-        confirm-layout := VerticalLayout {
-            padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 12px;
-            spacing: 10px;
-            Text { text: confirm-title; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; wrap: word-wrap; }
-            Text { text: confirm-text; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
-            HorizontalLayout { cross-axis-alignment: center;
-                spacing: 6px;
-                Btn { label: confirm-confirm-label; destructive: true; clicked => { confirm-yes(); } }
-                Btn { label: "Cancel"; clicked => { confirm-no(); } }
-            }
+    // profile, remove game) — P2-4: the shared centred Modal
+    // (420 px card, 0.4 scrim, blocking TouchArea, Esc owned by
+    // the root keyboard scope), replacing the hand-rolled
+    // top-right card + separate 0.35 backdrop. Cancel first,
+    // destructive action last — Cancel is then the first Tab stop.
+    if confirm-open : Modal {
+        width: parent.width;
+        height: parent.height;
+        title: confirm-title;
+        closed => { confirm-no(); }
+        Text { text: confirm-text; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
+        HorizontalLayout { cross-axis-alignment: center;
+            spacing: 6px;
+            Btn { label: "Cancel"; clicked => { confirm-no(); } }
+            Btn { label: confirm-confirm-label; destructive: true; clicked => { confirm-yes(); } }
         }
     }
     // Phase 2 (F-2 / U-1): backdrop + click-away for the
-    // notifications drawer.
+    // notifications drawer. (P3-5: 0.4 scrim, like Modal.)
     if notif-open : Rectangle {
         x: 0px; y: 0px; width: parent.width; height: parent.height;
-        background: #000000; opacity: 0.35;
+        background: #000000; opacity: 0.4;
         TouchArea { width: parent.width; height: parent.height; clicked => { notif-close(); } }
     }
     // Notification drawer overlay (right edge, above the page).
     // Esc is owned by the keyboard worker (clears `notif-open`).
     if notif-open : NotificationsDrawer {
-        x: parent.width - 356px;
+        x: parent.width - 372px;
         y: 64px;
+        // P2-2: the height cap (64px top offset + 40px StatusBar).
+        height-cap: parent.height - 104px;
         items: notifications;
         unread: notif-unread;
         close-requested => { notif-close(); }
@@ -1367,10 +1367,10 @@ export component MainWindow inherits Window {
         clear-all => { notif-clear(); }
     }
     // Phase 2 (F-2 / U-1): backdrop + click-away for the
-    // diagnostics drawer.
+    // diagnostics drawer. (P3-5: 0.4 scrim, like Modal.)
     if diag-open : Rectangle {
         x: 0px; y: 0px; width: parent.width; height: parent.height;
-        background: #000000; opacity: 0.35;
+        background: #000000; opacity: 0.4;
         TouchArea { width: parent.width; height: parent.height; clicked => { diag-open = false; } }
     }
     // Diagnostics drawer overlay (v2.0.1 hotfix): right edge, above
@@ -1476,18 +1476,22 @@ export component MainWindow inherits Window {
                     background: Theme.accent;
                 }
             }
-            if busy && status-kind != "" : Text {
-                vertical-alignment: center;
-                text: busy-label == "" ? "Working…" : busy-label;
-                font-size: Theme.fs-hint;
-                color: Theme.mute;
-            }
-            if busy && status-kind == "" : Text {
+            // P3-8: one busy label (fs-label, weight 600) — the old
+            // two (fs-hint/mute when a status also showed,
+            // fs-label/600 otherwise) changed size with the status.
+            // The elapsed time after it is the P1-6 job clock.
+            if busy : Text {
                 vertical-alignment: center;
                 text: busy-label == "" ? "Working…" : busy-label;
                 font-size: Theme.fs-label;
                 font-weight: 600;
                 color: Theme.text;
+            }
+            if busy && busy-elapsed != "" : Text {
+                vertical-alignment: center;
+                text: busy-elapsed;
+                font-size: Theme.fs-label;
+                color: Theme.mute;
             }
             // D12: the error mark is an SVG, not the "!" text glyph.
             if status-kind == "error" : Image { width: 16px; height: 16px; source: @image-url("../assets/icons/alert-triangle.svg"); colorize: Theme.bad; }

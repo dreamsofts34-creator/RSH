@@ -911,20 +911,38 @@ impl IpcApi {
 
     /// Build the [`UserError`] for a failed session `connect`
     /// (F26): the daemon's `IpcError::Api` payload carries its
-    /// `UserError` code first (`"{code}: {message}"` — see
-    /// `IpcClient::call_once`), so a no-board `Unreachable` comes
-    /// back typed instead of collapsing into `TransportClosed`
-    /// (which used to notify "Reconnect failed" on every no-board
-    /// (re)connect). The code is the text before the first `:` —
-    /// the real server sends `"{code}: daemon API error: {code}"`
-    /// and the fake daemon an empty message (`"{code}: "`), and
-    /// both must parse. An unrecognised payload is still the
-    /// generic link failure — only the daemon's own typed reason
-    /// is preserved, nothing is invented.
+    /// `UserError` code first. Since CORE-2 the dispatch payload is
+    /// the detailed `"{code}|{detail}"` shape (`detailed_api_error`),
+    /// and the client re-wraps it as `"{code}: daemon API error:
+    /// {payload}"` — so the real payload reaching the UI is
+    /// `"Unreachable|<detail>: daemon API error:
+    /// Unreachable|<detail>"`. Parse it like the other detailed
+    /// parsers (`game_call_error`, `capture_code_detail`): strip
+    /// the client double-wrap (the LAST half is the complete one),
+    /// then split on `|` first — NEVER on `:` (the old
+    /// `split(':')` yielded `"Unreachable|no board …"` as the
+    /// "code", `from_code` returned `None`, and every no-board
+    /// connect collapsed into `TransportClosed` / "daemon IPC link
+    /// failed" instead of "Wheel not found"). The old
+    /// `"{code}: {reason}"` shape is the fallback split. An
+    /// unrecognised code is still the generic link failure — only
+    /// the daemon's own typed reason is preserved, nothing is
+    /// invented.
     fn daemon_connect_error(payload: &str) -> UserError {
-        let code = payload.split(':').next().unwrap_or(payload).trim();
+        let tail = payload
+            .rsplit_once(": daemon API error: ")
+            .map_or(payload, |(_, tail)| tail);
+        let (code, detail) = tail
+            .split_once('|')
+            .or_else(|| tail.split_once(": "))
+            .map_or((tail.trim(), ""), |(code, detail)| {
+                (code.trim(), detail.trim())
+            });
         match ConnectionError::from_code(code) {
-            Some(error) => UserError::from_connection(error, payload.to_string()),
+            Some(error) => UserError::from_connection(
+                error,
+                if detail.is_empty() { code } else { detail },
+            ),
             None => Self::ipc_failed(),
         }
     }
@@ -1579,12 +1597,25 @@ impl AppApi for IpcApi {
     }
 
     fn set_output_enabled(&self, enabled: bool) {
-        let _ = self.rt.block_on(self.call_async(
-            "set_output_enabled",
-            serde_json::json!({"enabled": enabled}),
-        ));
-        if let Ok(mut slot) = self.cache.output.lock() {
-            *slot = Some(enabled);
+        // CORE-P1-2 (frontend half): cache only the APPLIED value.
+        // The call can time out at 500 ms while the daemon keeps
+        // switching for up to minutes (the daemon-side bound is the
+        // backend team's arm) — caching the REQUESTED value on
+        // error showed ON until the next poll corrected it to OFF,
+        // then ON again when the switch landed: the toggle flickered
+        // and lied for the whole switch. On error the cache is left
+        // to the next fast poll (~50 ms), which reports the real flag.
+        let applied = self
+            .rt
+            .block_on(self.call_async(
+                "set_output_enabled",
+                serde_json::json!({"enabled": enabled}),
+            ))
+            .is_ok();
+        if applied {
+            if let Ok(mut slot) = self.cache.output.lock() {
+                *slot = Some(enabled);
+            }
         }
     }
 
@@ -2566,6 +2597,72 @@ impl AppApi for IpcApi {
 }
 
 impl IpcApi {
+    /// Cheap connection fingerprint for `push_frame`'s rest
+    /// pre-check (PERF P1-4): a 64-bit FNV-1a hash over everything
+    /// a frame reads from the connection — state variant + error
+    /// code + `retry_in_ms` / backoff wait + label + transport +
+    /// address + session flag + board-reachable latch + error +
+    /// hint + whether a connect started — computed under the cache
+    /// lock WITHOUT cloning the `String`s (`connection()` clones
+    /// three of them on every 50 ms tick). `0` = no cached
+    /// connection yet. A changed fingerprint means the connection
+    /// moved; an unchanged one means the frame's connection inputs
+    /// are identical — the pre-check may skip the frame. The hash
+    /// is a change detector, not an identity: a 64-bit collision
+    /// is the only miss, and a missed frame is re-caught by the
+    /// next moving input (the snapshot seq moves on every live
+    /// tick) or the 1 Hz safety re-sync.
+    pub fn connection_fingerprint(&self) -> u64 {
+        let Ok(slot) = self.cache.connection.lock() else {
+            return 0;
+        };
+        let Some(conn) = slot.as_ref() else {
+            return 0;
+        };
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |bytes: &[u8]| {
+            for byte in bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        match &conn.state {
+            ConnectionState::Idle => mix(b"Idle"),
+            ConnectionState::LinkUp => mix(b"LinkUp"),
+            ConnectionState::Hello => mix(b"Hello"),
+            ConnectionState::Active => mix(b"Active"),
+            ConnectionState::Error {
+                reason,
+                hint,
+                retry_in_ms,
+            } => {
+                mix(b"Error");
+                mix(reason.code().as_bytes());
+                mix(hint.as_bytes());
+                mix(&retry_in_ms.unwrap_or(u64::MAX).to_le_bytes());
+            }
+            ConnectionState::Backoff { wait_ms, attempt } => {
+                mix(b"Backoff");
+                mix(&wait_ms.to_le_bytes());
+                mix(&attempt.to_le_bytes());
+            }
+        }
+        mix(conn.label.as_bytes());
+        mix(conn.transport.as_str().as_bytes());
+        mix(conn.address.as_bytes());
+        mix(&[u8::from(conn.session_active), u8::from(conn.board_reachable)]);
+        match &conn.error {
+            Some(error) => mix(error.code().as_bytes()),
+            None => mix(b"no-error"),
+        }
+        match &conn.hint {
+            Some(hint) => mix(hint.as_bytes()),
+            None => mix(b"no-hint"),
+        }
+        mix(&[u8::from(conn.connect_started.is_some())]);
+        hash
+    }
+
     /// One capture round-trip: `{"mv": n}` out, or the daemon's
     /// reason as the [`UserError`] title (see
     /// [`capture_code_detail`]).
@@ -2610,12 +2707,28 @@ impl IpcApi {
     /// keeps its code + reason; anything else (link down, timeout,
     /// protocol) is the generic link failure. The UI's
     /// `notify_error` maps known codes to a plain title + next step.
+    ///
+    /// CORE-P1-4: the client re-wraps the payload as `"{code}:
+    /// daemon API error: {code}|{detail}"`, so the raw payload
+    /// repeats the detail inside IPC framing — splitting it on
+    /// `|` directly used to show `"<detail>: daemon API error:
+    /// Unknown|<detail>"` to the user. Strip the double-wrap
+    /// first (the LAST half is the complete payload, same tail
+    /// split as `game_call_error`), then split on `|`; the
+    /// fallback path uses the stripped tail too, never the wrapped
+    /// payload. A detail containing `": "` survives whole — the
+    /// split is on `|`, never on `": "`.
     fn api_error(error: &IpcError) -> UserError {
         if let IpcError::Api(payload) = error {
-            if let Some((code, detail)) = payload.split_once('|') {
+            let tail = payload
+                .rsplit(": daemon API error: ")
+                .next()
+                .unwrap_or(payload.as_str());
+            if let Some((code, detail)) = tail.split_once('|') {
+                let detail = detail.trim();
                 if !detail.is_empty() {
                     return UserError {
-                        code: code.to_string(),
+                        code: code.trim().to_string(),
                         title: detail.to_string(),
                         what_happened: detail.to_string(),
                         what_to_do: "Try again.".to_string(),
@@ -2623,7 +2736,15 @@ impl IpcApi {
                     };
                 }
             }
-            return UserError::from_connection(ConnectionError::Unknown, payload.clone());
+            // No `|` — a bare code or the old `"{code}: {reason}"`
+            // shape: the stripped tail is the message, never the
+            // wrapped payload. An empty tail carries nothing the
+            // user can act on — the generic link failure.
+            let tail = tail.trim();
+            if tail.is_empty() {
+                return Self::ipc_failed();
+            }
+            return UserError::from_connection(ConnectionError::Unknown, tail.to_string());
         }
         Self::ipc_failed()
     }
@@ -2760,11 +2881,17 @@ impl IpcApi {
     /// stays the generic link failure.
     fn game_write_error(error: &IpcError) -> UserError {
         if let IpcError::Api(payload) = error {
-            let head = payload
-                .split(": daemon API error: ")
+            // CORE-P1-3/P1-4 (polish round): the client rebuilds
+            // the error as `"{bare_code}: daemon API error:
+            // {code}|{reason}"` — the head before the separator
+            // is the bare code, only the TAIL carries the reason.
+            // A head-strip here used to lose it and collapse into
+            // the generic link failure.
+            let tail = payload
+                .rsplit(": daemon API error: ")
                 .next()
                 .unwrap_or(payload);
-            if let Some((code, reason)) = head.split_once('|') {
+            if let Some((code, reason)) = tail.split_once('|') {
                 if !reason.is_empty() {
                     return UserError {
                         code: code.to_string(),
@@ -2903,11 +3030,17 @@ impl IpcApi {
 fn capture_code_detail(error: &IpcError) -> (String, String) {
     const FALLBACK: &str = "RSH isn't running — reconnect to capture.";
     if let IpcError::Api(payload) = error {
-        let head = payload
-            .split(": daemon API error: ")
+        // CORE-P1-3/P1-4 (polish round): same tail-strip as
+        // `api_error` — the client rebuilds the error as
+        // `"{bare_code}: daemon API error: {code}|{detail}"`, so
+        // the head before the separator is the bare code and only
+        // the TAIL carries the detail. A head-strip here lost the
+        // reason and fell back to the reconnect text.
+        let tail = payload
+            .rsplit(": daemon API error: ")
             .next()
             .unwrap_or(payload);
-        if let Some((code, detail)) = head.split_once('|') {
+        if let Some((code, detail)) = tail.split_once('|') {
             if !detail.is_empty() {
                 return (code.to_string(), detail.to_string());
             }
@@ -3854,6 +3987,18 @@ mod tests {
             "the range reason must survive: {}",
             detail(&bad_range)
         );
+        // CORE-P1-3/P1-4 (polish round): the server now sends the
+        // bare code in the body's `code` field, so the client
+        // rebuilds `"{bare_code}: daemon API error:
+        // {code}|{detail}"` — the head before the separator is the
+        // bare code, only the TAIL carries the detail. A head-strip
+        // here used to lose the reason and fall back to the
+        // reconnect text (caught by
+        // `capture_round_trips_over_real_socket`).
+        let new_shape = IpcError::Api(
+            "UnknownPedal: daemon API error: UnknownPedal|unknown pedal 'gear'".to_string(),
+        );
+        assert_eq!(detail(&new_shape), "unknown pedal 'gear'");
         // A dead link (not a daemon error) is the reconnect reason,
         // never a silent empty string.
         assert_eq!(
@@ -3898,6 +4043,71 @@ mod tests {
             error.code, "TransportClosed",
             "an unrecognised daemon code stays the generic link failure"
         );
+    }
+
+    #[test]
+    fn daemon_connect_error_parses_code_detail_shape() {
+        // CORE-P1-3: the dispatch payload is now
+        // `"Unreachable|<detail>"` and the client re-wraps it, so
+        // the UI sees `"Unreachable|<detail>: daemon API error:
+        // Unreachable|<detail>"` — the code is before the `|`,
+        // never before the first `:`. A detail containing `": "`
+        // survives whole (the split is on `|`, not `":"`).
+        let error = IpcApi::daemon_connect_error(
+            "Unreachable|no board serial port detected: daemon API error: Unreachable|no board serial port detected",
+        );
+        assert_eq!(error.code, "Unreachable");
+        assert_eq!(error.title, "Wheel not found");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("no board serial port detected")
+        );
+        // A detail with its own ": " is not truncated at the colon.
+        let error = IpcApi::daemon_connect_error(
+            "Timeout|wheel did not answer: waited 3 s: daemon API error: Timeout|wheel did not answer: waited 3 s",
+        );
+        assert_eq!(error.code, "Timeout");
+        assert_eq!(error.title, "Wheel did not answer");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("wheel did not answer: waited 3 s")
+        );
+        // The bare detailed payload (no client wrap) parses too.
+        let error =
+            IpcApi::daemon_connect_error("Unreachable|no board found");
+        assert_eq!(error.code, "Unreachable");
+        assert_eq!(error.title, "Wheel not found");
+    }
+
+    #[test]
+    fn api_error_strips_client_double_wrap() {
+        // CORE-P1-4: the client wraps the payload as `"{code}:
+        // daemon API error: {code}|{detail}"` — the title must be
+        // the bare detail, with no IPC framing and no duplication,
+        // and a detail containing `": "` survives whole.
+        let error = IpcApi::api_error(&IpcError::Api(
+            "Unknown: daemon API error: Unknown|cannot save manual games: disk full".to_string(),
+        ));
+        assert_eq!(error.code, "Unknown");
+        assert_eq!(error.title, "cannot save manual games: disk full");
+        assert_eq!(error.what_happened, "cannot save manual games: disk full");
+        assert!(
+            !error.title.contains("daemon API error"),
+            "no IPC framing may reach the user"
+        );
+        // The old bare-code shape still parses, framing-free.
+        let error = IpcApi::api_error(&IpcError::Api(
+            "Unknown: daemon API error: Unknown".to_string(),
+        ));
+        assert_eq!(error.code, "Unknown");
+        assert_eq!(error.detail.as_deref(), Some("Unknown"));
+        assert!(
+            !error.detail.as_deref().unwrap_or("").contains("daemon API error"),
+            "the fallback must use the stripped tail, never the wrapped payload"
+        );
+        // A non-Api error stays the generic link failure.
+        let error = IpcApi::api_error(&IpcError::Closed);
+        assert_eq!(error.code, "TransportClosed");
     }
 
     #[test]
@@ -4009,6 +4219,28 @@ mod tests {
                 mapped.what_happened
             );
         }
+    }
+
+    /// CORE-P1-3/P1-4 (polish round): same new wire shape as the
+    /// capture parser — the client rebuilds `"{bare_code}: daemon
+    /// API error: {code}|{reason}"`, so the reason lives in the
+    /// tail, not the head. A head-strip here used to collapse the
+    /// real reason into the generic link failure.
+    #[test]
+    fn game_write_error_keeps_reason_in_new_wire_shape() {
+        let error = IpcError::Api(
+            "SaveFailed: daemon API error: SaveFailed|cannot save manual games: disk full"
+                .to_string(),
+        );
+        let mapped = IpcApi::game_write_error(&error);
+        assert_eq!(mapped.code, "SaveFailed");
+        assert!(
+            mapped
+                .what_happened
+                .contains("cannot save manual games: disk full"),
+            "the save reason must survive: {}",
+            mapped.what_happened
+        );
     }
 
     /// Minimal `AppApi` for the capture test: only the capture

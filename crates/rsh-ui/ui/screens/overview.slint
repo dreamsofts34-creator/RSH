@@ -67,7 +67,7 @@ export component OverviewPage inherits PageScaffold {
     // padding) — the games-grid gap below reads `scroll-width`
     // (the scaffold's parent-driven ScrollView width), never the
     // content's own width (binding loop — see the comment there).
-    if daemon-error != "" : EmptyBanner { text: daemon-error; action-label: "Reconnect"; action-icon: @image-url("../../assets/icons/refresh.svg"); action-has-icon: true; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
+    if daemon-error != "" : EmptyBanner { text: daemon-error; action-label: "Reconnect"; action-icon: @image-url("../../assets/icons/refresh.svg"); action-has-icon: true; is-error: true; action-disabled: busy-kind == 0; action-disabled-text: "Reconnecting…"; action-clicked => { reconnect(); } }
     if !daemon-live && daemon-error == "" : EmptyBanner { text: "Live data unavailable — RSH isn't running. Live data appears once it starts."; is-error: false; }
     // REDESIGN-PLAN §8.6 disconnected state: banner + Reconnect.
     // Phase 2 (Wi-Fi gap): while Unreachable, name the fix
@@ -81,8 +81,8 @@ export component OverviewPage inherits PageScaffold {
     // banner still grows for longer texts (daemon-error above) —
     // gate-measured — this only removes the wrap for the two texts
     // the user actually saw clip.
-    if daemon-live && !connected && unreachable : EmptyBanner { text: "Wheel not found — join the wheel's RSH-XXXX Wi-Fi network or plug in USB."; action-label: "Reconnect"; action-icon: @image-url("../../assets/icons/refresh.svg"); action-has-icon: true; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
-    if daemon-live && !connected && !unreachable : EmptyBanner { text: "Wheel not connected — check the wheel's Wi-Fi is joined or the USB cable is plugged in."; action-label: "Reconnect"; action-icon: @image-url("../../assets/icons/refresh.svg"); action-has-icon: true; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
+    if daemon-live && !connected && unreachable : EmptyBanner { text: "Wheel not found — join the wheel's RSH-XXXX Wi-Fi network or plug in USB."; action-label: "Reconnect"; action-icon: @image-url("../../assets/icons/refresh.svg"); action-has-icon: true; is-error: true; action-disabled: busy-kind == 0; action-disabled-text: "Reconnecting…"; action-clicked => { reconnect(); } }
+    if daemon-live && !connected && !unreachable : EmptyBanner { text: "Wheel not connected — check the wheel's Wi-Fi is joined or the USB cable is plugged in."; action-label: "Reconnect"; action-icon: @image-url("../../assets/icons/refresh.svg"); action-has-icon: true; is-error: true; action-disabled: busy-kind == 0; action-disabled-text: "Reconnecting…"; action-clicked => { reconnect(); } }
     Card {
         HorizontalLayout {
             // Phase 2 (F-16): spec card padding 14/16 (was 16/20).
@@ -148,6 +148,16 @@ export component OverviewPage inherits PageScaffold {
                                 return reject;
                             }
                         }
+                        // P1-4: visible 2px focus ring (Switch pattern).
+                        if prof-fs.has-focus : Rectangle {
+                            x: -3px;
+                            y: -3px;
+                            width: parent.width + 6px;
+                            height: parent.height + 6px;
+                            border-radius: 10px;
+                            border-width: 2px;
+                            border-color: Theme.accent-text;
+                        }
                         HorizontalLayout {
                             padding-left: 12px;
                             padding-right: 12px;
@@ -171,6 +181,9 @@ export component OverviewPage inherits PageScaffold {
                 Text { text: "Games"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                 Rectangle { horizontal-stretch: 1; }
                 Text { text: "Auto-switches profile."; font-size: Theme.fs-hint; color: Theme.mute; }
+                // P2-12: the reason sits next to the button instead
+                // of a silently dead one.
+                if busy-kind == 13 : Text { vertical-alignment: center; text: "Adding…"; font-size: Theme.fs-hint; color: Theme.mute; }
                 if games.length > 0 : Btn { label: "Add game"; icon: @image-url("../../assets/icons/plus.svg"); has-icon: true; disabled: busy-kind == 13; clicked => { add-game(); } }
             }
             // Manual games (no auto-scan): the empty state offers
@@ -183,6 +196,9 @@ export component OverviewPage inherits PageScaffold {
                 cross-axis-alignment: center;
                 Image { width: 32px; height: 32px; source: @image-url("../../assets/icons/grid.svg"); colorize: Theme.faint; }
                 Text { text: "No games added yet — add your first game."; font-size: Theme.fs-hint; color: Theme.faint; horizontal-alignment: center; wrap: word-wrap; }
+                // P2-12: the reason sits next to the button instead
+                // of a silently dead one.
+                if busy-kind == 13 : Text { vertical-alignment: center; text: "Adding…"; font-size: Theme.fs-hint; color: Theme.mute; }
                 Btn { label: "Add game"; icon: @image-url("../../assets/icons/plus.svg"); has-icon: true; disabled: busy-kind == 13; clicked => { add-game(); } }
             }
             // Phase 2 (F-8): two tiles per row, min 300 px each —
@@ -277,9 +293,14 @@ export component OverviewPage inherits PageScaffold {
                     accessible-label: "Open diagnostics";
                     accessible-role: button;
                     // FIX-4: keyboard activation for this text link.
+                    // P2-5: the FocusScope + TouchArea extend 4px
+                    // above/below the text (a 12px link is a 20px
+                    // target — still small, but no longer 1:1 with
+                    // the glyphs).
                     fs := FocusScope {
+                        y: -4px;
                         width: 100%;
-                        height: 100%;
+                        height: parent.height + 8px;
                         key-pressed(event) => {
                             if (event.text == Key.Return || event.text == Key.Space) {
                                 open-diagnostics();
@@ -288,7 +309,19 @@ export component OverviewPage inherits PageScaffold {
                             return reject;
                         }
                     }
-                    diag-ta := TouchArea { mouse-cursor: pointer; clicked => { open-diagnostics(); } }
+                    // P1-4: visible focus ring — the colour change
+                    // alone is too subtle to show Tab focus (About
+                    // link pattern).
+                    if fs.has-focus : Rectangle {
+                        x: -6px;
+                        y: -3px;
+                        width: parent.width + 12px;
+                        height: parent.height + 6px;
+                        border-radius: 6px;
+                        border-width: 2px;
+                        border-color: Theme.accent-text;
+                    }
+                    diag-ta := TouchArea { y: -4px; width: 100%; height: parent.height + 8px; mouse-cursor: pointer; clicked => { open-diagnostics(); } }
                 }
             }
         }

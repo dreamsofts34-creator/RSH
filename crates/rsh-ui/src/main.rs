@@ -338,12 +338,33 @@ pub fn chart_commands(samples: &VecDeque<f32>, min_v: f32, max_v: f32) -> String
     }
     let n = samples.len();
     let span = (max_v - min_v).max(f32::EPSILON);
-    let mut out = String::new();
+    // PERF P2-4: decimate to ≤101 plotted points — the chart is a
+    // 380 px viewBox, so 100 points is one per 3.8 px (visually
+    // identical to 200) and halves the formatting work per rebuild
+    // (2 Hz while Diagnostics is open). The last sample is always
+    // plotted so the trace reaches the right edge. A version-keyed
+    // cache was considered and REJECTED: the history moves every
+    // live frame, so a push-count version never hits at the 2 Hz
+    // build, and a (len, first, last) probe is unsound — a push+pop
+    // with repeated values changes the interior while first/last/
+    // len stay the same. Incremental append is likewise invalid:
+    // x = i/(n-1)*380 shifts every surviving point when the window
+    // slides, so old points do NOT re-format identically.
+    let stride = n.div_ceil(100).max(1);
+    let mut vals = [0.0f32; 101];
+    let mut m = 0usize;
     for (i, v) in samples.iter().enumerate() {
-        let x = i as f32 / (n - 1) as f32 * 380.0;
+        if i % stride == 0 || i + 1 == n {
+            vals[m] = *v;
+            m += 1;
+        }
+    }
+    let mut out = String::new();
+    for (j, v) in vals[..m].iter().enumerate() {
+        let x = j as f32 / (m - 1) as f32 * 380.0;
         // y spans 85 (min) .. 5 (max) inside the 90px viewBox.
         let y = 85.0 - (v.clamp(min_v, max_v) - min_v) / span * 80.0;
-        if i == 0 {
+        if j == 0 {
             let _ = write!(out, "M {x:.1} {y:.1}");
         } else {
             let _ = write!(out, " L {x:.1} {y:.1}");
@@ -1260,17 +1281,20 @@ fn set_extras_on_prop(win: &MainWindow, index: usize, value: bool) {
 /// stderr — the Xvfb smoke run reads the busy on/off off the log.
 /// `kind` is the [`JobKind::order`] value for the running job
 /// (DS-54: `-1` = idle) — screens disable + dim the button that
-/// started it while it runs.
-fn set_busy_props(win: &MainWindow, busy: bool, label: &str, kind: i32) {
+/// started it while it runs. `elapsed` is the Backend switch's
+/// `m:ss` wait (P1-6, "" otherwise).
+fn set_busy_props(win: &MainWindow, busy: bool, label: &str, kind: i32, elapsed: &str) {
     if win.get_busy() == busy
         && win.get_busy_label().as_str() == label
         && win.get_busy_kind() == kind
+        && win.get_busy_elapsed().as_str() == elapsed
     {
         return;
     }
     win.set_busy(busy);
     win.set_busy_label(label.into());
     win.set_busy_kind(kind);
+    win.set_busy_elapsed(elapsed.into());
     if busy {
         ui_log!("RSH-UI busy: {label}");
     } else {
@@ -2181,6 +2205,23 @@ struct Ctx {
     /// Slint crossings + 4 history pushes + chart formatting.
     /// `None` = no frame has run yet (the first frame always runs).
     last_frame: Rc<RefCell<Option<FrameInputs>>>,
+    /// Generation counter for the local tuning records (PERF
+    /// P1-4): bumped by every function that mutates `tuning`,
+    /// `pedals` or `handbrake_record` — the cheap frame key reads
+    /// it instead of cloning those records. A bump without a value
+    /// change only costs one extra frame (the full `FrameInputs`
+    /// compare still rests it); a MISSED bump would hide a change,
+    /// so every mutating function MUST call `bump_tuning_gen`
+    /// (first line, before any early return — a false positive is
+    /// harmless, a missed bump is not).
+    tuning_gen: Rc<Cell<u64>>,
+    /// Last cheap frame key (PERF P1-4): `push_frame` returns early
+    /// when the current key equals this — an idle frame then costs
+    /// a few scalar reads instead of the `FrameInputs` clones.
+    /// `None` = no cheap key stored yet (first frame always runs)
+    /// or the last frame fell through to the full compare with no
+    /// cheap signal (transient live / `live_api` disagreement).
+    last_cheap_frame: Rc<Cell<Option<CheapFrameKey>>>,
     /// Startup syncs deferred to the first frame tick (perf F-2):
     /// `main` sets this; the frame timer runs `refresh_profiles` /
     /// `refresh_games` / `sync_diag` once and clears it, so the
@@ -2193,6 +2234,44 @@ struct Ctx {
     /// When the notification file was last written (perf F-7): the
     /// ≤1 write/s bound for the coalesced save.
     notif_last_save: Rc<Cell<Option<Instant>>>,
+}
+
+/// Cheap pre-check key for `push_frame` (PERF P1-4): every input
+/// a frame is derived from, as scalars only — the snapshot seq
+/// (the snapshot is pure scalars, so its clone is a memcpy, but
+/// the seq alone proves whether it moved), the connection
+/// fingerprint (no `String` clones — see
+/// [`IpcApi::connection_fingerprint`]), the slow-cache generation,
+/// the local-tuning generation, the steering 6-tuple, and the
+/// flag reads. `push_frame` computes this FIRST; when it equals
+/// the previous key the frame is skipped without building
+/// `FrameInputs` (which clones the connection, the pedal cache
+/// and the handbrake record — ~5 heap allocs per 50 ms tick
+/// while idle). When the key moved, the full `FrameInputs`
+/// compare still runs below — a bump without a value change only
+/// costs one extra frame. The one input NOT in here is the
+/// Wi-Fi rejoin flag's *clear*: the clear needs the connection's
+/// `active` flag, which only the full path reads, so while a
+/// rejoin is in flight the cheap path is skipped outright (the
+/// flag is in the key so a flip is always detected).
+#[derive(Clone, Copy, PartialEq, Debug)]
+#[allow(clippy::struct_excessive_bools)]
+struct CheapFrameKey {
+    snap_seq: u64,
+    conn_fingerprint: u64,
+    cache_gen: u64,
+    tuning_gen: u64,
+    tuning: (f32, f32, i32, f32, bool, f32),
+    unsaved: bool,
+    horn_flash: bool,
+    handbrake_flash: bool,
+    raw_available: bool,
+    raw_job_running: bool,
+    diag_open: bool,
+    output_enabled: bool,
+    live: bool,
+    connecting: bool,
+    wifi_rejoining: bool,
 }
 
 /// Every value a frame is derived from (perf F-4): `push_frame`
@@ -2225,6 +2304,12 @@ struct FrameInputs {
     output_enabled: bool,
     live: bool,
     connecting: bool,
+    /// PERF P1-4: the rejoin flag is a visible input (the
+    /// connection label shows "Rejoining…" while set) — the struct
+    /// doc always claimed it, but the field was missing, so a
+    /// rejoin clear with a frozen snapshot could be skipped away
+    /// by the rest-compare. Now a flip always re-runs the frame.
+    wifi_rejoining: bool,
 }
 
 /// Whether a 400 ms test flash (Horn Test, handbrake Button-mode
@@ -2442,6 +2527,65 @@ impl Ctx {
         percentile_p50_p99(&self.frame_paint_times.borrow())
     }
 
+    /// Bump the local-tuning generation (PERF P1-4): the first line
+    /// of every function that mutates `tuning`, `pedals` or
+    /// `handbrake_record`, so the cheap frame key sees the change.
+    /// A false positive (bump without a value change) only costs
+    /// one extra frame; a missed bump would hide a slider echo
+    /// until the next slow poll.
+    fn bump_tuning_gen(&self) {
+        self.tuning_gen.set(self.tuning_gen.get().wrapping_add(1));
+    }
+
+    /// Cheap frame key for `push_frame` (PERF P1-4), or `None`
+    /// when no cheap signal exists: live without a `live_api`
+    /// handle (or vice versa — a transient swap state) falls
+    /// through to the full `FrameInputs` compare, which is always
+    /// sound. The snapshot seq is read only while live — the frame
+    /// itself uses a defaulted snapshot then, and the sim's seq
+    /// stays 0 anyway (L-4); reading it through the live API keeps
+    /// the key honest about the engine tick.
+    fn cheap_frame_key(
+        &self,
+        api: &Arc<dyn AppApi>,
+        live: bool,
+        connecting: bool,
+        live_api: Option<&IpcApi>,
+        win: &MainWindow,
+    ) -> Option<CheapFrameKey> {
+        let conn_fingerprint = match (live, live_api) {
+            (true, Some(ipc)) => ipc.connection_fingerprint(),
+            (false, None) => 0, // sim: fixed "Connected" connection
+            _ => return None,
+        };
+        let snap_seq = if live { api.snapshot().seq } else { 0 };
+        let tuning = self.tuning.borrow();
+        Some(CheapFrameKey {
+            snap_seq,
+            conn_fingerprint,
+            cache_gen: api.cache_generation(),
+            tuning_gen: self.tuning_gen.get(),
+            tuning: (
+                tuning.deadzone_pct,
+                tuning.exponent,
+                tuning.preset,
+                tuning.smoothing_pct,
+                tuning.invert,
+                tuning.lock_deg,
+            ),
+            unsaved: self.unsaved.get(),
+            horn_flash: test_flash_active(self.horn_test_until.get()),
+            handbrake_flash: test_flash_active(self.handbrake_test_until.get()),
+            raw_available: self.raw_available.get(),
+            raw_job_running: self.busy_jobs.borrow().contains_key(&JobKind::RawAvailable),
+            diag_open: win.get_diag_open(),
+            output_enabled: api.output_enabled(),
+            live,
+            connecting,
+            wifi_rejoining: self.wifi_rejoining.get(),
+        })
+    }
+
     /// Push the current API + tuning state into the window (one
     /// frame). Live values only: no daemon means Disconnected +
     /// "—", never fake Online (acceptance); the pressed tile is
@@ -2454,10 +2598,35 @@ impl Ctx {
     /// charts stay empty, even though the sim is the active API.
     #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn push_frame(&self, win: &MainWindow, tick: u64) -> bool {
-        let (api, live, connecting) = {
+        let (api, live, connecting, live_api) = {
             let state = self.state.borrow();
-            (state.api.clone(), state.live, state.connecting)
+            (
+                state.api.clone(),
+                state.live,
+                state.connecting,
+                state.live_api.clone(),
+            )
         };
+        // PERF P1-4: cheap rest-check BEFORE any clone — an idle /
+        // disconnected frame used to clone the connection (3
+        // Strings), the pedal cache (3 records) and the handbrake
+        // record before the `FrameInputs` compare could rest it.
+        // Now the scalar key decides first; only a moved key
+        // builds `FrameInputs`. While a Wi-Fi rejoin is in flight
+        // the cheap path is skipped: the rejoin clear below needs
+        // the connection, which only the full path reads — and the
+        // clear must never be skipped away.
+        if !self.wifi_rejoining.get() {
+            match self.cheap_frame_key(&api, live, connecting, live_api.as_deref(), win) {
+                Some(key) => {
+                    if self.last_cheap_frame.get() == Some(key) {
+                        return false;
+                    }
+                    self.last_cheap_frame.set(Some(key));
+                }
+                None => self.last_cheap_frame.set(None),
+            }
+        }
         let conn = api.connection();
         // H1: remember the live session's transport every frame, so
         // Reconnect re-uses it (USB stays USB).
@@ -2521,6 +2690,7 @@ impl Ctx {
             output_enabled: api.output_enabled(),
             live,
             connecting,
+            wifi_rejoining: self.wifi_rejoining.get(),
         };
         {
             let mut last = self.last_frame.borrow_mut();
@@ -3560,11 +3730,49 @@ impl Ctx {
     /// Current busy state (B5): whether any job runs + the oldest
     /// running job's label (the strip shows one job at a time) + its
     /// [`JobKind::order`] value (DS-54: `-1` = idle — the screens
-    /// disable + dim the button that started it).
-    fn busy_state(&self) -> (bool, String, i32) {
+    /// disable + dim the button that started it) + the elapsed
+    /// `m:ss` for the Backend switch ("" for every other job).
+    ///
+    /// P1-6: the Backend switch is the only job that can run for
+    /// minutes (420 s bound — the user may take a minute on the
+    /// UAC prompt while the sidecar waits), so its strip shows how
+    /// long it has been waiting (same `m:ss` pattern as the vJoy
+    /// install elapsed) instead of a bare spinner. Past 60 s the
+    /// label stages too: the daemon allows 60 s for the UAC
+    /// prompt, so after a minute the wait is sidecar/driver work,
+    /// not the prompt — the label says so. There is no stage
+    /// signal from the daemon; the 60 s boundary is the daemon's
+    /// own UAC allowance, and the elapsed time is the honest
+    /// progress signal. There is deliberately NO Cancel button:
+    /// the switch cannot be cancelled — the daemon keeps switching
+    /// after any client timeout (CORE-P1-2) — so a Cancel would
+    /// lie; the 420 s timeout + the re-query path are the exit.
+    fn busy_state(&self) -> (bool, String, i32, String) {
         let jobs = self.busy_jobs.borrow();
         let (busy, label) = busy_state_for(&jobs);
-        (busy, label, busy_kind_for(&jobs))
+        let kind = busy_kind_for(&jobs);
+        if !busy || kind != i32::from(JobKind::Backend.order()) {
+            return (busy, label, kind, String::new());
+        }
+        let secs = jobs
+            .get(&JobKind::Backend)
+            .map_or(0, |(_, started)| started.elapsed().as_secs());
+        let elapsed = Self::fmt_elapsed(secs);
+        // Stage label (see above): the stored label stays
+        // "Switching controller…" — only the displayed label
+        // stages, so the timeout toast still names the job.
+        let label = if secs >= 60 {
+            "Switching controller… — still working".to_string()
+        } else {
+            label
+        };
+        (busy, label, kind, elapsed)
+    }
+
+    /// Elapsed seconds as `m:ss` ("0:07", "1:23", "7:00") — the
+    /// busy-strip / vJoy-install elapsed format. Pure.
+    fn fmt_elapsed(secs: u64) -> String {
+        format!("{}:{:02}", secs / 60, secs % 60)
     }
 
     /// Drive the B5 busy strip from `busy_jobs` (FC2): a running
@@ -3572,10 +3780,11 @@ impl Ctx {
     /// every job start/finish/timeout (see [`Ctx::run_job`],
     /// [`Ctx::drain_jobs`], [`Ctx::check_job_timeouts`]) plus a 1 Hz
     /// safety call from the frame timer — the write itself is
-    /// change-detected, so the safety call costs nothing.
+    /// change-detected, so the safety call costs nothing. The 1 Hz
+    /// call is also what ticks the Backend elapsed (P1-6).
     fn sync_busy(&self, win: &MainWindow) {
-        let (busy, label, kind) = self.busy_state();
-        set_busy_props(win, busy, &label, kind);
+        let (busy, label, kind, elapsed) = self.busy_state();
+        set_busy_props(win, busy, &label, kind, &elapsed);
     }
 
     /// Re-sample Theme Auto from the cached OS preference (DS-50):
@@ -4894,7 +5103,22 @@ impl Ctx {
         let confirm = win.get_wifi_password_confirm().to_string();
         if let Some(err) = Self::wifi_password_error(&new, &confirm) {
             win.set_wifi_password_error(err.clone().into());
-            self.set_toast(win, "Wi-Fi password", &err);
+            // P2-10: the inline field error stays, but the message
+            // must also land in the notifications drawer — the old
+            // bare `set_toast` bypassed it, so Details opened a
+            // drawer with no such entry. `notify_error` writes both
+            // (the bar shows the same text as before).
+            self.notify_error(
+                win,
+                "Connection",
+                &UserError {
+                    code: "Validation".to_string(),
+                    title: "Wi-Fi password".to_string(),
+                    what_happened: err,
+                    what_to_do: String::new(),
+                    detail: None,
+                },
+            );
             return;
         }
         win.set_wifi_password_error("".into());
@@ -5848,6 +6072,7 @@ impl Ctx {
     /// the ~1 Hz cache, which may still hold pre-push values.
     #[allow(clippy::cast_possible_truncation)]
     fn apply_tuning_record(&self, win: &MainWindow, stored: &TuningSettings) {
+        self.bump_tuning_gen();
         match stored.module.as_str() {
             // --- Pedal ramps/curves per-module tuning ---
             // Both throttle spellings: the daemon canonicalizes to
@@ -6003,6 +6228,7 @@ impl Ctx {
     /// when a revert happened (the caller then tells the user the
     /// change was put back).
     fn revert_tuning_push(&self, win: &MainWindow, target: &TuningPushTarget) -> bool {
+        self.bump_tuning_gen();
         match target {
             TuningPushTarget::Steering { due, base } => {
                 if self.steer_push_due.get() != Some(*due) {
@@ -6222,6 +6448,7 @@ impl Ctx {
     /// ~1 Hz re-sync agrees instead of snapping it back. Only the
     /// daemon push waits out the 150 ms debounce.
     fn apply_pedal_deadzone_local(&self, win: &MainWindow, index: usize, deadzone: f64) {
+        self.bump_tuning_gen();
         let (record, feel_exp) = {
             let mut pedals = self.pedals.borrow_mut();
             pedals.records[index].deadzone = deadzone;
@@ -6234,6 +6461,7 @@ impl Ctx {
     /// pattern as [`Self::apply_pedal_deadzone_local`]. `index` is
     /// the pedal index (1 brake, 2 clutch).
     fn apply_pedal_bite_local(&self, win: &MainWindow, index: usize, bite: f64) {
+        self.bump_tuning_gen();
         let (record, feel_exp) = {
             let mut pedals = self.pedals.borrow_mut();
             pedals.records[index].bite_point = Some(bite);
@@ -6247,6 +6475,7 @@ impl Ctx {
     /// mouse, the local record follows, and only the daemon push
     /// waits out the 150 ms debounce.
     fn apply_pedal_bite_width_local(&self, win: &MainWindow, width: f64) {
+        self.bump_tuning_gen();
         let (record, feel_exp) = {
             let mut pedals = self.pedals.borrow_mut();
             pedals.records[2].bite_width = Some(width);
@@ -6260,6 +6489,7 @@ impl Ctx {
     /// follows, and only the daemon push waits out the 150 ms
     /// debounce.
     fn apply_pedal_brake_force_local(&self, win: &MainWindow, saturation: f64) {
+        self.bump_tuning_gen();
         let (record, feel_exp) = {
             let mut pedals = self.pedals.borrow_mut();
             pedals.records[1].saturation = Some(saturation);
@@ -6323,6 +6553,7 @@ impl Ctx {
     /// curve (soft < 0.95, sharp > 1.05, else linear).
     #[allow(clippy::cast_possible_truncation)]
     fn apply_pedal_curve_local(&self, win: &MainWindow, index: usize, exponent: f64) {
+        self.bump_tuning_gen();
         let (record, feel_exp) = {
             let mut pedals = self.pedals.borrow_mut();
             pedals.records[index].curve = exponent;
@@ -6334,6 +6565,7 @@ impl Ctx {
 
     /// Echo a pedal press-ramp drag locally (R2-10): same pattern.
     fn apply_pedal_press_ms_local(&self, win: &MainWindow, index: usize, ms: f64) {
+        self.bump_tuning_gen();
         let (record, feel_exp) = {
             let mut pedals = self.pedals.borrow_mut();
             pedals.records[index].press_ms = Some(ms);
@@ -6344,6 +6576,7 @@ impl Ctx {
 
     /// Echo a pedal release-ramp drag locally (R2-10): same pattern.
     fn apply_pedal_release_ms_local(&self, win: &MainWindow, index: usize, ms: f64) {
+        self.bump_tuning_gen();
         let (record, feel_exp) = {
             let mut pedals = self.pedals.borrow_mut();
             pedals.records[index].release_ms = Some(ms);
@@ -6357,6 +6590,7 @@ impl Ctx {
     /// local record (the "Pedal down" mV re-syncs from calibration
     /// on the next ~1 Hz cycle when a capture exists).
     fn apply_throttle_saturation_local(&self, win: &MainWindow, max_mv: f64) {
+        self.bump_tuning_gen();
         let record = {
             let mut pedals = self.pedals.borrow_mut();
             pedals.records[0].max_mv = max_mv;
@@ -6748,6 +6982,7 @@ impl Ctx {
     /// Echo a handbrake deadzone drag locally (R2-10): same pattern
     /// as [`Self::apply_pedal_deadzone_local`].
     fn apply_handbrake_deadzone_local(&self, win: &MainWindow, deadzone: f64) {
+        self.bump_tuning_gen();
         let record = {
             let mut stored = self.handbrake_record.borrow_mut();
             stored.deadzone = deadzone;
@@ -6760,6 +6995,7 @@ impl Ctx {
     /// slider + text move with the mouse, the local record follows,
     /// and only the daemon push waits out the 150 ms debounce.
     fn apply_handbrake_grab_local(&self, win: &MainWindow, grab_ms: f64) {
+        self.bump_tuning_gen();
         let record = {
             let mut stored = self.handbrake_record.borrow_mut();
             stored.press_ms = Some(grab_ms);
@@ -6838,6 +7074,7 @@ impl Ctx {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn sync_pedals(&self, win: &MainWindow) {
         const MODULES: [&str; 3] = ["throttle", "brake", "clutch"];
+        self.bump_tuning_gen();
         let api = self.api();
         // A2: mV comes from calibration() (keys "accel" / "brake" /
         // "clutch") when a capture exists, else the tuning record.
@@ -6935,6 +7172,7 @@ impl Ctx {
     /// snapped back to the ~1 Hz cache mid-drag.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn sync_extras(&self, win: &MainWindow) {
+        self.bump_tuning_gen();
         let api = self.api();
         // R2-10: while a drag's push is pending for handbrake/LED,
         // the local record IS the drag value — re-reading the slow
@@ -7504,6 +7742,7 @@ impl Ctx {
         win.set_game_dialog_profile_name(
             self.game_dialog_profile_label(profile_id.as_ref()).into(),
         );
+        self.sync_game_dialog_profile_props(win);
         win.set_game_dialog_open(true);
         ui_log!("RSH-UI game dialog opened");
     }
@@ -7558,6 +7797,25 @@ impl Ctx {
         }
     }
 
+    /// Sync the dialog's profile position props (P2-9): the bound
+    /// profile's 1-based position in `profiles_cache` + the total
+    /// count, so the dialog can show "Profile: X (2 of 5)". Index
+    /// 0 = no profile bound (or a stale id). Called whenever the
+    /// bound profile changes — dialog open + cycle.
+    fn sync_game_dialog_profile_props(&self, win: &MainWindow) {
+        let profiles = self.profiles_cache.borrow();
+        let count = i32::try_from(profiles.len()).unwrap_or(i32::MAX);
+        let index = match self.game_dialog_profile_id.borrow().as_ref() {
+            Some(id) => profiles
+                .iter()
+                .position(|p| &p.id == id)
+                .map_or(0, |i| i32::try_from(i + 1).unwrap_or(0)),
+            None => 0,
+        };
+        win.set_game_dialog_profile_index(index);
+        win.set_game_dialog_profile_count(count);
+    }
+
     /// Cycle the dialog's bound profile: none → first profile →
     /// … → last → none again (the profile-link control's cycling
     /// pattern — the dialog has no dropdown component).
@@ -7583,6 +7841,7 @@ impl Ctx {
         };
         win.set_game_dialog_profile_name(self.game_dialog_profile_label(next.as_ref()).into());
         *self.game_dialog_profile_id.borrow_mut() = next;
+        self.sync_game_dialog_profile_props(win);
     }
 
     /// Save the dialog: validate name + exe (empty is refused
@@ -13085,6 +13344,8 @@ fn main() -> Result<(), slint::PlatformError> {
         diag_buttons_hash: Rc::new(Cell::new(None)),
         diag_events_hash: Rc::new(Cell::new(None)),
         last_frame: Rc::new(RefCell::new(None)),
+        tuning_gen: Rc::new(Cell::new(0)),
+        last_cheap_frame: Rc::new(Cell::new(None)),
         // Perf (F-2): the list/diag syncs run on the first frame
         // tick, not in `main` before the first paint.
         startup_sync_pending: Rc::new(Cell::new(true)),
@@ -13655,6 +13916,20 @@ mod tests {
         );
     }
 
+    /// PERF P2-4: a 200-sample history decimates to 101 plotted
+    /// points (one per ~3.8 px at the 380 px viewBox) and the trace
+    /// still starts at the left edge and reaches the right edge
+    /// with the last sample's value.
+    #[test]
+    fn chart_commands_decimates_long_histories_to_101_points() {
+        let samples: VecDeque<f32> = (0u8..200).map(f32::from).collect();
+        let cmds = chart_commands(&samples, 0.0, 199.0);
+        assert!(cmds.starts_with("M 0.0 85.0"), "{cmds}");
+        assert!(cmds.ends_with("L 380.0 5.0"), "{cmds}");
+        // 101 points = 1 M + 100 L segments.
+        assert_eq!(cmds.matches('L').count(), 100, "{cmds}");
+    }
+
     /// DS-78: the frame command cache reuses the built string while
     /// its inputs are unchanged, rebuilds when an input moves, and
     /// the dashed line is built once.
@@ -13718,6 +13993,54 @@ mod tests {
             "a local tuning change wakes the frame"
         );
         assert!(!ctx.push_frame(&win, 4), "identical again after the change");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Perf (P1-4): the cheap frame key rests an idle frame BEFORE
+    /// any clone — the second `push_frame` stores the key and the
+    /// identical tick returns `false` without building
+    /// `FrameInputs`; a bare `bump_tuning_gen` (no value change)
+    /// moves the key (so the cheap path does NOT rest it) but the
+    /// full compare still rests the frame — no visible change, one
+    /// extra compare only; and a real local pedal echo wakes the
+    /// frame through the bump wired into the mutator. (`SimApi` is
+    /// not live, so the connection fingerprint is the constant 0
+    /// and the snapshot seq is 0.)
+    #[test]
+    fn perf_cheap_frame_key_rests_idle_frame_before_cloning() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("perf cheap-key test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        assert!(ctx.push_frame(&win, 0), "first frame always runs");
+        let key0 = ctx
+            .last_cheap_frame
+            .get()
+            .expect("key stored after the first frame");
+        assert!(!ctx.push_frame(&win, 1), "identical tick rests on the cheap key");
+        assert_eq!(
+            ctx.last_cheap_frame.get(),
+            Some(key0),
+            "resting tick keeps the same key"
+        );
+        ctx.bump_tuning_gen();
+        assert!(!ctx.push_frame(&win, 3), "bump alone changes nothing visible");
+        let key1 = ctx
+            .last_cheap_frame
+            .get()
+            .expect("key re-stored after the bump");
+        assert_ne!(
+            key1.tuning_gen, key0.tuning_gen,
+            "the bump moved the generation"
+        );
+        assert!(!ctx.push_frame(&win, 4), "identical again after the bump");
+        ctx.apply_pedal_deadzone_local(&win, 0, 12.0);
+        assert!(
+            ctx.push_frame(&win, 5),
+            "a local pedal echo wakes the frame"
+        );
+        assert!(!ctx.push_frame(&win, 6), "identical again after the echo");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -13818,6 +14141,18 @@ mod tests {
         assert_eq!(pedal_key(2), Some(("clutch", "Clutch")));
         assert_eq!(pedal_key(3), None);
         assert_eq!(pedal_key(-1), None);
+    }
+
+    #[test]
+    fn fmt_elapsed_is_m_ss() {
+        // P1-6: the Backend busy strip shows the wait as m:ss —
+        // the same shape as the vJoy install elapsed.
+        assert_eq!(Ctx::fmt_elapsed(0), "0:00");
+        assert_eq!(Ctx::fmt_elapsed(7), "0:07");
+        assert_eq!(Ctx::fmt_elapsed(59), "0:59");
+        assert_eq!(Ctx::fmt_elapsed(60), "1:00");
+        assert_eq!(Ctx::fmt_elapsed(83), "1:23");
+        assert_eq!(Ctx::fmt_elapsed(420), "7:00");
     }
 
     #[test]
@@ -14190,6 +14525,8 @@ mod tests {
             diag_buttons_hash: Rc::new(Cell::new(None)),
             diag_events_hash: Rc::new(Cell::new(None)),
             last_frame: Rc::new(RefCell::new(None)),
+            tuning_gen: Rc::new(Cell::new(0)),
+            last_cheap_frame: Rc::new(Cell::new(None)),
             // Tests drive handlers directly (no frame timer), so
             // there is no first tick to run the deferred startup
             // syncs — they stay off here.

@@ -177,6 +177,8 @@ export component ExtrasScreen inherits PageScaffold {
     // while its LearnOp job (11) runs; Handbrake Set up/down while
     // their CaptureOp job (10) runs.
     in property <int> busy-kind: -1;
+    // P2-11: the "Unsaved changes" line, like Steering.
+    in property <bool> unsaved: false;
 
     callback action(string);
     callback handbrake-mode-selected(int);
@@ -212,12 +214,14 @@ export component ExtrasScreen inherits PageScaffold {
     // padding) — the 2x2 grid is ~750px tall, taller than the
     // 524px body, so the bottom row used to clip below the window
     // edge. Short content still sits at the top.
+    // P2-11: "Unsaved changes" at the top, like Steering.
+    if unsaved : Text { text: "Unsaved changes"; font-size: Theme.fs-hint; color: Theme.warn; }
     HorizontalLayout {
                 spacing: 0px;
                 // ---- Handbrake
                 Card {
                     horizontal-stretch: 1;
-                    min-width: 322px;
+                    min-width: 318px;
                     CardBody {
                         ExtrasCardHeader { title: "Handbrake"; on: handbrake-on; toggled => { handbrake-on = !handbrake-on; action("handbrake-toggle"); } }
                         // P2-2 (overlap/`visible` rework, update4):
@@ -343,7 +347,7 @@ export component ExtrasScreen inherits PageScaffold {
                 // ---- Shifter
                 Card {
                     horizontal-stretch: 1;
-                    min-width: 322px;
+                    min-width: 318px;
                     CardBody {
                         ExtrasCardHeader { title: "Shifter"; on: shifter-on; toggled => { shifter-on = !shifter-on; action("shifter-toggle"); } }
                         // P2-2 (see Handbrake): the ON body stays
@@ -400,7 +404,7 @@ export component ExtrasScreen inherits PageScaffold {
                 // ---- Horn
                 Card {
                     horizontal-stretch: 1;
-                    min-width: 322px;
+                    min-width: 318px;
                     CardBody {
                         ExtrasCardHeader { title: "Horn"; on: horn-on; toggled => { horn-on = !horn-on; action("horn-toggle"); } }
                         // P2-2 (see Handbrake): the ON body stays
@@ -448,7 +452,7 @@ export component ExtrasScreen inherits PageScaffold {
                 // ---- LEDs
                 Card {
                     horizontal-stretch: 1;
-                    min-width: 322px;
+                    min-width: 318px;
                     CardBody {
                         ExtrasCardHeader { title: "LEDs"; on: leds-on; toggled => { leds-on = !leds-on; action("leds-toggle"); } }
                         // P2-2 (see Handbrake): the ON body stays

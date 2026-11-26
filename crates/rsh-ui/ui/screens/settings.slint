@@ -167,14 +167,19 @@ export component SettingsScreen inherits VerticalLayout {
         vertical-stretch: 1;
             HorizontalLayout {
                 spacing: 0px;
-                // Equal columns: `min-width: 322px` each — P1-6:
+                // Equal columns: `min-width: 318px` each — P1-6:
                 // (656 - 12 gap) / 2 = 322 at the 880px minimum
                 // window ((880 - 184 sidebar - 40 page pad) = 656
-                // content). At the 920px design width the columns
-                // still stretch to 342px ((736 - 40 - 12) / 2), so
-                // the design-width maths — and the gate's 342px
-                // audit — are unchanged; 322 is only the floor
-                // two-across needs at the minimum width.
+                // content), but the floor is 318px, not 322px:
+                // 318*2 + 12 = 648, leaving 8px slack — at exactly
+                // 322 the two columns + gap filled the 656px column
+                // with zero slack and the card borders pushed the
+                // right column over the edge. At the 920px design
+                // width the columns still stretch to 342px
+                // ((736 - 40 - 12) / 2), so the design-width maths
+                // — and the gate's 342px audit — are unchanged; 318
+                // is only the floor two-across needs at the minimum
+                // width.
                 // (P2's 338px assumed its 24px pad-page token,
                 // which the scaffold does not use.) Staging formula
                 // sized them from the ScrollView's visible-width,
@@ -183,12 +188,12 @@ export component SettingsScreen inherits VerticalLayout {
                 // overflowing the right edge to x=915.
                 // CARDS-LAYOUT-RESEARCH §2: min-width (not `width`)
                 // + stretch 1 so the columns GROW with the window
-                // instead of sitting left-aligned at 322px; the gap
+                // instead of sitting left-aligned at 318px; the gap
                 // is a spacer Rectangle (min-width 12px, stretch
                 // 0.05) that scales with the window.
                 // ---- left column
                 VerticalLayout {
-                    min-width: 322px;
+                    min-width: 318px;
                     horizontal-stretch: 1;
                     spacing: 12px;
                     SectionHeader { text: "CONNECTION"; }
@@ -220,9 +225,12 @@ export component SettingsScreen inherits VerticalLayout {
                                     height: Theme.control-height;
                                     border-radius: 7px;
                                     border-width: 1px;
-                                    border-color: Theme.line;
+                                    // P1-3: the focus border is the accent
+                                    // text colour — the old Theme.line border
+                                    // looked identical focused or not.
+                                    border-color: addr-input.has-focus ? Theme.accent-text : Theme.line;
                                     background: Theme.bg;
-                                    TextInput {
+                                    addr-input := TextInput {
                                         x: 10px;
                                         width: parent.width - 20px;
                                         height: 100%;
@@ -233,12 +241,25 @@ export component SettingsScreen inherits VerticalLayout {
                                         font-weight: 500;
                                         color: Theme.text;
                                         selection-background-color: Theme.accent;
+                                        // P1-5: Up/Down stay in the field —
+                                        // accepting them here stops them
+                                        // bubbling to the root keyboard scope
+                                        // (which would trigger Save).
+                                        key-pressed(event) => {
+                                            if (event.text == Key.UpArrow || event.text == Key.DownArrow) {
+                                                return accept;
+                                            }
+                                            return reject;
+                                        }
                                         // H4: Enter accepts the typed
                                         // address — nothing is sent
                                         // per keystroke any more.
                                         accepted => { address-accepted(self.text); }
                                     }
                                 }
+                                // P2-12: the reason sits next to the
+                                // button instead of a silently dead one.
+                                if busy-kind == 0 : Text { vertical-alignment: center; text: "Reconnecting…"; font-size: Theme.fs-hint; color: Theme.mute; }
                                 Btn { label: "Reconnect"; icon: @image-url("../../assets/icons/refresh.svg"); has-icon: true; disabled: busy-kind == 0; clicked => { reconnect(); } }
                             }
                             Rectangle { height: 1px; background: Theme.line; }
@@ -272,7 +293,9 @@ export component SettingsScreen inherits VerticalLayout {
                                         height: Theme.control-height;
                                         border-radius: 7px;
                                         border-width: 1px;
-                                        border-color: Theme.line;
+                                        // P1-3: the focus border is the accent
+                                        // text colour — see the address box.
+                                        border-color: pw-new-input.has-focus ? Theme.accent-text : Theme.line;
                                         background: Theme.bg;
                                         Text {
                                             x: 10px;
@@ -284,7 +307,7 @@ export component SettingsScreen inherits VerticalLayout {
                                             color: Theme.faint;
                                             visible: wifi-password-new == "";
                                         }
-                                        TextInput {
+                                        pw-new-input := TextInput {
                                             x: 10px;
                                             width: parent.width - 20px;
                                             height: 100%;
@@ -295,6 +318,13 @@ export component SettingsScreen inherits VerticalLayout {
                                             font-weight: 500;
                                             color: Theme.text;
                                             selection-background-color: Theme.accent;
+                                            // P1-5: Up/Down stay in the field.
+                                            key-pressed(event) => {
+                                                if (event.text == Key.UpArrow || event.text == Key.DownArrow) {
+                                                    return accept;
+                                                }
+                                                return reject;
+                                            }
                                         }
                                     }
                                 }
@@ -306,7 +336,9 @@ export component SettingsScreen inherits VerticalLayout {
                                         height: Theme.control-height;
                                         border-radius: 7px;
                                         border-width: 1px;
-                                        border-color: Theme.line;
+                                        // P1-3: the focus border is the accent
+                                        // text colour — see the address box.
+                                        border-color: pw-confirm-input.has-focus ? Theme.accent-text : Theme.line;
                                         background: Theme.bg;
                                         Text {
                                             x: 10px;
@@ -318,7 +350,7 @@ export component SettingsScreen inherits VerticalLayout {
                                             color: Theme.faint;
                                             visible: wifi-password-confirm == "";
                                         }
-                                        TextInput {
+                                        pw-confirm-input := TextInput {
                                             x: 10px;
                                             width: parent.width - 20px;
                                             height: 100%;
@@ -329,6 +361,13 @@ export component SettingsScreen inherits VerticalLayout {
                                             font-weight: 500;
                                             color: Theme.text;
                                             selection-background-color: Theme.accent;
+                                            // P1-5: Up/Down stay in the field.
+                                            key-pressed(event) => {
+                                                if (event.text == Key.UpArrow || event.text == Key.DownArrow) {
+                                                    return accept;
+                                                }
+                                                return reject;
+                                            }
                                         }
                                     }
                                 }
@@ -442,7 +481,7 @@ export component SettingsScreen inherits VerticalLayout {
                 Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
                 // ---- right column
                 VerticalLayout {
-                    min-width: 322px;
+                    min-width: 318px;
                     horizontal-stretch: 1;
                     spacing: 12px;
                     SectionHeader { text: "PROFILES"; }

@@ -91,9 +91,9 @@ export component TrayPopup inherits Window {
     out property <color> c-line: light-theme ? #d9d4ec : #262f40;
     out property <color> c-text: light-theme ? #171b26 : #e9edf4;
     out property <color> c-mute: light-theme ? #565c6e : #9aa5b8;
-    out property <color> c-faint: light-theme ? #6e7490 : #7c879b;
+    out property <color> c-faint: light-theme ? #5f657f : #7c879b;
     out property <color> c-accent-text: light-theme ? #2456d6 : #8eb0ff;
-    out property <color> c-ok: light-theme ? #157a4c : #3dd68c;
+    out property <color> c-ok: light-theme ? #12703f : #3dd68c;
     out property <color> c-bad: light-theme ? #c92a2a : #ff6b6b;
     out property <color> c-track: light-theme ? #dcd8ec : #232c3c;
     out property <color> c-switch-off: light-theme ? #c6c1dc : #232c3c;
@@ -102,7 +102,7 @@ export component TrayPopup inherits Window {
     // one step off the resting surface (`Theme.hover-bg`), and the
     // accent darkens in Light / lightens in Dark (`accent-hover`).
     out property <color> c-hover: light-theme ? #e3e8f6 : #28324a;
-    out property <color> c-accent-hover: light-theme ? #2456d6 : #4a7dff;
+    out property <color> c-accent-hover: light-theme ? #2456d6 : #2a63f0;
 
     in property <string> conn-label: "Disconnected";
     in property <string> conn-sub: "Wi-Fi";
@@ -212,6 +212,21 @@ export component TrayPopup inherits Window {
                         border-radius: 8px;
                         background: #ffffff;
                     }
+                    // P2-6: keyboard activation — Return/Space
+                    // toggles, like a click (the switch was
+                    // mouse-only; Tab could reach the popup but
+                    // not flip it).
+                    sw-fs := FocusScope {
+                        width: 100%;
+                        height: 100%;
+                        key-pressed(event) => {
+                            if (event.text == Key.Return || event.text == Key.Space) {
+                                root.toggled-send();
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
                     sw-ta := TouchArea {
                         width: parent.width;
                         height: parent.height;
@@ -250,7 +265,7 @@ export component TrayPopup inherits Window {
                         Text {
                             text: steer-text;
                             color: c-text;
-                            font-size: 11px;
+                            font-size: 12px;
                             font-weight: 600;
                             horizontal-alignment: center;
                             vertical-alignment: center;
@@ -261,7 +276,7 @@ export component TrayPopup inherits Window {
                         alignment: center;
                         HorizontalLayout {
                             spacing: 8px;
-                            Text { text: "Throttle"; color: c-mute; font-size: 11px; width: 46px; }
+                            Text { text: "Throttle"; color: c-mute; font-size: 12px; width: 46px; }
                             Rectangle {
                                 height: 6px;
                                 background: c-track;
@@ -273,11 +288,11 @@ export component TrayPopup inherits Window {
                                     border-radius: 3px;
                                 }
                             }
-                            Text { text: throttle-text; color: c-text; font-size: 11px; width: 30px; horizontal-alignment: right; }
+                            Text { text: throttle-text; color: c-text; font-size: 12px; width: 30px; horizontal-alignment: right; }
                         }
                         HorizontalLayout {
                             spacing: 8px;
-                            Text { text: "Brake"; color: c-mute; font-size: 11px; width: 46px; }
+                            Text { text: "Brake"; color: c-mute; font-size: 12px; width: 46px; }
                             Rectangle {
                                 height: 6px;
                                 background: c-track;
@@ -289,11 +304,11 @@ export component TrayPopup inherits Window {
                                     border-radius: 3px;
                                 }
                             }
-                            Text { text: brake-text; color: c-text; font-size: 11px; width: 30px; horizontal-alignment: right; }
+                            Text { text: brake-text; color: c-text; font-size: 12px; width: 30px; horizontal-alignment: right; }
                         }
                         HorizontalLayout {
                             spacing: 8px;
-                            Text { text: "Clutch"; color: c-mute; font-size: 11px; width: 46px; }
+                            Text { text: "Clutch"; color: c-mute; font-size: 12px; width: 46px; }
                             Rectangle {
                                 height: 6px;
                                 background: c-track;
@@ -305,7 +320,7 @@ export component TrayPopup inherits Window {
                                     border-radius: 3px;
                                 }
                             }
-                            Text { text: clutch-text; color: c-text; font-size: 11px; width: 30px; horizontal-alignment: right; }
+                            Text { text: clutch-text; color: c-text; font-size: 12px; width: 30px; horizontal-alignment: right; }
                         }
                     }
                 }
@@ -326,6 +341,19 @@ export component TrayPopup inherits Window {
                     Text { text: profile-name; color: c-text; font-size: 12px; font-weight: 600; vertical-alignment: center; }
                     Text { text: profile-sub; color: c-mute; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
                 }
+                // P2-6: keyboard activation — Return/Space cycles
+                // to the next profile, like a click.
+                prof-fs := FocusScope {
+                    width: 100%;
+                    height: 100%;
+                    key-pressed(event) => {
+                        if (event.text == Key.Return || event.text == Key.Space) {
+                            root.cycle-profile();
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
                 prof-ta := TouchArea {
                     width: parent.width;
                     height: parent.height;
@@ -333,7 +361,7 @@ export component TrayPopup inherits Window {
                 }
             }
 
-            Text { text: "GAMES"; color: c-faint; font-size: 11px; font-weight: 600; letter-spacing: 1px; }
+            Text { text: "GAMES"; color: c-faint; font-size: 12px; font-weight: 600; letter-spacing: 1px; }
             HorizontalLayout {
                 spacing: 10px;
                 height: 38px;
@@ -342,7 +370,7 @@ export component TrayPopup inherits Window {
                     height: 24px;
                     border-radius: 6px;
                     background: c-panel2;
-                    Text { text: game0-initials; color: c-accent-text; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: game0-initials; color: c-accent-text; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                 }
                 Text { horizontal-stretch: 1; overflow: elide; text: game0-name; color: c-text; font-size: 13px; font-weight: 500; vertical-alignment: center; }
                 if game0-can-launch: Rectangle {
@@ -351,14 +379,14 @@ export component TrayPopup inherits Window {
                     border-radius: 6px;
                     // DS-23: hover darkens the accent, mirroring Btn (A5).
                     background: launch0-ta.has-hover ? c-accent-hover : #2f6bff;
-                    Text { text: "Launch"; color: #ffffff; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: "Launch"; color: #ffffff; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
                     launch0-ta := TouchArea {
                         width: parent.width;
                         height: parent.height;
                         clicked => { root.launch-game(game0-id); }
                     }
                 }
-                if !game0-can-launch: Text { text: game0-state; color: c-mute; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                if !game0-can-launch: Text { text: game0-state; color: c-mute; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
             }
             HorizontalLayout {
                 spacing: 10px;
@@ -368,7 +396,7 @@ export component TrayPopup inherits Window {
                     height: 24px;
                     border-radius: 6px;
                     background: c-panel2;
-                    Text { text: game1-initials; color: c-accent-text; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: game1-initials; color: c-accent-text; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                 }
                 Text { horizontal-stretch: 1; overflow: elide; text: game1-name; color: c-text; font-size: 13px; font-weight: 500; vertical-alignment: center; }
                 if game1-can-launch: Rectangle {
@@ -377,14 +405,14 @@ export component TrayPopup inherits Window {
                     border-radius: 6px;
                     // DS-23: hover darkens the accent, mirroring Btn (A5).
                     background: launch1-ta.has-hover ? c-accent-hover : #2f6bff;
-                    Text { text: "Launch"; color: #ffffff; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: "Launch"; color: #ffffff; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
                     launch1-ta := TouchArea {
                         width: parent.width;
                         height: parent.height;
                         clicked => { root.launch-game(game1-id); }
                     }
                 }
-                if !game1-can-launch: Text { text: game1-state; color: c-mute; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                if !game1-can-launch: Text { text: game1-state; color: c-mute; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
             }
             HorizontalLayout {
                 spacing: 10px;
@@ -394,7 +422,7 @@ export component TrayPopup inherits Window {
                     height: 24px;
                     border-radius: 6px;
                     background: c-panel2;
-                    Text { text: game2-initials; color: c-accent-text; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: game2-initials; color: c-accent-text; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                 }
                 Text { horizontal-stretch: 1; overflow: elide; text: game2-name; color: c-text; font-size: 13px; font-weight: 500; vertical-alignment: center; }
                 if game2-can-launch: Rectangle {
@@ -403,14 +431,14 @@ export component TrayPopup inherits Window {
                     border-radius: 6px;
                     // DS-23: hover darkens the accent, mirroring Btn (A5).
                     background: launch2-ta.has-hover ? c-accent-hover : #2f6bff;
-                    Text { text: "Launch"; color: #ffffff; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: "Launch"; color: #ffffff; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
                     launch2-ta := TouchArea {
                         width: parent.width;
                         height: parent.height;
                         clicked => { root.launch-game(game2-id); }
                     }
                 }
-                if !game2-can-launch: Text { text: game2-state; color: c-mute; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                if !game2-can-launch: Text { text: game2-state; color: c-mute; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
             }
 
             // Footer.

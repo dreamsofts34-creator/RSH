@@ -10,8 +10,9 @@
 // the name field saves when both fields are filled.
 // The exe path is NOT typed: Browse opens the native Windows file
 // picker (Rust `game-dialog-browse`, PC-test Bug 6) and the picked
-// path shows read-only here, elided when long; the name auto-fills
-// from the file stem when still empty. The profile is a cycling
+// path shows read-only here, elided when long — click it to
+// expand the full path; the name auto-fills from the file stem
+// when still empty. The profile is a cycling
 // button (the profile-link control's pattern) because no dropdown
 // component exists — each click moves to the next profile, then
 // back to "No profile".
@@ -25,6 +26,13 @@ export component GameDialog inherits Modal {
     in-out property <string> name: "";
     in-out property <string> exe: "";
     in property <string> profile-name: "No profile";
+    // P2-9: the bound profile's 1-based position + total count
+    // (0 = no profile bound) — shown as "Profile: X (2 of 5)".
+    in property <int> profile-index: 0;
+    in property <int> profile-count: 0;
+    // P2-9: tap-to-expand for the exe path — elided by default,
+    // wrapped in full when the box is tapped.
+    property <bool> exe-expanded: false;
     // P1-7: the daemon's save error, shown inline in the dialog
     // ("" = no error). A failed save used to surface only as a 1 s
     // StatusBar message while the dialog stayed open looking inert.
@@ -54,9 +62,10 @@ export component GameDialog inherits Modal {
             height: Theme.control-height;
             border-radius: 7px;
             border-width: 1px;
-            border-color: Theme.line;
+            // P1-3: the focus border is the accent text colour.
+            border-color: name-input.has-focus ? Theme.accent-text : Theme.line;
             background: Theme.bg;
-            TextInput {
+            name-input := TextInput {
                 x: 10px;
                 width: parent.width - 20px;
                 height: 100%;
@@ -66,36 +75,51 @@ export component GameDialog inherits Modal {
                 font-weight: 500;
                 color: Theme.text;
                 selection-background-color: Theme.accent;
+                // P1-5: Up/Down stay in the field — Return rejects
+                // so it still reaches `accepted` below and saves.
+                key-pressed(event) => {
+                    if (event.text == Key.UpArrow || event.text == Key.DownArrow) {
+                        return accept;
+                    }
+                    return reject;
+                }
                 accepted => { if (name != "" && exe != "" && busy-kind != 13) { save(name, exe); } }
             }
         }
-        Text { text: "Game file (.exe or shortcut)"; font-size: Theme.fs-label; color: Theme.mute; }
+        Text { text: "Game file (.exe or shortcut) — click the path to expand it"; font-size: Theme.fs-label; color: Theme.mute; }
         HorizontalLayout { cross-axis-alignment: center;
             spacing: 8px;
             Rectangle {
                 horizontal-stretch: 1;
-                height: Theme.control-height;
+                // P2-9: expanded, the box grows to the wrapped
+                // path's height (+ 16px padding) instead of
+                // eliding it to one line.
+                height: exe-expanded ? exe-text.preferred-height + 16px : Theme.control-height;
                 border-radius: 7px;
                 border-width: 1px;
                 border-color: Theme.line;
                 background: Theme.bg;
-                Text {
+                exe-text := Text {
                     x: 10px;
+                    y: exe-expanded ? 8px : 0px;
                     width: parent.width - 20px;
-                    height: 100%;
-                    vertical-alignment: center;
+                    height: exe-expanded ? parent.height - 16px : parent.height;
+                    vertical-alignment: exe-expanded ? top : center;
                     text: exe == "" ? "No file chosen" : exe;
                     font-size: Theme.fs-hint;
                     font-weight: 500;
                     color: exe == "" ? Theme.faint : Theme.text;
+                    wrap: exe-expanded ? word-wrap : no-wrap;
                     overflow: elide;
                 }
+                // P2-9: tap the path to expand / collapse it.
+                TouchArea { width: 100%; height: 100%; mouse-cursor: pointer; clicked => { if (exe != "") { exe-expanded = !exe-expanded; } } }
             }
             Btn { label: "Browse…"; icon: @image-url("../../assets/icons/folder.svg"); has-icon: true; clicked => { browse(); } }
         }
         HorizontalLayout { cross-axis-alignment: center;
             spacing: 8px;
-            Text { vertical-alignment: center; text: "Profile: " + profile-name; font-size: Theme.fs-label; color: Theme.text; }
+            Text { vertical-alignment: center; text: "Profile: " + profile-name + (profile-index > 0 ? " (" + profile-index + " of " + profile-count + ")" : ""); font-size: Theme.fs-label; color: Theme.text; }
             Rectangle { horizontal-stretch: 1; }
             Btn { label: "Change"; clicked => { cycle-profile(); } }
         }

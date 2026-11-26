@@ -38,6 +38,16 @@ component FeelChip inherits Rectangle {
             return reject;
         }
     }
+    // P1-4: visible 2px focus ring (Switch pattern).
+    if fs.has-focus : Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: 9px;
+        border-width: 2px;
+        border-color: Theme.accent-text;
+    }
     Text {
         width: 100%;
         height: 100%;
@@ -385,6 +395,8 @@ export component PedalsPage inherits PageScaffold {
     // JobKind::order value (-1 = idle) — the cards' Set up/down
     // disable + dim while their CaptureOp job (10) runs.
     in property <int> busy-kind: -1;
+    // P2-11: the "Unsaved changes" line, like Steering.
+    in property <bool> unsaved: false;
     callback set-up(int);          // pedal index 0 throttle, 1 brake, 2 clutch
     callback set-down(int);
     callback feel-selected(int, int); // (pedal, feel)
@@ -418,17 +430,22 @@ export component PedalsPage inherits PageScaffold {
     // FIX (inner shortfall): the shell sizes the page to its preferred
     // width, and the row only shares what the cards prefer - the cards
     // preferred 215px each (row 671px, ending x=874). `min-width:
-    // 224px` card widths (preview-exact: (696 - 2*12) / 3) make the
-    // row prefer 696px, so the page spans the full 736px column.
+    // 210px` card widths make the row prefer 654px (3*210 + 2*12),
+    // so the page spans the full 736px column at the design width
+    // AND fits the 656px column at the 880px minimum window — the
+    // old 224px (preview-exact: (696 - 2*12) / 3) preferred 696px
+    // and clipped the clutch card there.
     // CARDS-LAYOUT-RESEARCH §2: min-width (not `width`) so the cards
-    // can GROW past 224px on wider windows (explicit `width` caps
+    // can GROW past 210px on wider windows (explicit `width` caps
     // max == pref, can_grow == 0); the gaps are spacer Rectangles
     // (min-width 12px, stretch 0.05) that scale with the window.
+    // P2-11: "Unsaved changes" at the top, like Steering.
+    if unsaved : Text { text: "Unsaved changes"; font-size: Theme.fs-hint; color: Theme.warn; }
     HorizontalLayout {
         spacing: 0px;
         PedalCard {
             horizontal-stretch: 1;
-            min-width: 224px;
+            min-width: 210px;
             pedal-name: "Throttle";
             pct: throttle-pct;
             bar-color: Theme.ok;
@@ -488,7 +505,7 @@ export component PedalsPage inherits PageScaffold {
         Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
         PedalCard {
             horizontal-stretch: 1;
-            min-width: 224px;
+            min-width: 210px;
             pedal-name: "Brake";
             pct: brake-pct;
             bar-color: Theme.bad;
@@ -543,7 +560,7 @@ export component PedalsPage inherits PageScaffold {
         Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
         PedalCard {
             horizontal-stretch: 1;
-            min-width: 224px;
+            min-width: 210px;
             pedal-name: "Clutch";
             pct: clutch-pct;
             bar-color: Theme.accent;

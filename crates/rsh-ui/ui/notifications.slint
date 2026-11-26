@@ -72,8 +72,11 @@ export component BellButton inherits Rectangle {
         stroke: transparent;
     }
     if unread > 0 : Rectangle {
-        x: parent.width - 12px;
-        y: -4px;
+        // P3-6: fully inside the 32px button (was x parent.width-12,
+        // y -4 — the badge hung off the top-right corner and clipped
+        // at 150% scaling). The "9+" cap stays.
+        x: parent.width - 18px;
+        y: 0px;
         width: 18px;
         height: 18px;
         border-radius: 9px;
@@ -152,7 +155,7 @@ component NotificationRow inherits Rectangle {
     }
 }
 
-// ---------------------------------------------------------------- notifications drawer (344px, right edge)
+// ---------------------------------------------------------------- notifications drawer (360px, right edge)
 export component NotificationsDrawer inherits Rectangle {
     in property <[NotificationItem]> items;
     in property <int> unread;
@@ -160,8 +163,18 @@ export component NotificationsDrawer inherits Rectangle {
     callback mark-all-read();
     callback clear-all();
 
-    width: 344px;
-    height: 420px;
+    // P2-2: the height cap, passed by the shell (window height
+    // minus 104px: 64px top offset + 40px StatusBar) — the
+    // component root cannot read `parent` itself. Default is the
+    // design height (uncapped in practice).
+    in property <length> height-cap: 420px;
+
+    // P3-4: 360px wide (was 344px) — the title elided to
+    // "Notificatio…" with unread > 0. P2-2: the height caps at the
+    // window height minus 104px (64px top offset + 40px StatusBar)
+    // so the drawer never runs under the StatusBar on a short window.
+    width: 360px;
+    height: Math.min(420px, height-cap);
     border-radius: 12px;
     border-width: 1px;
     border-color: Theme.line;
@@ -189,7 +202,7 @@ export component NotificationsDrawer inherits Rectangle {
             // buttons instead of top-aligning in the header row.
             cross-axis-alignment: center;
             // A7: the title shrinks (elides) instead of pushing the
-            // buttons out of the 344px drawer.
+            // buttons out of the 360px drawer.
             Text { horizontal-stretch: 1; text: "Notifications"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; wrap: no-wrap; overflow: elide; }
             if unread > 0 : Text {
                 vertical-alignment: center;
