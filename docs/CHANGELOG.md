@@ -1,10 +1,36 @@
 # Changelog — RSH (Real Sim Hub)
 
 All notable changes to the RSH app and firmware. Current versions:
-**app v2.0.13 · firmware v4.0.6 · protocol v2.2 (frozen)**.
+**app v2.0.14 · firmware v4.0.6 · protocol v2.2 (frozen)**.
 Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
+
+## [2.0.14] — 2026-11-26 (FH4 wheel fix)
+
+App 2.0.14 + firmware 4.0.6 unchanged (protocol v2.2 frozen — no wire-format
+change, no firmware code change in this release).
+FH4 still showed no Wheel tab after v2.0.13: v2.0.13 wrote only the *required*
+GameInput RacingWheel subkeys; the mapping was incomplete vs Microsoft's
+example. This release writes the complete tree for both devices (vJoy
+1234BEAD00010004 + HID 1209525300010004): Labels (Buttons/Switches), DPad,
+Button1→0/Button2→1, Clutch→Rx/3 (clutch is now fed to Rx as well as wClutch,
+so the mapping is truthful), MaxWheelAngle 450 — per the Microsoft Learn
+example, value by value (unit-tested). vJoy EmuWheel envelope verified
+(8 axes, 128 buttons, 1 discrete POV × 4 Directions, FFB on); envelope
+validation now reports a wrong-shaped device without refusing to connect
+(feeding keeps working on default-shape devices; ETS2 unaffected). Daemon
+wheel-check self-check (mapping completeness + envelope + feeder state)
+surfaces in the wizard Drivers step and diagnostics — plain words, no
+"will work" claim. Feeder acquires device 1 and feeds neutral from backend
+start, so the wheel is alive before any game launches. Installer warns
+loudly when vJoyConfig.exe is missing; in-app repair (elevated) re-applies
+the envelope + both mapping trees. Smoke test asserts the complete tree
+after install and after the update install; packaging gate asserts the
+complete tree + argv match. FH4 sends no FFB data to vJoy (Granite 2018) —
+the goal is steering/pedals input, not FFB. No G29 spoof (user decision);
+Steam OEMData fix never applied (breaks the Store version). The FH4 Wheel
+tab itself is user-PC proof — it cannot be verified on Linux.
 
 ## [2.0.13] — 2026-11-26 (polish round, unreleased — proposal only)
 

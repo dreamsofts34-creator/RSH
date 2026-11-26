@@ -1626,7 +1626,7 @@ mod tests {
     /// Slint default copy too.
     #[test]
     fn app_version_matches_release_tag() {
-        assert_eq!(app_version(), "2.0.13");
+        assert_eq!(app_version(), "2.0.14");
     }
 
     /// L-4: a stub whose state flips between two reads — the
