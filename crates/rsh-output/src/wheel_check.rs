@@ -670,7 +670,7 @@ fn wide(text: &str) -> Vec<u16> {
 
 /// Open a HKLM subkey for reading.
 #[cfg(windows)]
-fn open_key(subkey: &str) -> Option<windows::Win32::Foundation::HKEY> {
+fn open_key(subkey: &str) -> Option<windows::Win32::System::Registry::HKEY> {
     use windows::Win32::System::Registry::{HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegOpenKeyExW};
     use windows::core::PCWSTR;
     let subkey_w = wide(subkey);
@@ -696,7 +696,7 @@ fn open_key(subkey: &str) -> Option<windows::Win32::Foundation::HKEY> {
 /// Read one value's raw bytes + type from an open key.
 #[cfg(windows)]
 fn query_value(
-    key: windows::Win32::Foundation::HKEY,
+    key: windows::Win32::System::Registry::HKEY,
     value_name: &str,
 ) -> Option<(windows::Win32::System::Registry::REG_VALUE_TYPE, Vec<u8>)> {
     use windows::Win32::System::Registry::{REG_VALUE_TYPE, RegQueryValueExW};

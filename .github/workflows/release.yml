@@ -838,7 +838,7 @@ jobs:
           $daemon = Join-Path $installDir "rsh-daemon.exe"
           Start-WaitOrFail $daemon @("--check", "--no-tray", "--no-connect", "--data-dir", $dataDir) 60 "daemon --check (IPC must answer)"
           Write-Host "Smoke test PASS: daemon --check exit 0 (IPC answers)."
-          # --- Update path: second install over the first --------
+          # --- Update path: install a second time over the first --------
           $version = "${{ steps.tag.outputs.version }}"
           $realDataDir = Join-Path $env:APPDATA "RSH"
           New-Item -ItemType Directory -Force -Path $realDataDir | Out-Null
