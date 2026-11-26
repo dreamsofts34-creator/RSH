@@ -38,11 +38,14 @@ internal static class Program
     static int inputReportSize;
     static long submitCount;
     static long lastLatencyUs;
-    static bool exitRequested;
+    static volatile bool exitRequested;
     static string transportName = "stdio";
     static string? dllSha256Cache;
     static bool dllSha256OkCache;
     static readonly Stopwatch sw = Stopwatch.StartNew();
+    // P3-2: serialises in-process file-log writers (Log is also
+    // called from the submit-latency callback thread).
+    static readonly object logLock = new();
     /// P2-4 (update4-fix): bound for the TCP connect-back (see
     /// `Run` — below the daemon's 30 s accept bound, far above a
     /// normal loopback connect).
@@ -116,12 +119,16 @@ internal static class Program
 
     static int Run(string[] args)
     {
-        var connectBack = ParseArgs(args);
-        // C-TOK-1: the loopback token comes from the ENVIRONMENT
-        // (`RSH_HM_SIDECAR_TOKEN`, set by RSH just for the spawn),
-        // never from argv — argv is world-readable via WMI / Process
-        // Explorer. `--token` is rejected by ParseArgs (above).
-        var token = Environment.GetEnvironmentVariable("RSH_HM_SIDECAR_TOKEN");
+        var (connectBack, token) = ParseArgs(args);
+        // v2.0.12 (H1 — PROVEN on the owner's PC): the loopback token
+        // comes from argv (`--token <nonce>`), NOT the environment.
+        // The old env transport (`RSH_HM_SIDECAR_TOKEN`) is dead: a
+        // non-elevated daemon launches this sidecar elevated via
+        // `runas`, and AIS builds a FRESH environment for the
+        // elevated child, dropping the runtime-set variable — so the
+        // sidecar exited 2 here before connecting. The nonce is
+        // single-use random and briefly visible in the process list /
+        // WMI — accepted; it is NEVER logged (presence only, below).
         if (connectBack is not null && string.IsNullOrEmpty(token))
         {
             // P2-7 (update4-fix): this used to bypass the file log
@@ -129,7 +136,7 @@ internal static class Program
             // connect-back failure left no trace in the file log,
             // the one place the daemon-side diagnostics look.
             // Log() writes stderr AND the file log.
-            Log("bad-args: --connect-back needs RSH_HM_SIDECAR_TOKEN in the environment (the token is never passed on the command line)");
+            Log("bad-args: --connect-back needs --token <nonce> (the one-time loopback token is required as a --token argument — it is no longer read from the environment)");
             return 2;
         }
 
@@ -168,8 +175,12 @@ internal static class Program
             {
                 AutoFlush = true,
             };
-            transport = "tcp";
-            transportName = "tcp";
+            // P3-6 (v2.0.13 polish): the Rust contract documents
+            // "tcp-loopback" (protocol.rs, manager.rs) — the sidecar
+            // sent "tcp", so the hello/reply transport never matched
+            // the documented value.
+            transport = "tcp-loopback";
+            transportName = "tcp-loopback";
         }
         else
         {
@@ -183,7 +194,14 @@ internal static class Program
             transport = "stdio";
         }
 
-        Console.CancelKeyPress += (_, _) => DisposeAll();
+        // P3-1 (v2.0.13 polish): Ctrl+C used to call DisposeAll()
+        // straight from the console signal thread while the main
+        // loop could be mid-submit — DisposeAll racing the loop's
+        // own dispose. Now the handler only sets the flag (and
+        // cancels the default terminate so the loop can exit
+        // cleanly); the loop breaks after the current command and
+        // disposes on its own thread (finally block below).
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; exitRequested = true; };
 
         var (dllSha256, dllSha256Ok) = CheckDllHash();
 
@@ -280,16 +298,23 @@ internal static class Program
 
     /// <summary>
     /// Parse the command line (M5 — strict). Only
-    /// `--connect-back 127.0.0.1:&lt;port&gt;` is accepted. Anything else —
-    /// an unknown flag, a missing value, a non-loopback host, a bad
-    /// port, a duplicate flag, or the removed `--token` flag (the
-    /// token now travels in `RSH_HM_SIDECAR_TOKEN`, C-TOK-1) — is a
-    /// distinctive stderr message + fast exit 2, never a silent
+    /// `--connect-back 127.0.0.1:&lt;port&gt;` and `--token &lt;nonce&gt;`
+    /// are accepted. Anything else — an unknown flag, a missing
+    /// value, a non-loopback host, a bad port, or a duplicate flag —
+    /// is a distinctive stderr message + fast exit 2, never a silent
     /// fallback to stdio with a half-parsed address.
+    /// The token travels on argv (v2.0.12, H1): AIS drops
+    /// environment variables set by the non-elevated daemon when it
+    /// launches this sidecar elevated via `runas`, so the old
+    /// `RSH_HM_SIDECAR_TOKEN` environment transport is dead — a
+    /// connect-back with no `--token` is `bad-args`, exit 2 (see
+    /// `Run`). `--token` with no value, and a duplicate `--token`,
+    /// are `bad-args` too.
     /// </summary>
-    static string? ParseArgs(string[] args)
+    static (string? ConnectBack, string? Token) ParseArgs(string[] args)
     {
         string? connectBack = null;
+        string? token = null;
         for (var i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -305,16 +330,31 @@ internal static class Program
                 case "--connect-back":
                     throw new InvalidOperationException(
                         "[sidecar] bad-args: --connect-back needs a value (127.0.0.1:<port>)");
+                case "--token" when i + 1 < args.Length:
+                    if (token is not null)
+                    {
+                        throw new InvalidOperationException(
+                            "[sidecar] bad-args: --token given twice");
+                    }
+                    token = args[++i];
+                    break;
                 case "--token":
                     throw new InvalidOperationException(
-                        "[sidecar] bad-args: --token is no longer accepted — the loopback token comes from the RSH_HM_SIDECAR_TOKEN environment variable");
+                        "[sidecar] bad-args: --token needs a value (the one-time loopback nonce)");
                 default:
+                    // P3-10 (v2.0.12 scan): name the POSITION, never
+                    // the value — a nonce passed as a bare argument
+                    // (no `--token`) would otherwise land in the
+                    // file log verbatim, breaking the "never logged
+                    // anywhere" rule for the one-time token (it is
+                    // single-use and dead by then, but the log must
+                    // not be the place a secret ever appears).
                     throw new InvalidOperationException(
-                        $"[sidecar] bad-args: unknown argument '{args[i]}' (only --connect-back 127.0.0.1:<port> is accepted)");
+                        $"[sidecar] bad-args: unknown argument at position {i} (only --connect-back 127.0.0.1:<port> and --token <nonce> are accepted; argument values are never logged)");
             }
         }
 
-        return connectBack;
+        return (connectBack, token);
     }
 
     static string ValidateConnectBack(string value)
@@ -325,8 +365,11 @@ internal static class Program
                 System.Globalization.CultureInfo.InvariantCulture, out var port)
             || port < 1 || port > 65535)
         {
+            // P3-10 (v2.0.12 scan): do not echo the supplied value
+            // — a malformed launch could pass the nonce here, and
+            // argument values are never logged.
             throw new InvalidOperationException(
-                $"[sidecar] bad-args: --connect-back must be 127.0.0.1:<port> (1-65535), got '{value}'");
+                "[sidecar] bad-args: --connect-back must be 127.0.0.1:<port> (1-65535)");
         }
 
         return value;
@@ -879,17 +922,37 @@ internal static class Program
             // Stderr is gone; the file log below may still work.
         }
 
-        try
+        // P3-2 (v2.0.13 polish): the file log had no locking —
+        // two sidecars share one daily file, and concurrent
+        // AppendAllText calls (same process via the submit-latency
+        // callback thread, or a second sidecar process) could
+        // collide on open and silently drop the line. A static
+        // lock serialises in-process writers; FileShare.ReadWrite
+        // + a short retry absorbs a cross-process open collision.
+        // Logging must still never break the protocol loop.
+        lock (logLock)
         {
-            var path = LogFilePath();
-            if (path is not null)
+            for (var attempt = 0; attempt < 3; attempt++)
             {
-                File.AppendAllText(path, line + Environment.NewLine);
+                try
+                {
+                    var path = LogFilePath();
+                    if (path is null) break;
+                    using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                    var bytes = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetBytes(line + Environment.NewLine);
+                    fs.Write(bytes, 0, bytes.Length);
+                    break;
+                }
+                catch (IOException) when (attempt < 2)
+                {
+                    Thread.Sleep(10);
+                }
+                catch
+                {
+                    // File log unwritable; stderr already carried the line.
+                    break;
+                }
             }
-        }
-        catch
-        {
-            // File log unwritable; stderr already carried the line.
         }
     }
 }

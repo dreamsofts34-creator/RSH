@@ -71,6 +71,14 @@ static RshWebotaAuth webotaAuth;
 
 // D9: baghair password ke WebOTA band hai (defense in depth — server
 // aam tor par start hi nahi hota, lekin agar ho bhi jaye to auth fail).
+// F-14 (polish round, documented accepted risk): HTTP Basic auth plain
+// HTTP (port 80) par chalti hai — SoftAP par TLS ka koi cert story nahi
+// hai. WPA2 AP par unicast traffic per-station encrypted hota hai, is
+// liye PSK ke baghair passive sniffer base64 credentials nahi parh
+// sakta — lekin jis ke paas PSK hai (user ne Wi-Fi password share kiya
+// ho) wo handshake capture karke decrypt/replay kar sakta hai. CSRF
+// token (neeche) cross-site upload rokta hai, credential sniffing nahi.
+// Is liye Wi-Fi password ko WebOTA password jitna hi secret mano.
 static bool authed() {
   if (!keystore_has_password()) {
     server.requestAuthentication();
@@ -339,11 +347,22 @@ static void handleUpload() {
       active = false;
       return;
     }
-    // R3-FW-08: Update.end(true) flash verify/write blocking hai — loop
-    // task WDT (5 s) mein subscribed hai, is liye end se pehle aur baad
-    // mein feed karo (webota_handle loop task se chalta hai).
-    esp_task_wdt_reset();
+    // F-15 (polish round): Update.end(true) flash verify/write blocking
+    // hai — ~1 MB image par 5 s task WDT window se zyada lag sakta hai
+    // (HW-VERIFY: asal duration board par napna baaqi hai). Pehle sirf
+    // end se pehle/baad feed hota tha — beech mein unfed rehta tha.
+    // Is liye loop task ko end() ke doran WDT se unsubscribe karo
+    // (esp_task_wdt_delete) aur foran baad dobara subscribe karo
+    // (esp_task_wdt_add). Sample task subscribed rehta hai (us ka feed
+    // chalta rehta hai), aur end() fail hone par purana firmware boot
+    // hota hai (image abhi bootable mark nahi hui). Trade-off: agar
+    // end() HAMESHA ke liye atak jaye to loop-task WDT panic nahi karega
+    // — lekin end() ka atakna pehle bhi reboot ke baghair recover nahi
+    // hota tha (sirf panic se reboot hota tha); ye window sirf end()
+    // call tak mehdood hai.
+    esp_task_wdt_delete(NULL);
     updateOk = Update.end(true);  // ESP image SHA bhi yahin verify hoti hai
+    esp_task_wdt_add(NULL);
     esp_task_wdt_reset();
     if (!updateOk) uploadError = "update end failed";
     active = false;

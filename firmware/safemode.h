@@ -19,8 +19,13 @@
 //     firmware mein hai — firmware rollback (Round 2C):
 //     `rsh_boot_firmware_rollback_due` sach hota hai aur caller doosri
 //     OTA slot par wapas jata hai (ping-pong rokne ke liye NVS "fwRb"
-//     flag, kamyab boot par saaf). Kamyab boot (AP waqt par up) dono
-//     counter zero karta hai.
+//     flag, kamyab boot par saaf).
+//   * F-02 (polish round): kamyab boot SIRF 60 s stable uptime ke baad
+//     darj hota hai (AP-up par nahi) — AP-up ke baad panic-loop karne
+//     wali kharab OTA pehle har boot ko SUCCESS gin kar rollback se
+//     bach jati thi. Caller (rsh.ino) PANIC/TASK_WDT/INT_WDT reset reason
+//     ko bhi pichle boot ki failure ke tor par counter mein darj karta
+//     hai (boot begin par), taake post-AP-up crash bhi accumulate ho.
 //   * Safe mode mein config apply nahi hoti — config_transaction.h ka
 //     safe-mode flag stage + commit dono ko BUSY (7) se rokta hai.
 //
@@ -33,6 +38,8 @@
 
 // ---------- Constants (plan + contract) ----------
 #define RSH_BOOT_AP_UP_DEADLINE_MS   15000u   // FW-3: AP up na ho to boot fail
+#define RSH_BOOT_STABLE_MS           60000u   // F-02: AP-up ke baad itni
+                                              // stable uptime = kamyab boot
 #define RSH_BOOT_MAX_CONSEC_FAILURES 3u       // itne lagatar fail -> fallback
 #define RSH_BOOTHOLD_SAFE_MS         5000u    // 5 s hold -> safe mode (§4.4)
 #define RSH_BOOTHOLD_KEYRESET_MS     10000u   // 10 s hold -> password clear (D7)
@@ -50,6 +57,14 @@ typedef struct {
   uint32_t lkg_consecutive_failures;  // LKG-source boot fail, lagatar
   uint8_t using_lkg;                  // is boot mein LKG source istemal ho rahi hai
   uint8_t counted_this_boot;          // is boot ka natija darj ho chuka hai
+  // F-02: runtime-only (NVS mein persist nahi hote — .ino sirf
+  // total/fails/lkgFails save karta hai). AP kab se up hai (pehli dafa
+  // up hone ka waqt) aur AP kabhi up hua ya nahi.
+  uint32_t ap_up_since_ms;
+  uint8_t ap_seen;
+  uint8_t crash_counted;    // F-02: is boot ke shuru mein pichle boot
+                            // ka crash ek dafa gin liya gaya (alag flag —
+                            // counted_this_boot is boot ka apna natija hai)
 } rsh_boot_counter_t;
 
 static inline void rsh_boot_counter_init(rsh_boot_counter_t *c) {
@@ -57,10 +72,16 @@ static inline void rsh_boot_counter_init(rsh_boot_counter_t *c) {
 }
 
 // Boot shuru: total barhao, is boot ka natija abhi darj nahi hua.
+// F-02: per-boot runtime state (ap_seen / ap_up_since_ms /
+// crash_counted) bhi reset hoti hai — warna pichle boot ki AP-up
+// agle boot ki deadline ko rok deti (ap_seen purana reh jata).
 static inline void rsh_boot_begin(rsh_boot_counter_t *c) {
   if (!c) return;
   c->total_boots++;
   c->counted_this_boot = 0;
+  c->ap_seen = 0;
+  c->ap_up_since_ms = 0;
+  c->crash_counted = 0;
 }
 
 // Is boot mein kaunsi config source istemal ho? Caller `using_lkg` ko
@@ -76,9 +97,25 @@ static inline rsh_boot_src_t rsh_boot_decide_source(const rsh_boot_counter_t *c,
   return RSH_BOOT_SRC_FACTORY;
 }
 
-// Boot ka natija ek dafa darj karo. Kamyab boot (AP waqt par up) dono
-// counter zero karta hai; fail sirf us source ka counter barhata hai jo
-// is boot mein istemal ho rahi thi. Dobara call no-op hai.
+// Pichle boot ki failure darj karo (F-02, rsh.ino se): reset reason
+// PANIC / TASK_WDT / INT_WDT / WDT ho to is boot ke shuru mein pichle
+// boot ka failure gino — warna pichle boot ki AP-up SUCCESS ne counter
+// pehle hi zero kar diye hote aur post-AP-up panic-loop kabhi rollback
+// tak na pahunche. Kamyab boot ke baad ek-off crash sirf 1 gin'ti hai
+// (agla kamyab boot use saaf kar deta hai); lagatar 3 panic boots hi
+// fallback ladder chalate hain. Dobara call (crash_counted) no-op hai.
+// NOTE: ye counted_this_boot ko NAHI chherta — is boot ka apna natija
+// (60 s stable ya 15 s deadline) rsh_boot_tick se alag darj hota hai.
+static inline void rsh_boot_record_crash(rsh_boot_counter_t *c) {
+  if (!c || c->crash_counted) return;
+  c->crash_counted = 1;
+  if (c->using_lkg) c->lkg_consecutive_failures++;
+  else c->consecutive_failures++;
+}
+
+// Boot ka natija ek dafa darj karo. Kamyab boot (60 s stable uptime)
+// dono counter zero karta hai; fail sirf us source ka counter barhata
+// hai jo is boot mein istemal ho rahi thi. Dobara call no-op hai.
 static inline void rsh_boot_record_outcome(rsh_boot_counter_t *c, uint8_t ap_up_in_time) {
   if (!c || c->counted_this_boot) return;
   c->counted_this_boot = 1;
@@ -123,15 +160,31 @@ typedef enum {
 // ap_up = SoftAP up hai (net_begin kamyab). boot_start_ms = power-on
 // (millis) ka waqt. Deadline ke baad AP up ho bhi jaye to is boot ka
 // fail wapas nahi hota — der se up hona bhi fail hai (counter sach bole).
-// (uint32 subtraction wrap-safe hai — millis ~49 din par wrap hota hai.)
+// F-02: AP-up par SUCCESS darj NAHI hota — sirf 60 s stable uptime
+// (RSH_BOOT_STABLE_MS) ke baad. AP-up se pehle deadline guzar jaye to
+// FAIL (pehle jaisa). (uint32 subtraction wrap-safe hai — millis
+// ~49 din par wrap hota hai.)
 static inline rsh_boot_tick_t rsh_boot_tick(rsh_boot_counter_t *c, uint8_t ap_up,
                                             uint32_t now_ms, uint32_t boot_start_ms) {
   if (!c || c->counted_this_boot) return RSH_BOOT_WAITING;
   if (ap_up) {
-    rsh_boot_record_outcome(c, 1);
-    return RSH_BOOT_SUCCESS;
+    if (!c->ap_seen) {
+      c->ap_seen = 1;
+      c->ap_up_since_ms = now_ms;
+    }
+    if ((uint32_t)(now_ms - c->ap_up_since_ms) >= RSH_BOOT_STABLE_MS) {
+      rsh_boot_record_outcome(c, 1);
+      return RSH_BOOT_SUCCESS;
+    }
+    return RSH_BOOT_WAITING;
   }
-  if ((uint32_t)(now_ms - boot_start_ms) >= RSH_BOOT_AP_UP_DEADLINE_MS) {
+  // Deadline SIRF tab jab AP kabhi up hi nahi hua (ap_seen==0): der se
+  // pehli dafa up hona fail hai. AP ek dafa up ho jaye to deadline khatam
+  // — us ke baad sirf 60 s stable window faisla karti hai (AP flap net
+  // ka masla hai, firmware crash nahi; panic loop board ko reboot karta
+  // hai, ap_seen dobara 0 se shuru hota hai).
+  if (!c->ap_seen &&
+      (uint32_t)(now_ms - boot_start_ms) >= RSH_BOOT_AP_UP_DEADLINE_MS) {
     rsh_boot_record_outcome(c, 0);
     return RSH_BOOT_FAILED;
   }

@@ -135,7 +135,12 @@ impl Discovery {
     /// small grace margin, so a misbehaving daemon can never block the
     /// fallback.
     fn resolve_mdns(&self) -> Option<IpAddr> {
-        let daemon = ServiceDaemon::new().ok()?;
+        // PERF P3-5 (polish round): one long-lived `ServiceDaemon`
+        // for the process instead of constructing (and shutting down)
+        // one per cache miss — the construction cost was paid on every
+        // first connect / post-TTL resolve. The daemon is never shut
+        // down now; only the per-query resolve is stopped.
+        let daemon = long_lived_mdns_daemon()?;
         let timeout_ms = u64::try_from(self.mdns_timeout.as_millis()).ok()?;
         let receiver = daemon
             .resolve_hostname(MDNS_HOSTNAME, Some(timeout_ms))
@@ -157,9 +162,21 @@ impl Discovery {
             }
         }
         let _ = daemon.stop_resolve_hostname(MDNS_HOSTNAME);
-        let _ = daemon.shutdown();
         found
     }
+}
+
+/// The process-wide mDNS daemon (PERF P3-5): created once, reused
+/// across resolves. `ServiceDaemon` is a cheap cloneable handle, so
+/// the static holds one and hands out clones.
+fn long_lived_mdns_daemon() -> Option<ServiceDaemon> {
+    static DAEMON: std::sync::OnceLock<ServiceDaemon> = std::sync::OnceLock::new();
+    if let Some(daemon) = DAEMON.get() {
+        return Some(daemon.clone());
+    }
+    let daemon = ServiceDaemon::new().ok()?;
+    let _ = DAEMON.set(daemon.clone());
+    Some(daemon)
 }
 
 /// Prefer an IPv4 answer (the board is IPv4); otherwise take any address.

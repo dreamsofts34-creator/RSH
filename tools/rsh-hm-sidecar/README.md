@@ -67,9 +67,10 @@ dotnet publish -c Release -r win-x64 --self-contained true
 # stdio (dev / when RSH itself runs elevated)
 RshCoreHiDcr.exe
 # TCP connect-back (production; RSH listens on loopback first).
-# The token comes from the environment, never argv (C-TOK-1):
-$env:RSH_HM_SIDECAR_TOKEN = "<128-bit hex>"
-RshCoreHiDcr.exe --connect-back 127.0.0.1:54321
+# The one-time token travels on argv (v2.0.12, H1) — never the
+# environment: AIS drops env vars set by the non-elevated daemon
+# when it launches the sidecar elevated via `runas`.
+RshCoreHiDcr.exe --connect-back 127.0.0.1:54321 --token <nonce>
 ```
 
 > Sandbox note: the TCP connect-back path is **sandbox-blocked**

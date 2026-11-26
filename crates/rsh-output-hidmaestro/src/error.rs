@@ -16,8 +16,14 @@ pub enum HidMaestroError {
     SidecarNotFound(PathBuf),
     /// The sidecar process could not be spawned.
     SpawnFailed(String),
-    /// No `hello` line arrived within the spawn timeout.
-    HelloTimeout,
+    /// No `hello` line arrived within the spawn timeout. The payload
+    /// is the enriched diagnostic (P1-1, v2.0.12 scan): which bound
+    /// was hit, the spawn PID, the sidecar exit code
+    /// (`STILL_ACTIVE` = alive but slow, not dead), and the ms
+    /// since spawn — the bare unit variant could not tell a slow
+    /// hello (first-run startup, DLL hash on a slow disk, AV scan)
+    /// from a dead sidecar in the daemon log.
+    HelloTimeout(String),
     /// The `hello` line was malformed or failed validation.
     BadHello(String),
     /// The sidecar's `HIDMaestro.Core.dll` hash is not the pinned hash.
@@ -58,8 +64,15 @@ pub enum HidMaestroError {
     CreateFailed(String),
     /// The sidecar died (EOF / crash / heartbeat timeout) mid-session.
     SidecarDied(String),
-    /// A sidecar reply did not arrive within the reply timeout.
-    ReplyTimeout,
+    /// A sidecar reply did not arrive within the reply timeout. The
+    /// payload is the enriched diagnostic (HID path sweep, v2.0.12):
+    /// which bound was hit, the spawn PID, the sidecar exit code
+    /// (`STILL_ACTIVE` = hung, not dead), and the ms since the last
+    /// reply — the bare unit variant could not tell a 120 s
+    /// install/create timeout (hung driver install, sidecar alive)
+    /// from a crashed sidecar, and the daemon log + Output page
+    /// showed only "stopped answering" either way.
+    ReplyTimeout(String),
     /// A sidecar reply was not valid JSON or failed validation.
     BadReply(String),
     /// `update` called while not connected.
@@ -68,8 +81,15 @@ pub enum HidMaestroError {
     UpdateFailed(String),
     /// D9: a single button number outside 1–32. Never clamped.
     InvalidButton(u8),
-    /// The sidecar already failed once and the one retry was used up —
-    /// fall back to vJoy (G3). Cleared by an explicit user re-select
+    /// The sidecar already failed once and the one retry was used up.
+    /// The message deliberately claims NO fallback (P2-5, v2.0.12
+    /// scan): whether a fallback actually happens is decided by the
+    /// selector, not the manager — on an explicit re-select there is
+    /// none, and the old "falling back to vJoy" text told the user
+    /// (toast + Output page) that RSH had switched to vJoy when vJoy
+    /// was not active at all. The selector's fallback outcome states
+    /// the fallback on the automatic path, where it really happens.
+    /// Cleared by an explicit user re-select
     /// ([`crate::SidecarManager::reset_fallback`]).
     FallbackNeeded,
     /// This backend only runs on Windows (sidecar + driver).
@@ -87,9 +107,9 @@ impl fmt::Display for HidMaestroError {
                 path.display()
             ),
             Self::SpawnFailed(msg) => write!(f, "Could not start the HIDMaestro sidecar: {msg}"),
-            Self::HelloTimeout => write!(
+            Self::HelloTimeout(detail) => write!(
                 f,
-                "The HIDMaestro sidecar did not answer in time. Try again or switch the output backend to vJoy."
+                "The HIDMaestro sidecar did not answer in time ({detail}). Try again or switch the output backend to vJoy."
             ),
             Self::BadHello(msg) => write!(f, "The HIDMaestro sidecar sent an invalid hello: {msg}"),
             Self::DllHashMismatch { expected, actual } => write!(
@@ -120,9 +140,9 @@ impl fmt::Display for HidMaestroError {
                 f,
                 "The HIDMaestro sidecar stopped unexpectedly ({msg}). Falling back to vJoy."
             ),
-            Self::ReplyTimeout => write!(
+            Self::ReplyTimeout(detail) => write!(
                 f,
-                "The HIDMaestro sidecar stopped answering. Falling back to vJoy."
+                "The HIDMaestro sidecar stopped answering: {detail}. Falling back to vJoy."
             ),
             Self::BadReply(msg) => write!(f, "The HIDMaestro sidecar sent an invalid reply: {msg}"),
             Self::NotConnected => write!(f, "HIDMaestro is not connected."),
@@ -133,7 +153,7 @@ impl fmt::Display for HidMaestroError {
             ),
             Self::FallbackNeeded => write!(
                 f,
-                "HIDMaestro already failed once and the retry was used up — falling back to vJoy. Re-select HIDMaestro in Output settings to try again."
+                "HIDMaestro already failed once and the retry was used up — re-select HIDMaestro in Output settings to try again."
             ),
             Self::UnsupportedPlatform => write!(
                 f,

@@ -117,10 +117,13 @@ pub enum ErrorCode {
     Unsupported = 6,
     /// `7` — board busy.
     Busy = 7,
+    /// `8` — `SET_PASSWORD` synchronous NVS write failed (F-07, firmware
+    /// 4.0.6): the password was NOT changed; retry or keep the old one.
+    NvsFail = 8,
 }
 
 impl ErrorCode {
-    /// Decode a status byte; `None` for values > 7.
+    /// Decode a status byte; `None` for values > 8.
     #[must_use]
     pub fn from_u8(b: u8) -> Option<Self> {
         Some(match b {
@@ -132,6 +135,7 @@ impl ErrorCode {
             5 => Self::PinConflict,
             6 => Self::Unsupported,
             7 => Self::Busy,
+            8 => Self::NvsFail,
             _ => return None,
         })
     }
@@ -595,12 +599,14 @@ mod tests {
     #[test]
     fn error_code_round_trip() {
         // Code 1 is BadPassword (v2.2, D3 — reuses the freed BadTag
-        // slot); every code 0..=7 decodes, 8+ does not.
-        for b in [0u8, 1, 2, 3, 4, 5, 6, 7] {
+        // slot); code 8 is NvsFail (firmware 4.0.6, F-07). Every
+        // code 0..=8 decodes, 9+ does not.
+        for b in [0u8, 1, 2, 3, 4, 5, 6, 7, 8] {
             assert!(ErrorCode::from_u8(b).is_some());
         }
         assert_eq!(ErrorCode::from_u8(1), Some(ErrorCode::BadPassword));
-        assert_eq!(ErrorCode::from_u8(8), None);
+        assert_eq!(ErrorCode::from_u8(8), Some(ErrorCode::NvsFail));
+        assert_eq!(ErrorCode::from_u8(9), None);
     }
 
     #[test]

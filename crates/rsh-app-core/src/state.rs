@@ -174,14 +174,18 @@ use rsh_engine::metrics::EngineMetrics;
 use rsh_engine::pipeline::OutputState as PipelineOutputState;
 use rsh_engine::pipeline::{PipelinePlan, ProcessingPipeline};
 use rsh_output::selector::{BackendFactories, BackendKind, SwitchOutcome, switch_backend};
+#[cfg(windows)]
+use rsh_output::vjoy::{RealVJoyDll, VJoyInterface};
 use rsh_output::vjoy::{VJOY_DOWNLOAD_URL, VJoyOutput, resolve_dll_path};
+#[cfg(windows)]
+use rsh_output::vjoy_config::configure_device_1_envelope;
 use rsh_output::{IJoystickOutput, ProcessedState, VJoyError};
 use rsh_output_hidmaestro::HidMaestroOutput;
 use rsh_output_hidmaestro::backend::UAC_NOTE;
 use rsh_output_hidmaestro::manager::resolve_sidecar_path;
 use rsh_profiles::bindings::{BindingError, BindingStore, is_app_action};
 use rsh_profiles::csharp_import::{
-    GameId, PedalCalibration, PerModuleTuning, SteeringCalibration, WheelProfile,
+    GameId, KNOWN_MODULES, PedalCalibration, PerModuleTuning, SteeringCalibration, WheelProfile,
     canonical_module_id,
 };
 use rsh_profiles::resolver::{
@@ -228,7 +232,7 @@ use crate::launcher::{GameLauncher, SystemSpawner};
 use crate::manual_games::ManualGameStore;
 use crate::snapshot::{
     ConnectionState, EncoderState, EngineSnapshot, EngineStats, LoopRateTracker, PedalSnapshot,
-    SnapshotInput, build_engine_stats,
+    SnapshotInput, build_engine_stats_cached,
 };
 use crate::system::{NullSink, ShutdownOutcome};
 use crate::telemetry_adapter::TelemetryCarSource;
@@ -978,6 +982,12 @@ pub struct AppStateCore {
     /// The engine supervisor std thread, while the engine task is
     /// running ([`None`] before start / after stop).
     engine_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Readiness receiver of a supervisor whose 5 s ready wait timed
+    /// out (CORE-P3-7, polish round): the thread may still report
+    /// ready a moment later, so the receiver is kept for the next
+    /// `start_engine` call to re-await instead of returning early
+    /// with a stale `Failed` status while the engine runs.
+    engine_ready_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     /// Frame channel into the running engine (the forwarder and test
     /// feeders send here), while the engine task is running.
     engine_frame_tx: Mutex<Option<tokio::sync::mpsc::Sender<StreamFrame>>>,
@@ -1009,6 +1019,14 @@ pub struct AppStateCore {
     /// `installing` / `install_error` are NOT cached — they are
     /// cheap lock reads and must stay live.
     vjoy_dll_cache: Mutex<VjoyDllCache>,
+    /// Last measured vJoy driver version (P3-9, v2.0.12 scan):
+    /// the live vJoy backend measures it at connect (see
+    /// [`IJoystickOutput::vjoy_driver_version`]), and `vjoy_status()`
+    /// caches it here so the version survives a switch away to
+    /// another backend (the live backend then measures nothing).
+    /// [`None`] until a vJoy backend has connected once — an
+    /// unmeasured version is never invented.
+    last_vjoy_driver_version: Mutex<Option<String>>,
     /// Cached Wi-Fi password-set flag (R3-D-08, see
     /// [`WifiPasswordCache`]): the Credential Manager read behind
     /// `wifi_status()` is cached the same way, so the ~1 Hz slow
@@ -1316,6 +1334,7 @@ impl AppStateCore {
             engine_cmd_tx: Mutex::new(None),
             engine_report_rx: Mutex::new(None),
             engine_thread: Mutex::new(None),
+            engine_ready_rx: Mutex::new(None),
             engine_frame_tx: Mutex::new(None),
             engine_last_report: Mutex::new(None),
             engine_encoders: Mutex::new(EngineEncoderAccum::default()),
@@ -1324,6 +1343,7 @@ impl AppStateCore {
             backend_migration_note: Mutex::new(backend_migration_note),
             vjoy_install: Mutex::new(VjoyInstallState::default()),
             vjoy_dll_cache: Mutex::new(VjoyDllCache::default()),
+            last_vjoy_driver_version: Mutex::new(None),
             wifi_password_cache: Mutex::new(WifiPasswordCache::default()),
             session_gate_open: Mutex::new(false),
             session_gate_held_frames: Mutex::new(0),
@@ -1659,6 +1679,14 @@ impl AppStateCore {
             // reply, unexpected reply, bad argument) keeps its own
             // type instead of collapsing into `Unknown`.
             SessionError::Control(_) => ConnectionError::ControlFailed,
+            // P3-2 (v2.0.12 scan): genuinely unknown future
+            // variants collapse to `Unknown` here — and the
+            // collapse must be VISIBLE, not silent: the only call
+            // site logs the unmapped variant (Debug) to the
+            // connection log when the classification comes back
+            // `Unknown`, so a future variant that lands here shows
+            // up in diagnostics instead of vanishing into a bare
+            // "Something went wrong".
             _ => ConnectionError::Unknown,
         }
     }
@@ -3010,9 +3038,13 @@ impl AppStateCore {
     /// loop rate (`None` p99s while unmeasured — never a fake 0).
     #[must_use]
     pub fn engine_stats(&self) -> EngineStats {
-        let metrics = *lock(&self.metrics);
+        // PERF P1-3 (polish round): the cached-stats variant — the
+        // three p99 sorts run at most every 100 ms instead of on
+        // every 200 Hz tick. The metrics lock is held mutably for
+        // the cache update, same short hold as before.
         let loop_hz = lock(&self.loop_rate).rate_hz();
-        build_engine_stats(&metrics, loop_hz)
+        let mut metrics = lock(&self.metrics);
+        build_engine_stats_cached(&mut metrics, loop_hz)
     }
 
     /// The latest snapshot (built by the most recent `ingest_frame`;
@@ -3081,8 +3113,8 @@ impl AppStateCore {
     /// a button restores the pipeline's own value on the next tick.
     ///
     /// * Game action: the source button's bit is cleared and the
-    ///   target is set while the button is held — `horn` sets bit 2
-    ///   (button 3, plus the `horn` flag), `shifter_up` /
+    ///   target is set while the button is held — `horn` sets bit 4
+    ///   (button 5, plus the `horn` flag), `shifter_up` /
     ///   `shifter_down` set bits 0/1, `gear_N` sets the decoded
     ///   `gear` field, `handbrake` drives the handbrake axis to
     ///   1.0. The game never sees the raw button as well.
@@ -3208,7 +3240,10 @@ impl AppStateCore {
                 Self::clear_bound_button(&mut out, button);
                 match action {
                     "horn" => {
-                        out.buttons |= 1 << 2;
+                        // HID P1-1: the canonical horn bit is 4
+                        // (stream `buttons` bit 4), not 2 — bit 2
+                        // is the accel pedal button.
+                        out.buttons |= 1 << 4;
                         out.horn = true;
                     }
                     "shifter_up" => out.buttons |= 1 << 0,
@@ -3485,6 +3520,16 @@ impl AppStateCore {
     /// mock backends here, the shell and settings paths use the real
     /// factories through [`AppStateCore::set_output_enabled`]).
     ///
+    /// The `output_enabled` flag is the toggle's truth: it is set
+    /// ONLY once the enable has actually happened (P1-1, v2.0.12
+    /// scan). Enabling starts from OFF and sets it `true` only when
+    /// the guard + deferred activation pass AND the backend
+    /// connects; a cooldown refusal, a failed activation, a switch
+    /// already in flight, or a failed connect all report the toggle
+    /// OFF. Disabling sets it `false` up front — stopping the engine
+    /// from sending is the safe direction even when a switch is in
+    /// flight.
+    ///
     /// When output is enabled while the [`NullSink`] is installed and
     /// a real backend is selected, this is the user-initiated moment
     /// the deferred startup backend is activated: startup never
@@ -3502,8 +3547,14 @@ impl AppStateCore {
         enabled: bool,
         factories: &BackendFactories,
     ) -> CommandOutputState {
-        *lock(&self.output_enabled) = enabled;
         if enabled {
+            // P1-1 (v2.0.12 scan): assume the enable fails — the
+            // flag reads OFF on every early return below (refusal,
+            // failed activation, switch in flight, failed connect)
+            // and is only set `true` once a backend actually
+            // connects. The old code set it `true` up front, so a
+            // refused/failed enable reported the toggle ON.
+            *lock(&self.output_enabled) = false;
             // P1-5 (update4-fix): the storm guard covers the enable
             // toggle too — see `hid_switch_cooldown_refusal`.
             if let Some(refused) = self.hid_switch_cooldown_refusal() {
@@ -3536,10 +3587,15 @@ impl AppStateCore {
             } else {
                 // No sink factory (test-only path — the real
                 // factories always provide one): connect on the
-                // live handle, as before.
+                // live handle, as before. The flag follows the
+                // connect outcome (P1-1): `connect_and_resend`
+                // reports the backend's connected state, so a
+                // failed connect leaves the toggle OFF.
                 let handle = self.backend_handle();
                 let mut backend = lock(&handle);
-                return self.connect_and_resend(&mut backend);
+                let state = self.connect_and_resend(&mut backend);
+                *lock(&self.output_enabled) = state.connected;
+                return self.output_state();
             };
             // The extracted handle is owned by this scope: the slow
             // connect + resend run on its own lock, never on the
@@ -3554,6 +3610,13 @@ impl AppStateCore {
             // like a switch, so it must not bypass the guard.
             let backend_kind = BackendKind::from_backend_name(lock(&backend).name());
             let connected = lock(&backend).try_connect();
+            // P1-1 (v2.0.12 scan): the flag is set from the connect
+            // outcome, not from the request — a failed connect
+            // leaves the toggle OFF even though the user asked for
+            // ON. A connected backend reports ON even if the single
+            // resend below fails (the engine keeps sending on its
+            // ticks; the failure is in the detail).
+            *lock(&self.output_enabled) = connected.is_ok();
             match connected {
                 Ok(()) => {
                     if backend_kind == Some(BackendKind::HidMaestro) {
@@ -3581,12 +3644,14 @@ impl AppStateCore {
             }
             *lock(&self.backend) = backend;
         } else {
+            // P1-1 (v2.0.12 scan): disabling sets the flag up
+            // front — stopping the engine from sending is the safe
+            // direction, even when a switch is in flight (the
+            // switch result is left alone; see `send_engine_output`).
+            *lock(&self.output_enabled) = false;
             // R2-09: same extract pattern for the neutral +
             // disconnect — a sidecar shutdown must not hold the
-            // backend lock either. If a switch is in flight the
-            // flag above is already false, so the engine sends
-            // nothing (see `send_engine_output`) and the switch
-            // result is left alone.
+            // backend lock either.
             let Ok(_switch_guard) = self.switch_in_flight.try_lock() else {
                 self.record_send(
                     false,
@@ -4309,10 +4374,25 @@ impl AppStateCore {
     /// was found (cached file probe — see
     /// [`Self::vjoy_dll_path`]), whether a background install is
     /// running, the last install failure, and the resolved DLL path.
-    /// `version` is [`None`]: there is no version read without
-    /// loading the DLL, and an unmeasured version is never invented.
+    /// `version` is the last measured driver version (P3-9, v2.0.12
+    /// scan — it used to be always [`None`]): the live vJoy backend
+    /// measures it at connect, and the value is cached so it
+    /// survives a switch away to another backend; [`None`] until a
+    /// vJoy backend has connected once, never invented.
     #[must_use]
     pub fn vjoy_status(&self) -> rsh_api::VjoyStatus {
+        // Read the live backend's measured version FIRST and drop
+        // the backend lock before taking the DLL-cache / install
+        // locks below (no lock-ordering vs the install thread,
+        // which never takes the backend lock).
+        let live_version = {
+            let backend = self.backend_handle();
+            lock(&backend).vjoy_driver_version()
+        };
+        if let Some(version) = &live_version {
+            *lock(&self.last_vjoy_driver_version) = Some(version.clone());
+        }
+        let version = live_version.or_else(|| lock(&self.last_vjoy_driver_version).clone());
         // Probe before taking the install lock: the probe takes the
         // cache lock, and no other path takes both locks in the
         // opposite order.
@@ -4323,7 +4403,35 @@ impl AppStateCore {
             installing: install.installing,
             install_error: install.error.clone(),
             dll_path: dll.map(|path| path.to_string_lossy().into_owned()),
-            version: None,
+            version,
+        }
+    }
+
+    /// Whether the vJoy driver behind the resolved DLL is actually
+    /// enabled (P2-6, v2.0.12 scan): `resolve_dll_path` only proves
+    /// the file exists, so a present DLL with a disabled driver used
+    /// to make `install_vjoy` answer "already installed" with no
+    /// repair path. Loading the DLL and asking it (`VJoyEnabled()`)
+    /// is a read-only probe — no device is acquired. Any probe
+    /// failure (no DLL, DLL will not load, entry point missing)
+    /// counts as NOT usable: reinstalling is the repair for a
+    /// corrupt DLL too. Windows-only in practice — `install_vjoy`
+    /// refuses non-Windows before this runs — and off Windows there
+    /// is no DLL to probe.
+    fn vjoy_driver_usable() -> bool {
+        #[cfg(windows)]
+        {
+            let Some(path) = resolve_dll_path() else {
+                return false;
+            };
+            let Ok(dll) = RealVJoyDll::load_from(&path) else {
+                return false;
+            };
+            dll.vjoy_enabled()
+        }
+        #[cfg(not(windows))]
+        {
+            false
         }
     }
 
@@ -4346,7 +4454,13 @@ impl AppStateCore {
         if !cfg!(windows) {
             return Err("vJoy is Windows-only".to_string());
         }
-        if resolve_dll_path().is_some() {
+        // P2-6 (v2.0.12 scan): DLL presence alone is NOT "already
+        // installed" — a present DLL with a disabled (or corrupt)
+        // driver is installable, so the installer re-runs as the
+        // repair path instead of the Settings button dead-ending
+        // with "already installed" while every switch fails with
+        // `DriverDisabled`.
+        if resolve_dll_path().is_some() && Self::vjoy_driver_usable() {
             return Ok("vJoy is already installed".to_string());
         }
         {
@@ -4990,7 +5104,32 @@ impl AppStateCore {
             *lock(&self.engine_cmd_tx) = None;
             *lock(&self.engine_report_rx) = None;
         }
+        // CORE-P3-7 (polish round): a live handle with a stale
+        // `Failed` status (ready-timeout path) is not "already
+        // running" — re-await the kept readiness receiver once more
+        // (up to 5 s). A supervisor that reported ready at 5.1 s
+        // heals the status instead of leaving the UI showing a dead
+        // engine while it serves connects.
         if lock(&self.engine_thread).is_some() {
+            if matches!(self.engine_status(), EngineTaskStatus::Failed { .. })
+                && let Some(ready_rx) = lock(&self.engine_ready_rx).take()
+            {
+                // A second 5 s wait: keep the receiver for yet
+                // another call if it times out again (the supervisor
+                // may still be starting).
+                match ready_rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(()) => {
+                        self.set_engine_status(
+                            EngineTaskStatus::Running { transport: None },
+                            "engine running, no transport — idle (watchdog neutral)".to_string(),
+                        );
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        *lock(&self.engine_ready_rx) = Some(ready_rx);
+                    }
+                }
+            }
             return Ok(());
         }
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(ENGINE_COMMAND_CAPACITY);
@@ -5012,6 +5151,11 @@ impl AppStateCore {
                     );
                     Ok(())
                 } else {
+                    // CORE-P3-7: keep the readiness receiver — the
+                    // supervisor may still report ready, and the next
+                    // `start_engine` re-awaits it (see above) instead
+                    // of leaving a stale `Failed` forever.
+                    *lock(&self.engine_ready_rx) = Some(ready_rx);
                     let reason = "engine supervisor did not report ready within 5 s".to_string();
                     self.set_engine_status(
                         EngineTaskStatus::Failed {
@@ -5482,8 +5626,23 @@ impl AppStateCore {
         }
         let live =
             BackendKind::from_backend_name(&self.backend_name()).unwrap_or(BackendKind::None);
-        let Some(fallback) = live.fallback() else {
-            return Err(SinkError::new(REFUSED));
+        // HID P2-4 (polish round): vJoy has no fallback target, so a
+        // mid-session vJoy death used to be an unrecovered silent
+        // output stop — one tick errored, the engine sent one neutral
+        // and then nothing, with no retry and no notification. Reconnect
+        // vJoy itself (same backend, same 30 s throttle as failover,
+        // once until an explicit re-select) and surface the loss in
+        // the engine detail so the UI can toast it.
+        let fallback = match live.fallback() {
+            Some(fallback) => fallback,
+            None if live == BackendKind::VJoy => {
+                self.note_engine_detail(
+                    "vJoy device was lost mid-session — attempting one reconnect (30 s throttle)"
+                        .to_string(),
+                );
+                BackendKind::VJoy
+            }
+            None => return Err(SinkError::new(REFUSED)),
         };
         *lock(&self.fallback_last_attempt) = Some(now);
         self.fallback_used.store(true, Ordering::SeqCst);
@@ -5556,10 +5715,19 @@ impl AppStateCore {
     pub fn activate_profile(&self, id: &str) -> Result<ProfileSummary, String> {
         let summary = {
             let mut store = lock(&self.store);
-            store
+            // CORE-P2-3 (polish round): snapshot first — a save
+            // failure after `activate` used to leave the active
+            // profile switched in memory while disk still had the old
+            // one (the switch silently reverted on restart).
+            let snapshot = store.snapshot();
+            if let Err(error) = store
                 .activate(id, true)
-                .map_err(|error| error.to_string())?;
-            store.save().map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())
+                .and_then(|()| store.save().map_err(|error| error.to_string()))
+            {
+                store.restore(snapshot);
+                return Err(error);
+            }
             Self::summary(&store, id)?
         };
         // A switch drops the old profile's draft (its edits belong to
@@ -5848,6 +6016,10 @@ impl AppStateCore {
         module: &str,
         enabled: bool,
     ) -> Result<bool, String> {
+        // CORE-P3-4 (polish round): see `set_tuning`.
+        if !KNOWN_MODULES.contains(&canonical_module_id(module).as_str()) {
+            return Err(format!("unknown module '{module}'"));
+        }
         let module = canonical_module_id(module);
         let active = {
             lock(&self.store)
@@ -5996,6 +6168,10 @@ impl AppStateCore {
         let name = name.trim().to_string();
         let summary = {
             let mut store = lock(&self.store);
+            // CORE-P2-3 (polish round): snapshot first — a save
+            // failure after `update` used to leave the renamed
+            // profile in memory while disk kept the old name.
+            let snapshot = store.snapshot();
             let mut profile = store
                 .list()
                 .iter()
@@ -6003,10 +6179,14 @@ impl AppStateCore {
                 .map(|stored| stored.profile.clone())
                 .ok_or_else(|| format!("no profile with id '{id}'"))?;
             profile.name.clone_from(&name);
-            store
+            if let Err(error) = store
                 .update(id, profile)
-                .map_err(|error| error.to_string())?;
-            store.save().map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())
+                .and_then(|()| store.save().map_err(|error| error.to_string()))
+            {
+                store.restore(snapshot);
+                return Err(error);
+            }
             Self::summary(&store, id)?
         };
         if lock(&self.store)
@@ -6238,8 +6418,12 @@ impl AppStateCore {
     /// Returns a message when the name is invalid or saving fails.
     pub fn create_profile(&self, name: &str) -> Result<ProfileSummary, String> {
         let mut store = lock(&self.store);
+        let snapshot = store.snapshot();
         let created = store.create(name).map_err(|error| error.to_string())?;
-        store.save().map_err(|error| error.to_string())?;
+        if let Err(error) = store.save().map_err(|error| error.to_string()) {
+            store.restore(snapshot);
+            return Err(error);
+        }
         let summary = Self::summary(&store, &created.id)?;
         self.note_slow_state_changed();
         Ok(summary)
@@ -6252,8 +6436,12 @@ impl AppStateCore {
     /// Returns a message for an unknown id or a store save failure.
     pub fn duplicate_profile(&self, id: &str) -> Result<ProfileSummary, String> {
         let mut store = lock(&self.store);
+        let snapshot = store.snapshot();
         let created = store.duplicate(id).map_err(|error| error.to_string())?;
-        store.save().map_err(|error| error.to_string())?;
+        if let Err(error) = store.save().map_err(|error| error.to_string()) {
+            store.restore(snapshot);
+            return Err(error);
+        }
         let summary = Self::summary(&store, &created.id)?;
         self.note_slow_state_changed();
         Ok(summary)
@@ -6266,8 +6454,15 @@ impl AppStateCore {
     /// Returns a message for an unknown id or a store save failure.
     pub fn delete_profile(&self, id: &str) -> Result<(), String> {
         let mut store = lock(&self.store);
-        store.delete(id).map_err(|error| error.to_string())?;
-        store.save().map_err(|error| error.to_string())?;
+        let snapshot = store.snapshot();
+        if let Err(error) = store
+            .delete(id)
+            .map_err(|error| error.to_string())
+            .and_then(|()| store.save().map_err(|error| error.to_string()))
+        {
+            store.restore(snapshot);
+            return Err(error);
+        }
         self.note_slow_state_changed();
         Ok(())
     }
@@ -6281,10 +6476,14 @@ impl AppStateCore {
     /// fails schema checks, or saving fails.
     pub fn import_profile(&self, path: &str) -> Result<ProfileSummary, String> {
         let mut store = lock(&self.store);
+        let snapshot = store.snapshot();
         let imported = store
             .import_profile(Path::new(path))
             .map_err(|error| error.to_string())?;
-        store.save().map_err(|error| error.to_string())?;
+        if let Err(error) = store.save().map_err(|error| error.to_string()) {
+            store.restore(snapshot);
+            return Err(error);
+        }
         let summary = Self::summary(&store, &imported.id)?;
         self.note_slow_state_changed();
         Ok(summary)
@@ -6943,6 +7142,9 @@ impl AppStateCore {
     #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn get_tuning(&self, module: &str) -> TuningSettings {
+        // CORE-P3-4 (polish round): an unknown module reads as the
+        // neutral default (no stored entry can exist for it); the
+        // write paths above reject it outright.
         let module = canonical_module_id(module);
         if let Some(tuning) = lock(&self.tunings).get(&module) {
             return tuning.clone();
@@ -7045,6 +7247,13 @@ impl AppStateCore {
     /// Returns a message when the tuning fails validation or there is
     /// no active profile to draft against.
     pub fn set_tuning(self: &Arc<Self>, tuning: &TuningSettings) -> Result<TuningSettings, String> {
+        // CORE-P3-4 (polish round): an unknown module id used to be
+        // accepted, dirtied the draft and persisted into the profile
+        // while the pipeline never read it — a silent no-op that
+        // looked saved.
+        if !KNOWN_MODULES.contains(&canonical_module_id(&tuning.module).as_str()) {
+            return Err(format!("unknown module '{}'", tuning.module));
+        }
         let errors = validate_tuning(tuning);
         if !errors.is_empty() {
             return Err(format!("invalid tuning: {}", errors.join("; ")));
@@ -8148,6 +8357,23 @@ fn run_vjoy_install_inner() -> Result<(), String> {
         ));
     }
     if resolve_dll_path().is_some() {
+        // FH4 fix #1 (v2.0.13): vJoy installs with its own default
+        // device-1 shape, not the EmuWheel envelope wheel games
+        // need (8 axes, 128 buttons, 1 discrete POV, all FFB — see
+        // `rsh_output::vjoy_config`). Configure device 1 now,
+        // while the user is here — one UAC prompt (the installer
+        // already prompted once). The RSH installer does the same
+        // step directly (it is already elevated) and also writes
+        // the GameInput RacingWheel mapping, so a failed config
+        // here is reported as a failure with that repair path
+        // instead of a silent wrong-shaped device: without the
+        // envelope no wheel game can classify the device.
+        #[cfg(windows)]
+        if let Err(error) = configure_device_1_envelope() {
+            return Err(format!(
+                "vJoy installed, but its device 1 could not be configured as a wheel for Windows.Gaming.Input games (for example Forza Horizon 4): {error}"
+            ));
+        }
         Ok(())
     } else {
         Err(
@@ -8841,6 +9067,22 @@ where
                         typed,
                         &format!("session activation failed: {error}"),
                     );
+                    // P3-2 (v2.0.12 scan): the wildcard arm of
+                    // `classify_session_error` collapses genuinely
+                    // unknown future variants to `Unknown` — log the
+                    // unmapped variant itself, so the collapse is
+                    // visible in the connection log instead of
+                    // silent. (`Unknown` is only produced by that
+                    // wildcard arm, so this fires exactly when a
+                    // variant went unmapped.)
+                    if typed == ConnectionError::Unknown {
+                        state.push_connection_log(
+                            "ERROR",
+                            &format!(
+                                "unmapped SessionError variant collapsed to Unknown: {error:?}"
+                            ),
+                        );
+                    }
                     // Fail-closed: the gate stays exactly as it was
                     // (closed in production — never opened on a
                     // failed GET_CAPS).
@@ -10244,7 +10486,7 @@ mod tests {
             // consulted, and with the fallback wording.
             if *self.latched.lock().expect("latched lock poisoned") {
                 return Err(VJoyError::DriverNotFound(
-                    "HIDMaestro already failed once and the retry was used up — falling back to vJoy."
+                    "HIDMaestro already failed once and the retry was used up — re-select HIDMaestro in Output settings to try again."
                         .to_string(),
                 ));
             }
@@ -10489,9 +10731,11 @@ mod tests {
         // is delivered. (Hotfix v1.0.1: the enable now activates the
         // selected backend through the selector instead of only
         // `try_connect`-ing the NullSink, so the failure names the
-        // backend activation, not a bare connect.)
+        // backend activation, not a bare connect.) P1-1 (v2.0.12
+        // scan): the failed enable reports the toggle OFF — the
+        // flag is set only once an enable actually happens.
         let enabled = state.set_output_enabled(true);
-        assert_eq!(enabled.enabled, Some(true));
+        assert_eq!(enabled.enabled, Some(false));
         assert!(!enabled.connected);
         assert!(
             enabled.detail.contains("backend activation failed"),
@@ -10506,6 +10750,11 @@ mod tests {
         // Enable acquires the device and sends the last output (neutral).
         let enabled = state.set_output_enabled(true);
         assert!(enabled.connected);
+        // P1-1 (v2.0.12 scan): the successful enable reports the
+        // toggle ON — the flag is set only once an enable actually
+        // happens (the mirror of the failed-enable OFF assertions in
+        // `null_sink_state_reports_not_connected_and_not_sent`).
+        assert_eq!(enabled.enabled, Some(true));
         assert_eq!(sent.lock().expect("sent lock").len(), 1);
         assert_eq!(
             *sent.lock().expect("sent lock").last().unwrap(),
@@ -10775,6 +11024,14 @@ mod tests {
             !enabled.connected,
             "no backend is activated during the cooldown"
         );
+        // P1-1 (v2.0.12 scan): a refused enable reports the
+        // toggle OFF — the flag is set only once an enable
+        // actually happens.
+        assert_eq!(
+            enabled.enabled,
+            Some(false),
+            "a cooldown-refused enable must not report ON"
+        );
         assert!(
             enabled.detail.contains("retry in 30 s"),
             "the toggle is refused by the cooldown: {}",
@@ -11043,6 +11300,23 @@ mod tests {
         assert_eq!(status.install_error, None);
         assert_eq!(status.dll_path, None);
         assert_eq!(status.version, None, "version is never invented");
+    }
+
+    /// P3-9 (v2.0.12 scan): the last measured driver version is
+    /// reported (and survives a backend that measures nothing) —
+    /// the live read is covered by the `vJoy` backend's own test
+    /// (`vjoy_driver_version_is_measured_at_connect`); this pins
+    /// the cache half.
+    #[test]
+    fn vjoy_status_returns_last_measured_driver_version() {
+        let (state, _dir) = test_state();
+        assert_eq!(state.vjoy_status().version, None);
+        *lock(&state.last_vjoy_driver_version) = Some("2.2.2".to_string());
+        assert_eq!(
+            state.vjoy_status().version.as_deref(),
+            Some("2.2.2"),
+            "the cached measurement is reported"
+        );
     }
 
     #[test]
@@ -12288,8 +12562,8 @@ mod tests {
         let received = drive_tick(&state, &sent, &output);
         assert_eq!(
             received.buttons,
-            1 << 2,
-            "only the horn bit (button 3) survives — source bits 4/5/6 are cleared"
+            1 << 4,
+            "only the horn bit (button 5) survives — source bits 4/5/6 are cleared"
         );
         assert!(received.horn, "horn flag follows the bound horn bit");
         assert_eq!(received.gear, 2, "gear_2 sets the decoded gear field");
@@ -12341,7 +12615,7 @@ mod tests {
         assert!(!received.horn);
         output.long_press_buttons = 1 << 5;
         let received = drive_tick(&state, &sent, &output);
-        assert_eq!(received.buttons, 1 << 2, "horn bit only");
+        assert_eq!(received.buttons, 1 << 4, "horn bit only");
         assert!(received.horn);
         // Long-press app action: queues once on the threshold edge,
         // not once per tick while held.

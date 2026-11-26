@@ -126,38 +126,40 @@ jobs:
         if: steps.check.outputs.run == 'true'
         run: cargo fmt --all -- --check
 
-  # TRIPWIRE guard (release.yml "Write NSIS script" run: block):
-  # GitHub rejects a run: value over 21,000 chars — a real rejection
-  # was observed at 22,024 chars (0 s failed run, no jobs). This job
-  # parses release.yml and fails if that block's parsed value exceeds
-  # 20,800 chars, so the block can never grow back to the limit. The
-  # PARSED value (not the raw YAML text) is what counts, so the check
-  # uses PyYAML, not a line count.
-  nsis-block-guard:
-    name: nsis-block-guard
+  # P1-5 (v2.0.13 polish): CI validation of the NSIS script —
+  # a typo used to be caught only ~45 min into a release (the
+  # first makensis invocation in the repo was the release
+  # workflow's "Build NSIS installer" step). This job compiles
+  # the COMMITTED installer/rsh.nsi on every push: dummy
+  # version 0.0.0-test substituted for ${VERSION} (the same
+  # -replace the release workflow does), dummy staged files
+  # (the script only needs them to exist at compile time —
+  # empty files package fine), dummy ESTIMATEDSIZEKB. It is a
+  # compile-only check: no install, no signing, no firmware.
+  # It REPLACES the old nsis-block-guard job (P1-1): the guard
+  # measured the release.yml `run:` block that no longer exists
+  # — the script is committed now, so there is nothing to guard.
+  nsis-check:
+    name: nsis-check
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: NSIS run-block must stay under 20,800 chars (parsed)
+      - name: Install NSIS (makensis)
+        run: sudo apt-get update && sudo apt-get install -y nsis
+      - name: Stage dummy files + substitute version + makensis
         shell: bash
         run: |
-          python3 - <<'PYEOF'
-          import sys
-          try:
-              import yaml
-          except ImportError:
-              print("::error::PyYAML is not available on the runner — cannot parse release.yml.")
-              sys.exit(1)
-          doc = yaml.safe_load(open(".github/workflows/release.yml"))
-          steps = doc["jobs"]["release"]["steps"]
-          block = next(s["run"] for s in steps if s.get("name") == "Write NSIS script")
-          n = len(block)
-          print(f"Write NSIS script run: block is {n} chars (guard 20,800; GitHub rejects above 21,000).")
-          if n > 20800:
-              print(f"::error::NSIS run: block is {n} chars, over the 20,800-char guard (GitHub rejects above 21,000). Move new content to OTHER steps and trim comments inside the block — do not grow it.")
-              sys.exit(1)
-          PYEOF
+          set -euo pipefail
+          mkdir -p target/release src-tauri/binaries tools/rsh-hm-sidecar firmware/.pio/build/esp32dev release-staging
+          for f in target/release/rsh-daemon.exe target/release/rsh-ui.exe src-tauri/binaries/RshCoreHiDcr-x86_64-pc-windows-msvc.exe src-tauri/binaries/HIDMaestro.Core.dll tools/rsh-hm-sidecar/HIDMaestro-LICENSE.txt firmware/.pio/build/esp32dev/firmware-signed.bin; do
+            : > "$f"
+          done
+          sed 's/${VERSION}/0.0.0-test/g' installer/rsh.nsi > /tmp/rsh-check.nsi
+          cp /tmp/rsh-check.nsi installer/rsh-check.nsi
+          makensis -DESTIMATEDSIZEKB=1 installer/rsh-check.nsi
+          rm -f installer/rsh-check.nsi
+          test -f release-staging/RSH_0.0.0-test_x64-setup.exe
 
   clippy:
     name: clippy
@@ -1082,7 +1084,7 @@ jobs:
     timeout-minutes: 10
     needs:
       - fmt
-      - nsis-block-guard
+      - nsis-check
       - clippy
       - clippy-windows
       - test-linux

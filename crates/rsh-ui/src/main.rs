@@ -338,12 +338,33 @@ pub fn chart_commands(samples: &VecDeque<f32>, min_v: f32, max_v: f32) -> String
     }
     let n = samples.len();
     let span = (max_v - min_v).max(f32::EPSILON);
-    let mut out = String::new();
+    // PERF P2-4: decimate to ≤101 plotted points — the chart is a
+    // 380 px viewBox, so 100 points is one per 3.8 px (visually
+    // identical to 200) and halves the formatting work per rebuild
+    // (2 Hz while Diagnostics is open). The last sample is always
+    // plotted so the trace reaches the right edge. A version-keyed
+    // cache was considered and REJECTED: the history moves every
+    // live frame, so a push-count version never hits at the 2 Hz
+    // build, and a (len, first, last) probe is unsound — a push+pop
+    // with repeated values changes the interior while first/last/
+    // len stay the same. Incremental append is likewise invalid:
+    // x = i/(n-1)*380 shifts every surviving point when the window
+    // slides, so old points do NOT re-format identically.
+    let stride = n.div_ceil(100).max(1);
+    let mut vals = [0.0f32; 101];
+    let mut m = 0usize;
     for (i, v) in samples.iter().enumerate() {
-        let x = i as f32 / (n - 1) as f32 * 380.0;
+        if i % stride == 0 || i + 1 == n {
+            vals[m] = *v;
+            m += 1;
+        }
+    }
+    let mut out = String::new();
+    for (j, v) in vals[..m].iter().enumerate() {
+        let x = j as f32 / (m - 1) as f32 * 380.0;
         // y spans 85 (min) .. 5 (max) inside the 90px viewBox.
         let y = 85.0 - (v.clamp(min_v, max_v) - min_v) / span * 80.0;
-        if i == 0 {
+        if j == 0 {
             let _ = write!(out, "M {x:.1} {y:.1}");
         } else {
             let _ = write!(out, " L {x:.1} {y:.1}");
@@ -967,8 +988,10 @@ enum JobKind {
     Reconnect,
     /// Transport switch (`connect`).
     Transport,
-    /// Output-backend switch (`set_output_backend`, up to 390 s while
-    /// the user answers UAC + the sidecar spawns).
+    /// Output-backend switch (`set_output_backend`, 420 s job timeout
+    /// over the 390 s IPC bound while the user answers UAC + the
+    /// sidecar spawns; P1-1 invariant: job > IPC > daemon worst
+    /// case incl. UAC).
     Backend,
     /// Firmware check (board vs bundled version).
     FirmwareCheck,
@@ -1029,8 +1052,17 @@ impl JobKind {
         match self {
             // The probe and the seed fetch it follows share the
             // 15 s bound (the seed is ~35 round-trips on a live
-            // daemon; a dead one fails fast per call).
-            JobKind::Reconnect | JobKind::ReconnectSeed => Duration::from_secs(15),
+            // daemon; a dead one fails fast per call). GameOp
+            // shares it too (UI-4, v2.0.12): a game add / update /
+            // remove / launch / stop gets 15 s — it must exceed the
+            // 10 s game-write / launch IPC budget
+            // (`GAME_WRITE_TIMEOUT` / `GAME_LAUNCH_TIMEOUT`), or a
+            // healthy 5–10 s write was declared timed out, its
+            // apply dropped, and the dialog left open with no inline
+            // error (the Bug-2 shape).
+            JobKind::Reconnect | JobKind::ReconnectSeed | JobKind::GameOp => {
+                Duration::from_secs(15)
+            }
             // P1-1 (update4-fix): 420 s. Must exceed the 390 s
             // backend-switch IPC bound (see `IpcApi::set_output_backend`),
             // which itself must exceed the daemon worst case incl. a
@@ -1060,8 +1092,7 @@ impl JobKind {
             | JobKind::BindingOp
             | JobKind::CaptureOp
             | JobKind::LearnOp
-            | JobKind::LearnToggle
-            | JobKind::GameOp => Duration::from_secs(5),
+            | JobKind::LearnToggle => Duration::from_secs(5),
         }
     }
 
@@ -1170,11 +1201,13 @@ const FLAP_DOWN_WINDOW: Duration = Duration::from_secs(10);
 /// double-click advances exactly one step.
 const SETUP_STEP_DEBOUNCE: Duration = Duration::from_millis(300);
 /// How long an error message stays in the bottom status bar before
-/// the 1 Hz tick clears it (requested: every error hides after ~1 s;
-/// the tick granularity makes the real range 1–2 s).
-const STATUS_ERROR_LIFETIME: Duration = Duration::from_secs(1);
+/// the 1 Hz tick clears it (UI-5, v2.0.12: 4 s, the same as info /
+/// success — the old 1 s flash was too short to read, and the tick
+/// granularity made the real range 0–2 s).
+const STATUS_ERROR_LIFETIME: Duration = Duration::from_secs(4);
 /// How long an informational message stays (P1-3: info + success
-/// both live 4 s — long enough to read, unlike the 1 s error flash).
+/// both live 4 s — long enough to read; UI-5: errors live 4 s too
+/// now, the old 1 s error flash was unreadable).
 const STATUS_INFO_LIFETIME: Duration = Duration::from_secs(4);
 
 /// F12 (v2.0.3): a death within this long after a reconnect belongs
@@ -1221,6 +1254,25 @@ fn daemon_error_for(live: bool, status: Option<(String, String)>) -> String {
     }
 }
 
+/// Format a Unix timestamp as `HH:MM:SS UTC` (CORE-P3-8): the
+/// second-instance record's `at_unix` in the notification, so the
+/// user (and a diagnostics report) can match it to the UI spawn.
+/// No chrono dependency in this crate — plain arithmetic on the
+/// seconds since midnight UTC. `0` (no usable timestamp) reads as
+/// "unknown time", never as 1970.
+fn format_unix_time(at_unix: u64) -> String {
+    if at_unix == 0 {
+        return "unknown time".to_string();
+    }
+    let secs = at_unix % 86_400;
+    format!(
+        "{:02}:{:02}:{:02} UTC",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
 /// Write one Extras module `-on` prop by module index (H7, FC2):
 /// 0 handbrake, 1 shifter, 2 horn, 3 led. The props are `MainWindow`
 /// in-out props, so Rust can revert a toggle the backend rejected.
@@ -1248,17 +1300,20 @@ fn set_extras_on_prop(win: &MainWindow, index: usize, value: bool) {
 /// stderr — the Xvfb smoke run reads the busy on/off off the log.
 /// `kind` is the [`JobKind::order`] value for the running job
 /// (DS-54: `-1` = idle) — screens disable + dim the button that
-/// started it while it runs.
-fn set_busy_props(win: &MainWindow, busy: bool, label: &str, kind: i32) {
+/// started it while it runs. `elapsed` is the Backend switch's
+/// `m:ss` wait (P1-6, "" otherwise).
+fn set_busy_props(win: &MainWindow, busy: bool, label: &str, kind: i32, elapsed: &str) {
     if win.get_busy() == busy
         && win.get_busy_label().as_str() == label
         && win.get_busy_kind() == kind
+        && win.get_busy_elapsed().as_str() == elapsed
     {
         return;
     }
     win.set_busy(busy);
     win.set_busy_label(label.into());
     win.set_busy_kind(kind);
+    win.set_busy_elapsed(elapsed.into());
     if busy {
         ui_log!("RSH-UI busy: {label}");
     } else {
@@ -1317,6 +1372,22 @@ enum JobDone {
     Backend {
         index: i32,
         result: Result<String, UserError>,
+    },
+    /// Backend-switch timeout re-query finished (HID-3, v2.0.12):
+    /// the switch job timed out, so the UI asked the daemon for its
+    /// LIVE backend instead of trusting the UI-side cache.
+    /// `requested` is the Settings segment the timed-out switch
+    /// asked for (0 `HIDMaestro`, 1 vJoy); `backend` is what the
+    /// daemon reports right now — `None` when the re-query itself
+    /// did not answer, so the timeout stands as a failure. HID
+    /// P3-5 (v2.0.13): the re-query polls a few times before it
+    /// reports, so `backend` is the last of several samples — a
+    /// switch that completed mid-poll reports its success, and a
+    /// still-old backend means "still switching after N polls",
+    /// not one unlucky sample.
+    BackendRequery {
+        requested: i32,
+        backend: Option<String>,
     },
     /// Firmware check finished (board vs bundled version).
     FirmwareCheck(Result<FirmwareCheck, UserError>),
@@ -1863,6 +1934,13 @@ struct Ctx {
     /// id chosen in the dialog (`None` = no profile bound).
     game_dialog_edit_id: Rc<RefCell<Option<String>>>,
     game_dialog_profile_id: Rc<RefCell<Option<String>>>,
+    /// One idempotency key per add-dialog session (P1-3, v2.0.12):
+    /// minted when the dialog opens for a NEW add, kept for the
+    /// dialog's lifetime so a Save retried after a client-side
+    /// timeout carries the same key and the daemon returns the
+    /// already-created entry instead of a duplicate. `None` for an
+    /// Edit (updates are idempotent by id and take no key).
+    game_dialog_idempotency_key: Rc<RefCell<Option<String>>>,
     /// R2-11: the games list the profile presets were last built
     /// from — the presets model is only rebuilt when it changed.
     presets_games: Rc<RefCell<Vec<GameSummary>>>,
@@ -1953,15 +2031,28 @@ struct Ctx {
     wifi_rejoining: Rc<Cell<bool>>,
     wifi_rejoin_since: Rc<Cell<Option<Instant>>>,
     /// P2 (v2.0.10 HID retest, Bug 1 retry storm): when the
-    /// backend-selector cooldown ends — set by ANY output-backend
-    /// switch failure (Err, wrong-backend success, or job timeout,
-    /// including a daemon-side "retry in 30 s" refusal, which
-    /// arrives here as an ordinary `Err` — no error text is
-    /// parsed), cleared on a genuine switch success or on expiry
-    /// by the 1 Hz tick. `None` = no cooldown. The Slint
-    /// `backend-cooldown-secs` prop (seconds left, 0 = idle) is
-    /// driven from this by [`Ctx::sync_backend_cooldown`].
+    /// backend-selector cooldown ends — set by a `HIDMaestro`-requested
+    /// switch failure only (HID-4, v2.0.12: a vJoy failure must not
+    /// lock the user out of `HIDMaestro`, the daemon storm guard
+    /// counts `HIDMaestro` attempts only; a backend-job timeout
+    /// re-queries the live backend first, see HID-3, and arms only
+    /// when the re-query itself fails), cleared on a genuine switch
+    /// success or on expiry by the 1 Hz tick. `None` = no cooldown.
+    /// The Slint `backend-cooldown-secs` prop (seconds left, 0 =
+    /// idle) is driven from this by [`Ctx::sync_backend_cooldown`].
     backend_cooldown_until: Rc<Cell<Option<Instant>>>,
+    /// HID-3 (v2.0.12): the Settings segment the in-flight backend
+    /// switch requested (0 `HIDMaestro`, 1 vJoy) — recorded by
+    /// [`Ctx::start_backend_job`] so a backend-job timeout can
+    /// re-query the live backend and tell a switch that actually
+    /// succeeded from one still running. `None` = no switch in
+    /// flight. Cleared when the switch resolves (success, failure,
+    /// or the timeout re-query's verdict).
+    backend_job_requested: Rc<Cell<Option<i32>>>,
+    /// HID-3 (v2.0.12): true while a backend-timeout re-query job
+    /// is in flight — a second backend timeout while one runs must
+    /// not spawn another (the re-query's own verdict reports).
+    backend_requery_in_flight: Rc<Cell<bool>>,
     /// Last `password_set` value `sync_wifi_password_state` saw
     /// (R3-UI-02): the success message is cleared when the state
     /// moves on — otherwise it persists across Settings visits
@@ -2034,6 +2125,11 @@ struct Ctx {
     /// `mark_spawn_latched` does not notify the same fatal reason
     /// twice. `None` = the generic "not running" was shown.
     last_dead_detail: Rc<RefCell<Option<String>>>,
+    /// CORE-P3-8 (v2.0.13): the `at_unix` of the second-instance
+    /// `info` record already surfaced, so `sync_daemon_error`'s
+    /// 1 Hz safety call notifies once per record, not once per
+    /// second. `None` = none surfaced yet.
+    last_second_instance_at: Rc<Cell<Option<u64>>>,
     /// F12 (v2.0.3): when the current down-episode started (set by
     /// `mark_dead`, cleared by `swap_to_live`). `None` = never down
     /// since launch, or back live.
@@ -2138,6 +2234,23 @@ struct Ctx {
     /// Slint crossings + 4 history pushes + chart formatting.
     /// `None` = no frame has run yet (the first frame always runs).
     last_frame: Rc<RefCell<Option<FrameInputs>>>,
+    /// Generation counter for the local tuning records (PERF
+    /// P1-4): bumped by every function that mutates `tuning`,
+    /// `pedals` or `handbrake_record` — the cheap frame key reads
+    /// it instead of cloning those records. A bump without a value
+    /// change only costs one extra frame (the full `FrameInputs`
+    /// compare still rests it); a MISSED bump would hide a change,
+    /// so every mutating function MUST call `bump_tuning_gen`
+    /// (first line, before any early return — a false positive is
+    /// harmless, a missed bump is not).
+    tuning_gen: Rc<Cell<u64>>,
+    /// Last cheap frame key (PERF P1-4): `push_frame` returns early
+    /// when the current key equals this — an idle frame then costs
+    /// a few scalar reads instead of the `FrameInputs` clones.
+    /// `None` = no cheap key stored yet (first frame always runs)
+    /// or the last frame fell through to the full compare with no
+    /// cheap signal (transient live / `live_api` disagreement).
+    last_cheap_frame: Rc<Cell<Option<CheapFrameKey>>>,
     /// Startup syncs deferred to the first frame tick (perf F-2):
     /// `main` sets this; the frame timer runs `refresh_profiles` /
     /// `refresh_games` / `sync_diag` once and clears it, so the
@@ -2150,6 +2263,44 @@ struct Ctx {
     /// When the notification file was last written (perf F-7): the
     /// ≤1 write/s bound for the coalesced save.
     notif_last_save: Rc<Cell<Option<Instant>>>,
+}
+
+/// Cheap pre-check key for `push_frame` (PERF P1-4): every input
+/// a frame is derived from, as scalars only — the snapshot seq
+/// (the snapshot is pure scalars, so its clone is a memcpy, but
+/// the seq alone proves whether it moved), the connection
+/// fingerprint (no `String` clones — see
+/// [`IpcApi::connection_fingerprint`]), the slow-cache generation,
+/// the local-tuning generation, the steering 6-tuple, and the
+/// flag reads. `push_frame` computes this FIRST; when it equals
+/// the previous key the frame is skipped without building
+/// `FrameInputs` (which clones the connection, the pedal cache
+/// and the handbrake record — ~5 heap allocs per 50 ms tick
+/// while idle). When the key moved, the full `FrameInputs`
+/// compare still runs below — a bump without a value change only
+/// costs one extra frame. The one input NOT in here is the
+/// Wi-Fi rejoin flag's *clear*: the clear needs the connection's
+/// `active` flag, which only the full path reads, so while a
+/// rejoin is in flight the cheap path is skipped outright (the
+/// flag is in the key so a flip is always detected).
+#[derive(Clone, Copy, PartialEq, Debug)]
+#[allow(clippy::struct_excessive_bools)]
+struct CheapFrameKey {
+    snap_seq: u64,
+    conn_fingerprint: u64,
+    cache_gen: u64,
+    tuning_gen: u64,
+    tuning: (f32, f32, i32, f32, bool, f32),
+    unsaved: bool,
+    horn_flash: bool,
+    handbrake_flash: bool,
+    raw_available: bool,
+    raw_job_running: bool,
+    diag_open: bool,
+    output_enabled: bool,
+    live: bool,
+    connecting: bool,
+    wifi_rejoining: bool,
 }
 
 /// Every value a frame is derived from (perf F-4): `push_frame`
@@ -2182,6 +2333,12 @@ struct FrameInputs {
     output_enabled: bool,
     live: bool,
     connecting: bool,
+    /// PERF P1-4: the rejoin flag is a visible input (the
+    /// connection label shows "Rejoining…" while set) — the struct
+    /// doc always claimed it, but the field was missing, so a
+    /// rejoin clear with a frozen snapshot could be skipped away
+    /// by the rest-compare. Now a flip always re-runs the frame.
+    wifi_rejoining: bool,
 }
 
 /// Whether a 400 ms test flash (Horn Test, handbrake Button-mode
@@ -2399,6 +2556,65 @@ impl Ctx {
         percentile_p50_p99(&self.frame_paint_times.borrow())
     }
 
+    /// Bump the local-tuning generation (PERF P1-4): the first line
+    /// of every function that mutates `tuning`, `pedals` or
+    /// `handbrake_record`, so the cheap frame key sees the change.
+    /// A false positive (bump without a value change) only costs
+    /// one extra frame; a missed bump would hide a slider echo
+    /// until the next slow poll.
+    fn bump_tuning_gen(&self) {
+        self.tuning_gen.set(self.tuning_gen.get().wrapping_add(1));
+    }
+
+    /// Cheap frame key for `push_frame` (PERF P1-4), or `None`
+    /// when no cheap signal exists: live without a `live_api`
+    /// handle (or vice versa — a transient swap state) falls
+    /// through to the full `FrameInputs` compare, which is always
+    /// sound. The snapshot seq is read only while live — the frame
+    /// itself uses a defaulted snapshot then, and the sim's seq
+    /// stays 0 anyway (L-4); reading it through the live API keeps
+    /// the key honest about the engine tick.
+    fn cheap_frame_key(
+        &self,
+        api: &Arc<dyn AppApi>,
+        live: bool,
+        connecting: bool,
+        live_api: Option<&IpcApi>,
+        win: &MainWindow,
+    ) -> Option<CheapFrameKey> {
+        let conn_fingerprint = match (live, live_api) {
+            (true, Some(ipc)) => ipc.connection_fingerprint(),
+            (false, None) => 0, // sim: fixed "Connected" connection
+            _ => return None,
+        };
+        let snap_seq = if live { api.snapshot().seq } else { 0 };
+        let tuning = self.tuning.borrow();
+        Some(CheapFrameKey {
+            snap_seq,
+            conn_fingerprint,
+            cache_gen: api.cache_generation(),
+            tuning_gen: self.tuning_gen.get(),
+            tuning: (
+                tuning.deadzone_pct,
+                tuning.exponent,
+                tuning.preset,
+                tuning.smoothing_pct,
+                tuning.invert,
+                tuning.lock_deg,
+            ),
+            unsaved: self.unsaved.get(),
+            horn_flash: test_flash_active(self.horn_test_until.get()),
+            handbrake_flash: test_flash_active(self.handbrake_test_until.get()),
+            raw_available: self.raw_available.get(),
+            raw_job_running: self.busy_jobs.borrow().contains_key(&JobKind::RawAvailable),
+            diag_open: win.get_diag_open(),
+            output_enabled: api.output_enabled(),
+            live,
+            connecting,
+            wifi_rejoining: self.wifi_rejoining.get(),
+        })
+    }
+
     /// Push the current API + tuning state into the window (one
     /// frame). Live values only: no daemon means Disconnected +
     /// "—", never fake Online (acceptance); the pressed tile is
@@ -2411,10 +2627,35 @@ impl Ctx {
     /// charts stay empty, even though the sim is the active API.
     #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn push_frame(&self, win: &MainWindow, tick: u64) -> bool {
-        let (api, live, connecting) = {
+        let (api, live, connecting, live_api) = {
             let state = self.state.borrow();
-            (state.api.clone(), state.live, state.connecting)
+            (
+                state.api.clone(),
+                state.live,
+                state.connecting,
+                state.live_api.clone(),
+            )
         };
+        // PERF P1-4: cheap rest-check BEFORE any clone — an idle /
+        // disconnected frame used to clone the connection (3
+        // Strings), the pedal cache (3 records) and the handbrake
+        // record before the `FrameInputs` compare could rest it.
+        // Now the scalar key decides first; only a moved key
+        // builds `FrameInputs`. While a Wi-Fi rejoin is in flight
+        // the cheap path is skipped: the rejoin clear below needs
+        // the connection, which only the full path reads — and the
+        // clear must never be skipped away.
+        if !self.wifi_rejoining.get() {
+            match self.cheap_frame_key(&api, live, connecting, live_api.as_deref(), win) {
+                Some(key) => {
+                    if self.last_cheap_frame.get() == Some(key) {
+                        return false;
+                    }
+                    self.last_cheap_frame.set(Some(key));
+                }
+                None => self.last_cheap_frame.set(None),
+            }
+        }
         let conn = api.connection();
         // H1: remember the live session's transport every frame, so
         // Reconnect re-uses it (USB stays USB).
@@ -2478,6 +2719,7 @@ impl Ctx {
             output_enabled: api.output_enabled(),
             live,
             connecting,
+            wifi_rejoining: self.wifi_rejoining.get(),
         };
         {
             let mut last = self.last_frame.borrow_mut();
@@ -3403,7 +3645,7 @@ impl Ctx {
     }
 
     /// Show a failure in the bottom `StatusBar` (B01, was the DS-24
-    /// toast): title + body on the current screen for 1 s (see
+    /// toast): title + body on the current screen for 4 s (see
     /// `STATUS_ERROR_LIFETIME`), then the 1 Hz tick clears it.
     /// Skipped while the window is hidden (F27: no property writes
     /// on a hidden window) — the notification itself is still stored
@@ -3413,7 +3655,7 @@ impl Ctx {
     /// status already showing means this message supersedes it:
     /// `status-more` counts the superseded ones (+N).
     fn set_toast(&self, win: &MainWindow, title: &str, body: &str) {
-        // (error lifetime: STATUS_ERROR_LIFETIME, 1 s)
+        // (error lifetime: STATUS_ERROR_LIFETIME, 4 s)
         if self.hidden.load(Ordering::SeqCst) {
             return;
         }
@@ -3454,7 +3696,7 @@ impl Ctx {
     }
 
     /// Show a success in the bottom `StatusBar` (B01, was the D17
-    /// toast): same 1 s / 4 s rule as [`Self::set_toast`] — success
+    /// toast): error and success both live 4 s now (UI-5) — success
     /// lives 4 s. Same full text, same +N counter.
     fn set_toast_success(&self, win: &MainWindow, title: &str, body: &str) {
         if self.hidden.load(Ordering::SeqCst) {
@@ -3475,7 +3717,7 @@ impl Ctx {
     }
 
     /// Clear an expired status-bar message (B01, was the DS-24
-    /// toast, 1 Hz): the error lives 1 s / info + success 4 s from
+    /// toast, 1 Hz): the error lives 4 s / info + success 4 s from
     /// the last message, then vanishes — a newer message re-arms
     /// the deadline via [`Self::set_toast`].
     fn check_status_expiry(&self, win: &MainWindow) {
@@ -3517,11 +3759,49 @@ impl Ctx {
     /// Current busy state (B5): whether any job runs + the oldest
     /// running job's label (the strip shows one job at a time) + its
     /// [`JobKind::order`] value (DS-54: `-1` = idle — the screens
-    /// disable + dim the button that started it).
-    fn busy_state(&self) -> (bool, String, i32) {
+    /// disable + dim the button that started it) + the elapsed
+    /// `m:ss` for the Backend switch ("" for every other job).
+    ///
+    /// P1-6: the Backend switch is the only job that can run for
+    /// minutes (420 s bound — the user may take a minute on the
+    /// UAC prompt while the sidecar waits), so its strip shows how
+    /// long it has been waiting (same `m:ss` pattern as the vJoy
+    /// install elapsed) instead of a bare spinner. Past 60 s the
+    /// label stages too: the daemon allows 60 s for the UAC
+    /// prompt, so after a minute the wait is sidecar/driver work,
+    /// not the prompt — the label says so. There is no stage
+    /// signal from the daemon; the 60 s boundary is the daemon's
+    /// own UAC allowance, and the elapsed time is the honest
+    /// progress signal. There is deliberately NO Cancel button:
+    /// the switch cannot be cancelled — the daemon keeps switching
+    /// after any client timeout (CORE-P1-2) — so a Cancel would
+    /// lie; the 420 s timeout + the re-query path are the exit.
+    fn busy_state(&self) -> (bool, String, i32, String) {
         let jobs = self.busy_jobs.borrow();
         let (busy, label) = busy_state_for(&jobs);
-        (busy, label, busy_kind_for(&jobs))
+        let kind = busy_kind_for(&jobs);
+        if !busy || kind != i32::from(JobKind::Backend.order()) {
+            return (busy, label, kind, String::new());
+        }
+        let secs = jobs
+            .get(&JobKind::Backend)
+            .map_or(0, |(_, started)| started.elapsed().as_secs());
+        let elapsed = Self::fmt_elapsed(secs);
+        // Stage label (see above): the stored label stays
+        // "Switching controller…" — only the displayed label
+        // stages, so the timeout toast still names the job.
+        let label = if secs >= 60 {
+            "Switching controller… — still working".to_string()
+        } else {
+            label
+        };
+        (busy, label, kind, elapsed)
+    }
+
+    /// Elapsed seconds as `m:ss` ("0:07", "1:23", "7:00") — the
+    /// busy-strip / vJoy-install elapsed format. Pure.
+    fn fmt_elapsed(secs: u64) -> String {
+        format!("{}:{:02}", secs / 60, secs % 60)
     }
 
     /// Drive the B5 busy strip from `busy_jobs` (FC2): a running
@@ -3529,10 +3809,11 @@ impl Ctx {
     /// every job start/finish/timeout (see [`Ctx::run_job`],
     /// [`Ctx::drain_jobs`], [`Ctx::check_job_timeouts`]) plus a 1 Hz
     /// safety call from the frame timer — the write itself is
-    /// change-detected, so the safety call costs nothing.
+    /// change-detected, so the safety call costs nothing. The 1 Hz
+    /// call is also what ticks the Backend elapsed (P1-6).
     fn sync_busy(&self, win: &MainWindow) {
-        let (busy, label, kind) = self.busy_state();
-        set_busy_props(win, busy, &label, kind);
+        let (busy, label, kind, elapsed) = self.busy_state();
+        set_busy_props(win, busy, &label, kind, &elapsed);
     }
 
     /// Re-sample Theme Auto from the cached OS preference (DS-50):
@@ -3674,7 +3955,50 @@ impl Ctx {
                 text.clone_from(latch);
             }
         }
+        // CORE-P3-8 (v2.0.13): no fatal file and no latch — a fresh
+        // second-instance `info` record is still worth one
+        // notification (it is the only trace of the ~11 s
+        // UI-spawned daemon death). It never drives the banner:
+        // the first daemon is still starting, not dead.
+        if text.is_empty() && !self.is_live() {
+            self.surface_second_instance_info(win);
+        }
         set_daemon_error_prop(win, &text);
+    }
+
+    /// Surface a fresh second-instance `info` record (CORE-P3-8):
+    /// a second daemon exited because the first was still starting
+    /// — the ~11 s UI-spawned daemon death. Shown once per record
+    /// (`at_unix` dedupe) as a notification + info status-bar
+    /// message (drawer entry survives for Diagnostics), with the
+    /// record's timestamp in the body so a user-PC repro can be
+    /// matched to the spawn; the raw detail (with pids) goes to
+    /// the diagnostics log, not the user-facing text. Never a
+    /// fatal banner, never a spawn latch.
+    fn surface_second_instance_info(&self, win: &MainWindow) {
+        if self.is_live() {
+            return;
+        }
+        let Some((detail, at_unix)) = live_probe::read_second_instance_info(
+            self.data_dir.as_deref(),
+            live_probe::FATAL_FRESHNESS,
+        ) else {
+            return;
+        };
+        if self.last_second_instance_at.get() == Some(at_unix) {
+            return;
+        }
+        self.last_second_instance_at.set(Some(at_unix));
+        ui_log!("RSH-UI second-instance record: at_unix={at_unix} detail={detail}");
+        let when = format_unix_time(at_unix);
+        self.notify_toast(
+            win,
+            "Connection",
+            "Second RSH backend start noticed",
+            &format!(
+                "Another RSH backend tried to start at {when} while the first was still starting, so it closed itself — this is usually harmless. If RSH never connects, check Diagnostics."
+            ),
+        );
     }
 
     /// Latch the respawn-failure state (F3): the monitor sent
@@ -3918,7 +4242,20 @@ impl Ctx {
                 }
                 match result {
                     Ok(info) => {
-                        ui_log!("RSH-UI transport switch ok: {}", info.label);
+                        // CORE-13 (v2.0.12): `connect_started:
+                        // Some(false)` means the call no-op'd
+                        // because a retry was already in flight —
+                        // the switch itself is accepted (the
+                        // in-flight retry carries the session), so
+                        // there is nothing to revert or toast; the
+                        // outcome surfaces via the poller, which
+                        // the refresh below picks up. The value is
+                        // logged so a no-op switch is diagnosable.
+                        ui_log!(
+                            "RSH-UI transport switch ok: {} (connect_started={:?})",
+                            info.label,
+                            info.connect_started
+                        );
                         self.refresh(win, 0);
                     }
                     Err(e) => {
@@ -3938,6 +4275,9 @@ impl Ctx {
                 {
                     return;
                 }
+                // HID-3: the switch resolved — the timeout re-query
+                // has nothing to compare against any more.
+                self.backend_job_requested.set(None);
                 // Bug 4/8: a success toast is only honest when the
                 // backend that is actually live is the one the user
                 // asked for. The daemon reports the LIVE name, so a
@@ -3993,12 +4333,111 @@ impl Ctx {
                     // backend moved mid-switch.
                     self.resync_controller_from_live(win, 1 - index);
                     self.notify_error(win, "Game controller", &error);
-                    // P2: ANY backend-switch failure arms the 30 s
-                    // selector cooldown — Err, wrong-backend
-                    // success, or a daemon-side cooldown refusal
-                    // (all arrive here as a failure event; no error
-                    // text is parsed).
-                    self.start_backend_cooldown(win);
+                    // HID-4 (v2.0.12): the 30 s selector cooldown
+                    // arms ONLY for a HIDMaestro-requested failure.
+                    // The daemon storm guard counts HIDMaestro
+                    // attempts only, so a vJoy failure (e.g. vJoy
+                    // not installed) must not lock the user out of
+                    // HIDMaestro for 30 s. The old code armed on
+                    // ANY failure — Err, wrong-backend success, or
+                    // a daemon-side cooldown refusal — with no
+                    // error text parsed and no requested index
+                    // consulted.
+                    if index == 0 {
+                        self.start_backend_cooldown(win);
+                    }
+                }
+            }
+            JobDone::BackendRequery { requested, backend } => {
+                if self
+                    .busy_jobs
+                    .borrow_mut()
+                    .remove(&JobKind::Backend)
+                    .is_none()
+                {
+                    return;
+                }
+                // HID-3: the re-query answered — the timeout's
+                // verdict lands here, never in `check_job_timeouts`
+                // (which only starts the re-query and stays silent).
+                self.backend_requery_in_flight.set(false);
+                self.backend_job_requested.set(None);
+                // F27: a verdict that lands after the window was
+                // hidden must not touch it — the frame timer
+                // re-derives the display from state/cache when the
+                // window comes back, and the next poll re-syncs the
+                // backend either way.
+                if self.hidden.load(Ordering::SeqCst) {
+                    ui_log!(
+                        "RSH-UI backend re-query finished while hidden — verdict skipped (F27)"
+                    );
+                    return;
+                }
+                let requested_name = if requested == 1 { "vJoy" } else { "HIDMaestro" };
+                match backend.as_deref() {
+                    Some(live) if live == requested_name => {
+                        // The switch DID complete while the UI was
+                        // timing it out (long UAC dwell, slow
+                        // sidecar spawn) — report the success, not
+                        // the timeout. A genuine success ends any
+                        // cooldown an earlier failure armed.
+                        self.clear_backend_cooldown(win);
+                        win.set_controller(requested);
+                        self.sync_overview(win);
+                        self.notify_success(
+                            win,
+                            "Game controller",
+                            "Controller switched",
+                            &format!("Game controller is now {live}."),
+                        );
+                    }
+                    Some(live) => {
+                        // The daemon is still on the old backend
+                        // after several re-query polls: the switch
+                        // may still be running (the client timeout
+                        // never cancels the daemon handler) or it
+                        // failed without answering. Say so plainly
+                        // instead of declaring a failure — no
+                        // cooldown, but NO immediate-retry
+                        // invitation either (HID P3-5: a retry
+                        // while the daemon is still switching is
+                        // refused by the in-flight guard, so
+                        // "retry at once" was a guaranteed error);
+                        // the next poll re-syncs the segment if
+                        // the switch lands.
+                        win.set_controller(i32::from(live != "HIDMaestro"));
+                        self.notify_toast(
+                            win,
+                            "Game controller",
+                            "Controller switch still running",
+                            &format!(
+                                "The switch to {requested_name} is still running in the background — {live} is still the game controller for now. It will update on its own when the switch finishes; wait a moment before trying again — a retry while the switch is running is refused."
+                            ),
+                        );
+                    }
+                    None => {
+                        // The re-query itself did not answer — the
+                        // daemon link is gone or wedged, so the
+                        // timeout stands as a failure: restore the
+                        // segment from the cache and arm the
+                        // cooldown, but only for a
+                        // HIDMaestro-requested switch (HID-4).
+                        self.resync_controller_from_live(win, 1 - requested);
+                        self.notify_error(
+                            win,
+                            "Game controller",
+                            &UserError {
+                                code: "Unknown".to_string(),
+                                title: "Controller switch timed out".to_string(),
+                                what_happened: "The controller switch took too long — the previous controller is still active.".to_string(),
+                                what_to_do: "Try again.".to_string(),
+                                detail: None,
+                            },
+                        );
+                        if requested == 0 {
+                            self.start_backend_cooldown(win);
+                        }
+                    }
                 }
             }
             JobDone::FirmwareCheck(result) => {
@@ -4187,6 +4626,11 @@ impl Ctx {
             self.pending_applies
                 .borrow_mut()
                 .retain(|_, (k, _)| *k != kind);
+            // HID-3: set when a backend timeout starts a live
+            // re-query instead of failing — the generic timeout
+            // toast below is skipped then (the re-query's verdict
+            // notifies, so the user never sees the false failure).
+            let mut backend_requery = false;
             if kind == JobKind::Reconnect {
                 self.reconnect_in_flight.set(false);
                 // F3: a timed-out manual retry counts as a failed
@@ -4211,13 +4655,48 @@ impl Ctx {
                 self.connecting_since.set(None);
             }
             if kind == JobKind::Backend {
-                // The switch already flipped; the late result is
-                // ignored, so restore the live backend's segment now.
-                let backend = self.api().output_backend();
-                win.set_controller(i32::from(backend != "HIDMaestro"));
-                // P2: a switch that never answers is a failure too
-                // — arm the same 30 s cooldown as a reported one.
-                self.start_backend_cooldown(win);
+                // HID-3 (v2.0.12): a backend job that never answers
+                // is NOT declared a failure here — the daemon keeps
+                // switching after the client times out (a >60 s UAC
+                // dwell is the known case), and the UI-side cache
+                // still holds the PRE-switch backend, so restoring
+                // from it + arming the cooldown reported a live
+                // switch dead. Instead, re-query the LIVE backend
+                // from the daemon on a background job; its verdict
+                // (switched / still running / re-query failed)
+                // lands in `JobDone::BackendRequery` and notifies
+                // there, so the generic timeout toast below is
+                // skipped for this kind (`backend_requery`).
+                if self.backend_requery_in_flight.get() {
+                    // The timed-out Backend job IS the re-query
+                    // itself — no switch can start while it occupies
+                    // `JobKind::Backend`, so this timeout means the
+                    // re-query never answered. Clear the flag and
+                    // fall through to the plain failure path
+                    // instead of staying silent forever.
+                    self.backend_requery_in_flight.set(false);
+                    self.backend_timeout_failure(win);
+                } else if self.start_backend_requery(win) {
+                    backend_requery = true;
+                } else {
+                    // No re-query possible (no recorded request or
+                    // no live link): the timeout stands as a
+                    // failure.
+                    self.backend_timeout_failure(win);
+                }
+            }
+            if kind == JobKind::GameOp {
+                // UI-4 (v2.0.12): a timed-out save leaves the dialog
+                // open with no inline error — set one, so the user
+                // staring at the dialog sees why Save re-enabled.
+                // Only for the dialog's own save labels; a launch /
+                // stop timeout has no dialog to explain to.
+                if (label == "Adding game…" || label == "Saving game…")
+                    && win.get_game_dialog_open()
+                    && !self.hidden.load(Ordering::SeqCst)
+                {
+                    win.set_game_dialog_error("The save took too long — try again.".into());
+                }
             }
             if kind == JobKind::SettingsOp {
                 // R3-UI-02: the timed-out job's apply is dropped
@@ -4267,7 +4746,7 @@ impl Ctx {
                 }
             }
             ui_log!("RSH-UI job {kind:?} timed out ({label})");
-            if !tuning_silent && !sensitivity_silent {
+            if !tuning_silent && !sensitivity_silent && !backend_requery {
                 let body = if tuning_reverted || sensitivity_reverted {
                     "The change wasn't saved — the slider was put back to its previous value."
                 } else if kind == JobKind::Backend {
@@ -4481,8 +4960,9 @@ impl Ctx {
     }
 
     /// Start an output-backend switch job (A9/B-2): `set_output_backend`
-    /// runs on a background thread with its 390 s bound (UAC dwell +
-    /// 60 s sidecar spawn). Switching to `HIDMaestro` warns first —
+    /// runs on a background thread with the 420 s job timeout (IPC
+    /// 390 s > daemon worst case 310 s + 60 s UAC allowance, P1-1).
+    /// Switching to `HIDMaestro` warns first —
     /// Windows will ask once for admin permission. A second switch
     /// while one is in flight is ignored (no re-spawn loop, A10).
     fn start_backend_job(&self, win: &MainWindow, index: i32) {
@@ -4512,6 +4992,9 @@ impl Ctx {
                 "HIDMaestro needs admin permission — Windows will ask once.",
             );
         }
+        // HID-3: record what this switch asked for — a job timeout
+        // re-queries the live backend and compares against this.
+        self.backend_job_requested.set(Some(index));
         // D17: the switch itself is not a notification — the busy
         // strip is the surface while it runs. The label stays
         // "Switching controller…" for the whole switch (Bug 4/8):
@@ -4532,6 +5015,62 @@ impl Ctx {
                 result: api.set_output_backend(name),
             },
         );
+    }
+
+    /// The plain backend-timeout failure (HID-3 fallback): the
+    /// timeout stands — restore the segment from the (possibly
+    /// stale) cache and arm the cooldown, but only for a
+    /// `HIDMaestro`-requested switch (HID-4). A vJoy request never
+    /// arms; an unrecorded request keeps the old storm-guard
+    /// behaviour (arm) — the daemon counts `HIDMaestro` attempts,
+    /// and an unknown request is most likely one.
+    fn backend_timeout_failure(&self, win: &MainWindow) {
+        let requested = self.backend_job_requested.get();
+        self.backend_job_requested.set(None);
+        let backend = self.api().output_backend();
+        win.set_controller(i32::from(backend != "HIDMaestro"));
+        if requested != Some(1) {
+            self.start_backend_cooldown(win);
+        }
+    }
+
+    /// Start the HID-3 re-query after a backend-job timeout: ask
+    /// the daemon for its LIVE backend on a background job thread
+    /// (HID P3-5, v2.0.13: [`IpcApi::query_output_backend_polled`]
+    /// polls a few times instead of sampling once, so a switch
+    /// that lands mid-poll reports success and a still-running
+    /// switch is a verdict after several samples, not one) and
+    /// report the verdict in [`JobDone::BackendRequery`]. Returns
+    /// true when the re-query started; false when there is nothing
+    /// to re-query (no recorded request, a re-query already in
+    /// flight, or no live link) — the caller then falls back to
+    /// the plain timeout failure. The job runs under
+    /// [`JobKind::Backend`] so the busy strip shows "Checking
+    /// controller…" while it runs; its own 420 s timeout cannot
+    /// fire (the poll is bounded at ~5 s), and the in-flight flag
+    /// stops a second timeout from spawning a second re-query.
+    fn start_backend_requery(&self, win: &MainWindow) -> bool {
+        let Some(requested) = self.backend_job_requested.get() else {
+            return false;
+        };
+        if self.backend_requery_in_flight.get() {
+            return false;
+        }
+        let Some(live_api) = self.state.borrow().live_api.clone() else {
+            return false;
+        };
+        self.backend_requery_in_flight.set(true);
+        let requested_name = if requested == 1 { "vJoy" } else { "HIDMaestro" };
+        let started = self.run_job(win, JobKind::Backend, "Checking controller…", move || {
+            JobDone::BackendRequery {
+                requested,
+                backend: live_api.query_output_backend_polled(requested_name),
+            }
+        });
+        if !started {
+            self.backend_requery_in_flight.set(false);
+        }
+        started
     }
 
     /// Start a firmware-check job (M-8): board live version vs the
@@ -4642,7 +5181,22 @@ impl Ctx {
         let confirm = win.get_wifi_password_confirm().to_string();
         if let Some(err) = Self::wifi_password_error(&new, &confirm) {
             win.set_wifi_password_error(err.clone().into());
-            self.set_toast(win, "Wi-Fi password", &err);
+            // P2-10: the inline field error stays, but the message
+            // must also land in the notifications drawer — the old
+            // bare `set_toast` bypassed it, so Details opened a
+            // drawer with no such entry. `notify_error` writes both
+            // (the bar shows the same text as before).
+            self.notify_error(
+                win,
+                "Connection",
+                &UserError {
+                    code: "Validation".to_string(),
+                    title: "Wi-Fi password".to_string(),
+                    what_happened: err,
+                    what_to_do: String::new(),
+                    detail: None,
+                },
+            );
             return;
         }
         win.set_wifi_password_error("".into());
@@ -4790,15 +5344,29 @@ impl Ctx {
                 // A set password lives in the stored WLAN profile —
                 // it cannot be read back, so the daemon reconnects
                 // with it; an open AP is joined directly.
+                // CORE-13 (v2.0.12): `connect()` returns Ok with
+                // `connect_started: Some(false)` when a retry was
+                // already in flight — the wheel is NOT joined yet,
+                // so the success toast below must not claim it.
+                // The marker rides in the Ok string (empty =
+                // joined, "in-flight" = a retry is running and its
+                // outcome surfaces via the poller).
+                let marker = |info: ConnectionInfo| {
+                    if info.connect_started == Some(false) {
+                        "in-flight".to_string()
+                    } else {
+                        String::new()
+                    }
+                };
                 let joined = if api.wifi_status().password_set {
-                    api.connect(ApiTransport::Wifi).map(|_| ())
+                    api.connect(ApiTransport::Wifi).map(marker)
                 } else {
                     match api.rejoin_wifi_open(&ssid) {
-                        Ok(_) => api.connect(ApiTransport::Wifi).map(|_| ()),
+                        Ok(_) => api.connect(ApiTransport::Wifi).map(marker),
                         Err(e) => Err(e),
                     }
                 };
-                JobResult::Text(joined.map(|()| String::new()))
+                JobResult::Text(joined)
             },
             move |ctx, win, result| {
                 win.set_setup_wifi_joining(false);
@@ -4806,6 +5374,19 @@ impl Ctx {
                     return;
                 };
                 match result {
+                    // CORE-13: the connect no-op'd (a retry is
+                    // already in flight) — not joined yet, so no
+                    // success toast; the retry's outcome surfaces
+                    // via the poller.
+                    Ok(marker) if marker == "in-flight" => {
+                        win.set_setup_wifi_error("".into());
+                        ctx.notify_toast(
+                            win,
+                            "Connection",
+                            "Still connecting",
+                            "The wheel is still connecting — it should appear shortly.",
+                        );
+                    }
                     Ok(_) => {
                         win.set_setup_wifi_error("".into());
                         ctx.notify_success(
@@ -4936,7 +5517,18 @@ impl Ctx {
         let knob = usize::try_from(self.edit_knob.get()).unwrap_or(0);
         let row = usize::try_from(self.knob_row.get()).unwrap_or(0);
         let row_action = knobs[knob][row].clone();
-        *self.knob_actions.borrow_mut() = knobs;
+        self.knob_actions.borrow_mut().clone_from(&knobs);
+        // UI-1 (v2.0.12): drive the card + edit-panel labels from
+        // the real bindings — the Slint defaults are "Not set" and
+        // nothing else ever writes these props, so without this the
+        // card kept showing the old hardcoded "Gear 1 / Gear 2".
+        // Rows are [left, right, press] per knob.
+        win.set_knob1_left(knobs[0][0].clone().into());
+        win.set_knob1_right(knobs[0][1].clone().into());
+        win.set_knob1_press(knobs[0][2].clone().into());
+        win.set_knob2_left(knobs[1][0].clone().into());
+        win.set_knob2_right(knobs[1][1].clone().into());
+        win.set_knob2_press(knobs[1][2].clone().into());
         win.set_knob_row_action(row_action.into());
     }
 
@@ -5361,7 +5953,19 @@ impl Ctx {
         // The title says "Wheel connected" (the board), never
         // "RSH connected" (the daemon link) — the two must not
         // read as the same thing.
-        if seed.connect.is_ok() && !self.suppress_connected_notify.get() {
+        // CORE-13 (v2.0.12): `connect()` returns Ok with
+        // `connect_started: Some(false)` when a retry was already
+        // in flight — the session is NOT established yet, so an Ok
+        // seed must not toast "Wheel connected" for it. Only a
+        // fresh connect that actually started (or an unknown
+        // `None`, e.g. a test fake) counts as connected here; the
+        // in-flight retry's outcome surfaces via the poller / the
+        // next seed.
+        let connect_started = match &seed.connect {
+            Ok(info) => info.connect_started != Some(false),
+            Err(_) => false,
+        };
+        if connect_started && !self.suppress_connected_notify.get() {
             let n = self.flap_count.get();
             let recent = self
                 .last_flap_at
@@ -5546,6 +6150,7 @@ impl Ctx {
     /// the ~1 Hz cache, which may still hold pre-push values.
     #[allow(clippy::cast_possible_truncation)]
     fn apply_tuning_record(&self, win: &MainWindow, stored: &TuningSettings) {
+        self.bump_tuning_gen();
         match stored.module.as_str() {
             // --- Pedal ramps/curves per-module tuning ---
             // Both throttle spellings: the daemon canonicalizes to
@@ -5701,6 +6306,7 @@ impl Ctx {
     /// when a revert happened (the caller then tells the user the
     /// change was put back).
     fn revert_tuning_push(&self, win: &MainWindow, target: &TuningPushTarget) -> bool {
+        self.bump_tuning_gen();
         match target {
             TuningPushTarget::Steering { due, base } => {
                 if self.steer_push_due.get() != Some(*due) {
@@ -5920,6 +6526,7 @@ impl Ctx {
     /// ~1 Hz re-sync agrees instead of snapping it back. Only the
     /// daemon push waits out the 150 ms debounce.
     fn apply_pedal_deadzone_local(&self, win: &MainWindow, index: usize, deadzone: f64) {
+        self.bump_tuning_gen();
         let (record, feel_exp) = {
             let mut pedals = self.pedals.borrow_mut();
             pedals.records[index].deadzone = deadzone;
@@ -5932,6 +6539,7 @@ impl Ctx {
     /// pattern as [`Self::apply_pedal_deadzone_local`]. `index` is
     /// the pedal index (1 brake, 2 clutch).
     fn apply_pedal_bite_local(&self, win: &MainWindow, index: usize, bite: f64) {
+        self.bump_tuning_gen();
         let (record, feel_exp) = {
             let mut pedals = self.pedals.borrow_mut();
             pedals.records[index].bite_point = Some(bite);
@@ -5945,6 +6553,7 @@ impl Ctx {
     /// mouse, the local record follows, and only the daemon push
     /// waits out the 150 ms debounce.
     fn apply_pedal_bite_width_local(&self, win: &MainWindow, width: f64) {
+        self.bump_tuning_gen();
         let (record, feel_exp) = {
             let mut pedals = self.pedals.borrow_mut();
             pedals.records[2].bite_width = Some(width);
@@ -5958,6 +6567,7 @@ impl Ctx {
     /// follows, and only the daemon push waits out the 150 ms
     /// debounce.
     fn apply_pedal_brake_force_local(&self, win: &MainWindow, saturation: f64) {
+        self.bump_tuning_gen();
         let (record, feel_exp) = {
             let mut pedals = self.pedals.borrow_mut();
             pedals.records[1].saturation = Some(saturation);
@@ -6021,6 +6631,7 @@ impl Ctx {
     /// curve (soft < 0.95, sharp > 1.05, else linear).
     #[allow(clippy::cast_possible_truncation)]
     fn apply_pedal_curve_local(&self, win: &MainWindow, index: usize, exponent: f64) {
+        self.bump_tuning_gen();
         let (record, feel_exp) = {
             let mut pedals = self.pedals.borrow_mut();
             pedals.records[index].curve = exponent;
@@ -6032,6 +6643,7 @@ impl Ctx {
 
     /// Echo a pedal press-ramp drag locally (R2-10): same pattern.
     fn apply_pedal_press_ms_local(&self, win: &MainWindow, index: usize, ms: f64) {
+        self.bump_tuning_gen();
         let (record, feel_exp) = {
             let mut pedals = self.pedals.borrow_mut();
             pedals.records[index].press_ms = Some(ms);
@@ -6042,6 +6654,7 @@ impl Ctx {
 
     /// Echo a pedal release-ramp drag locally (R2-10): same pattern.
     fn apply_pedal_release_ms_local(&self, win: &MainWindow, index: usize, ms: f64) {
+        self.bump_tuning_gen();
         let (record, feel_exp) = {
             let mut pedals = self.pedals.borrow_mut();
             pedals.records[index].release_ms = Some(ms);
@@ -6055,6 +6668,7 @@ impl Ctx {
     /// local record (the "Pedal down" mV re-syncs from calibration
     /// on the next ~1 Hz cycle when a capture exists).
     fn apply_throttle_saturation_local(&self, win: &MainWindow, max_mv: f64) {
+        self.bump_tuning_gen();
         let record = {
             let mut pedals = self.pedals.borrow_mut();
             pedals.records[0].max_mv = max_mv;
@@ -6446,6 +7060,7 @@ impl Ctx {
     /// Echo a handbrake deadzone drag locally (R2-10): same pattern
     /// as [`Self::apply_pedal_deadzone_local`].
     fn apply_handbrake_deadzone_local(&self, win: &MainWindow, deadzone: f64) {
+        self.bump_tuning_gen();
         let record = {
             let mut stored = self.handbrake_record.borrow_mut();
             stored.deadzone = deadzone;
@@ -6458,6 +7073,7 @@ impl Ctx {
     /// slider + text move with the mouse, the local record follows,
     /// and only the daemon push waits out the 150 ms debounce.
     fn apply_handbrake_grab_local(&self, win: &MainWindow, grab_ms: f64) {
+        self.bump_tuning_gen();
         let record = {
             let mut stored = self.handbrake_record.borrow_mut();
             stored.press_ms = Some(grab_ms);
@@ -6536,6 +7152,7 @@ impl Ctx {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn sync_pedals(&self, win: &MainWindow) {
         const MODULES: [&str; 3] = ["throttle", "brake", "clutch"];
+        self.bump_tuning_gen();
         let api = self.api();
         // A2: mV comes from calibration() (keys "accel" / "brake" /
         // "clutch") when a capture exists, else the tuning record.
@@ -6633,6 +7250,7 @@ impl Ctx {
     /// snapped back to the ~1 Hz cache mid-drag.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn sync_extras(&self, win: &MainWindow) {
+        self.bump_tuning_gen();
         let api = self.api();
         // R2-10: while a drag's push is pending for handbrake/LED,
         // the local record IS the drag value — re-reading the slow
@@ -7113,6 +7731,19 @@ impl Ctx {
         *self.games_profiles.borrow_mut() = profiles;
     }
 
+    /// One idempotency key per add-dialog session (P1-3, v2.0.12):
+    /// process id + wall-clock nanos — unique per dialog open
+    /// within a process run, and a new process gets a new pid, so a
+    /// stale key from an earlier run can never dedupe a fresh add.
+    /// No extra dependency for one string: the store only needs the
+    /// key to be stable across retries of the SAME session.
+    fn new_game_dialog_key() -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        format!("game-add-{}-{nanos}", std::process::id())
+    }
+
     /// Open the add/edit game dialog for a new game (`None`) or
     /// the game with this id. Games are manual-only: the exe path
     /// comes from the native file picker (Browse — see
@@ -7169,6 +7800,17 @@ impl Ctx {
         self.game_dialog_profile_id
             .borrow_mut()
             .clone_from(&profile_id);
+        // P1-3 (v2.0.12): a NEW add mints one idempotency key for
+        // the dialog session — a Save retried after a client-side
+        // timeout reuses it, so the daemon dedupes instead of
+        // duplicating the game. An Edit takes no key (updates are
+        // idempotent by id).
+        let key = self
+            .game_dialog_edit_id
+            .borrow()
+            .is_none()
+            .then(Ctx::new_game_dialog_key);
+        *self.game_dialog_idempotency_key.borrow_mut() = key;
         win.set_game_dialog_title(title.into());
         win.set_game_dialog_name(name.into());
         win.set_game_dialog_exe(exe.into());
@@ -7178,6 +7820,7 @@ impl Ctx {
         win.set_game_dialog_profile_name(
             self.game_dialog_profile_label(profile_id.as_ref()).into(),
         );
+        self.sync_game_dialog_profile_props(win);
         win.set_game_dialog_open(true);
         ui_log!("RSH-UI game dialog opened");
     }
@@ -7232,6 +7875,25 @@ impl Ctx {
         }
     }
 
+    /// Sync the dialog's profile position props (P2-9): the bound
+    /// profile's 1-based position in `profiles_cache` + the total
+    /// count, so the dialog can show "Profile: X (2 of 5)". Index
+    /// 0 = no profile bound (or a stale id). Called whenever the
+    /// bound profile changes — dialog open + cycle.
+    fn sync_game_dialog_profile_props(&self, win: &MainWindow) {
+        let profiles = self.profiles_cache.borrow();
+        let count = i32::try_from(profiles.len()).unwrap_or(i32::MAX);
+        let index = match self.game_dialog_profile_id.borrow().as_ref() {
+            Some(id) => profiles
+                .iter()
+                .position(|p| &p.id == id)
+                .map_or(0, |i| i32::try_from(i + 1).unwrap_or(0)),
+            None => 0,
+        };
+        win.set_game_dialog_profile_index(index);
+        win.set_game_dialog_profile_count(count);
+    }
+
     /// Cycle the dialog's bound profile: none → first profile →
     /// … → last → none again (the profile-link control's cycling
     /// pattern — the dialog has no dropdown component).
@@ -7257,6 +7919,7 @@ impl Ctx {
         };
         win.set_game_dialog_profile_name(self.game_dialog_profile_label(next.as_ref()).into());
         *self.game_dialog_profile_id.borrow_mut() = next;
+        self.sync_game_dialog_profile_props(win);
     }
 
     /// Save the dialog: validate name + exe (empty is refused
@@ -7266,6 +7929,20 @@ impl Ctx {
     /// game tiles + profiles (a new bound profile changes the
     /// auto-profile line) and closes the dialog.
     fn save_game_dialog(&self, win: &MainWindow, name: &str, exe: &str) {
+        // The link can die while the dialog is open (the open-time
+        // guard above only covers the open): a Save against the
+        // `SimApi` fallback would hit the trait default ("games are
+        // not supported by this API") — refuse with the honest
+        // reason instead, like `remove_game` does.
+        if !self.is_live() {
+            self.notify_toast(
+                win,
+                "Game",
+                "RSH isn't running",
+                "RSH isn't running — reconnect, then save the game.",
+            );
+            return;
+        }
         let name = name.trim().to_string();
         let exe = exe.trim().to_string();
         // P1-7: a new save attempt clears the previous inline
@@ -7275,7 +7952,7 @@ impl Ctx {
         if name.is_empty() || exe.is_empty() {
             // P1-7: the validation refusal is inline too — the
             // dialog stays open, so the reason belongs in it, not
-            // only in the 1 s status bar.
+            // only in the 4 s status bar.
             win.set_game_dialog_error(
                 "Choose the game's file with Browse, and enter a name.".into(),
             );
@@ -7291,6 +7968,11 @@ impl Ctx {
         }
         let edit_id = self.game_dialog_edit_id.borrow().clone();
         let profile_id = self.game_dialog_profile_id.borrow().clone();
+        // P1-3 (v2.0.12): the dialog-session key, minted at open
+        // for a NEW add — a Save retried after a client-side timeout
+        // reuses it, so the daemon returns the already-created entry
+        // instead of duplicating the game. `None` for an Edit.
+        let idempotency_key = self.game_dialog_idempotency_key.borrow().clone();
         let adding = edit_id.is_none();
         let label = if adding {
             "Adding game…"
@@ -7305,7 +7987,7 @@ impl Ctx {
                 let result = if let Some(id) = &edit_id {
                     api.update_game(id, &name, &exe, profile_id.clone())
                 } else {
-                    api.add_game(&name, &exe, profile_id)
+                    api.add_game_with_key(&name, &exe, profile_id, idempotency_key.as_deref())
                 };
                 JobResult::Text(result.map(|g| g.name))
             },
@@ -7335,7 +8017,7 @@ impl Ctx {
                         // dialog — the same wording the status bar +
                         // drawer show (see `error_title_body`). The
                         // dialog stays open on failure; without this
-                        // the failed save looked inert after the 1 s
+                        // the failed save looked inert after the 4 s
                         // status message expired.
                         let (_title, body) = Ctx::error_title_body(&e);
                         w.set_game_dialog_error(body.into());
@@ -11037,17 +11719,22 @@ fn wire_keyboard(win: &MainWindow, ctx: &Rc<Ctx>) {
         let ctx = ctx.clone();
         win.unwrap().on_keyboard_escape(move || {
             if let Some(w) = win.upgrade() {
-                // D16: Esc dismisses only the TOPMOST overlay /
-                // status-bar message — never the wizard itself
-                // (closing the wizard needs the explicit
-                // Skip/Finish path).
+                // D16 / UI-10 (v2.0.12): Esc has ONE owner — this
+                // handler closes the TOPMOST overlay first and only
+                // clears the status-bar message when no overlay is
+                // open. The Modal's own FocusScope forwards Escape
+                // here instead of closing directly (it used to close
+                // the dialog while a toast stayed, or — focus
+                // elsewhere — clear the toast while the dialog
+                // stayed). Order is the paint order, topmost first:
+                // confirm, game dialog, popover, notifications
+                // drawer, diagnostics drawer, then the status bar.
+                // Never the wizard itself (closing it needs the
+                // explicit Skip/Finish path).
                 if w.get_confirm_open() {
                     w.set_confirm_open(false);
                     *ctx.confirm_pending.borrow_mut() = None;
                     ui_log!("RSH-UI keyboard-escape closed confirm dialog");
-                } else if w.get_status_title() != "" {
-                    ctx.clear_status(&w);
-                    ui_log!("RSH-UI keyboard-escape dismissed status bar");
                 } else if w.get_game_dialog_open() {
                     w.set_game_dialog_open(false);
                     ui_log!("RSH-UI keyboard-escape closed game dialog");
@@ -11060,6 +11747,9 @@ fn wire_keyboard(win: &MainWindow, ctx: &Rc<Ctx>) {
                 } else if w.get_diag_open() {
                     w.set_diag_open(false);
                     ui_log!("RSH-UI keyboard-escape closed diagnostics drawer");
+                } else if w.get_status_title() != "" {
+                    ctx.clear_status(&w);
+                    ui_log!("RSH-UI keyboard-escape dismissed status bar");
                 } else {
                     ui_log!("RSH-UI keyboard-escape (no overlay open)");
                 }
@@ -11235,6 +11925,18 @@ fn wire_action_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
             let Some(w) = win.upgrade() else {
                 return;
             };
+            // UI-2 (v2.0.12): refuse while RSH isn't running, like
+            // the add / edit / remove paths — a launch against the
+            // `SimApi` fallback could only fail with `needs_daemon`.
+            if !ctx.is_live() {
+                ctx.notify_toast(
+                    &w,
+                    "Game",
+                    "RSH isn't running",
+                    "Reconnect to RSH, then try again.",
+                );
+                return;
+            }
             let id = id.to_string();
             let Some(game) = ctx
                 .games_cache
@@ -11243,7 +11945,7 @@ fn wire_action_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
                 .find(|g| g.id == id)
                 .cloned()
             else {
-                ctx.notify(
+                ctx.notify_toast(
                     &w,
                     "Game",
                     "Game not found",
@@ -11252,7 +11954,7 @@ fn wire_action_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
                 return;
             };
             if !game.installed {
-                ctx.notify(
+                ctx.notify_toast(
                     &w,
                     "Game",
                     "Game not installed",
@@ -11287,24 +11989,65 @@ fn wire_action_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
                     match result {
                         Ok(is_running) => {
                             ctx.refresh_games(w);
-                            let body = if is_running {
-                                format!("{game_name} launched.")
+                            if !is_running && !running {
+                                // v2.0.13: the daemon's settle check
+                                // normally turns this into an error,
+                                // but a game that dies between the
+                                // settle and this refresh would
+                                // otherwise land here — and "Game
+                                // stopped." after a Launch press reads
+                                // as a silent no-op. Say so plainly.
+                                let err = UserError {
+                                    code: "game_closed_immediately".to_string(),
+                                    title: "Couldn't launch game".to_string(),
+                                    what_happened: format!(
+                                        "{game_name} started but closed right away."
+                                    ),
+                                    what_to_do: "Try starting the game from File Explorer. If it closes there too, the game itself is failing to start.".to_string(),
+                                    detail: None,
+                                };
+                                ctx.notify_error(w, "Game", &err);
+                                ui_log!("RSH-UI launch-game closed immediately: {game_name}");
                             } else {
-                                format!("{game_name} stopped.")
-                            };
-                            ctx.notify(
-                                w,
-                                "Game",
-                                if is_running {
-                                    "Game launched"
+                                let body = if is_running {
+                                    format!("{game_name} launched.")
                                 } else {
-                                    "Game stopped"
-                                },
-                                &body,
-                            );
+                                    format!("{game_name} stopped.")
+                                };
+                                ctx.notify(
+                                    w,
+                                    "Game",
+                                    if is_running {
+                                        "Game launched"
+                                    } else {
+                                        "Game stopped"
+                                    },
+                                    &body,
+                                );
+                            }
                         }
                         Err(e) => {
-                            ctx.notify(w, "Game", "Couldn't launch game", &e.title);
+                            // UI-2 (v2.0.12): a launch / stop failure
+                            // surfaces in place via `notify_error`
+                            // (status bar + drawer), never drawer-only
+                            // — the old `notify` left the user staring
+                            // at a tile that did nothing. The title
+                            // carries the right verb: the old code
+                            // said "Couldn't launch game" for a STOP
+                            // failure too, and showed only `e.title`
+                            // (reason + next step dropped).
+                            let titled = UserError {
+                                code: e.code.clone(),
+                                title: if running {
+                                    "Couldn't stop game".to_string()
+                                } else {
+                                    "Couldn't launch game".to_string()
+                                },
+                                what_happened: e.what_happened.clone(),
+                                what_to_do: e.what_to_do.clone(),
+                                detail: e.detail.clone(),
+                            };
+                            ctx.notify_error(w, "Game", &titled);
                             ui_log!("RSH-UI launch-game failed: {} ({})", e.code, e.title);
                         }
                     }
@@ -11669,7 +12412,13 @@ fn wire_settings_action(win: &MainWindow, ctx: &Rc<Ctx>) {
                                 Ok(path) => {
                                     // C3: the backup line updates after a backup.
                                     w.set_backup_text("Saved just now".into());
-                                    ctx.notify(
+                                    // UI-8 (v2.0.12): success surfaces
+                                    // in place (`notify_success`),
+                                    // like every other success path —
+                                    // the old drawer-only `notify`
+                                    // left the user with no visible
+                                    // confirmation at all.
+                                    ctx.notify_success(
                                         w,
                                         "Backup",
                                         "Backup saved",
@@ -11693,7 +12442,10 @@ fn wire_settings_action(win: &MainWindow, ctx: &Rc<Ctx>) {
                             };
                             match result {
                                 Ok(message) => {
-                                    ctx.notify(w, "Backup", "Backup restored", &message);
+                                    // UI-8 (v2.0.12): see the backup
+                                    // arm above — success surfaces in
+                                    // place, not drawer-only.
+                                    ctx.notify_success(w, "Backup", "Backup restored", &message);
                                     ctx.refresh_profiles(w);
                                 }
                                 Err(e) => ctx.notify_error(w, "Backup", &e),
@@ -12609,6 +13361,7 @@ fn main() -> Result<(), slint::PlatformError> {
         games_cache: Rc::new(RefCell::new(Vec::new())),
         game_dialog_edit_id: Rc::new(RefCell::new(None)),
         game_dialog_profile_id: Rc::new(RefCell::new(None)),
+        game_dialog_idempotency_key: Rc::new(RefCell::new(None)),
         presets_games: Rc::new(RefCell::new(Vec::new())),
         games_profiles: Rc::new(RefCell::new(Vec::new())),
         pending_profile_id: Rc::new(RefCell::new(None)),
@@ -12639,6 +13392,8 @@ fn main() -> Result<(), slint::PlatformError> {
         wifi_rejoining: Rc::new(Cell::new(false)),
         wifi_rejoin_since: Rc::new(Cell::new(None)),
         backend_cooldown_until: Rc::new(Cell::new(None)),
+        backend_job_requested: Rc::new(Cell::new(None)),
+        backend_requery_in_flight: Rc::new(Cell::new(false)),
         wifi_password_set_known: Rc::new(Cell::new(None)),
         wifi_password_message_for: Rc::new(Cell::new(None)),
         confirm_pending: Rc::new(RefCell::new(None)),
@@ -12663,6 +13418,7 @@ fn main() -> Result<(), slint::PlatformError> {
         spawn_budget: Arc::new(live_probe::SpawnBudget::new()),
         spawn_latch: Rc::new(RefCell::new(None)),
         last_dead_detail: Rc::new(RefCell::new(None)),
+        last_second_instance_at: Rc::new(Cell::new(None)),
         down_since: Rc::new(Cell::new(None)),
         last_back_at: Rc::new(Cell::new(None)),
         last_flap_at: Rc::new(Cell::new(None)),
@@ -12688,6 +13444,8 @@ fn main() -> Result<(), slint::PlatformError> {
         diag_buttons_hash: Rc::new(Cell::new(None)),
         diag_events_hash: Rc::new(Cell::new(None)),
         last_frame: Rc::new(RefCell::new(None)),
+        tuning_gen: Rc::new(Cell::new(0)),
+        last_cheap_frame: Rc::new(Cell::new(None)),
         // Perf (F-2): the list/diag syncs run on the first frame
         // tick, not in `main` before the first paint.
         startup_sync_pending: Rc::new(Cell::new(true)),
@@ -13258,6 +14016,20 @@ mod tests {
         );
     }
 
+    /// PERF P2-4: a 200-sample history decimates to 101 plotted
+    /// points (one per ~3.8 px at the 380 px viewBox) and the trace
+    /// still starts at the left edge and reaches the right edge
+    /// with the last sample's value.
+    #[test]
+    fn chart_commands_decimates_long_histories_to_101_points() {
+        let samples: VecDeque<f32> = (0u8..200).map(f32::from).collect();
+        let cmds = chart_commands(&samples, 0.0, 199.0);
+        assert!(cmds.starts_with("M 0.0 85.0"), "{cmds}");
+        assert!(cmds.ends_with("L 380.0 5.0"), "{cmds}");
+        // 101 points = 1 M + 100 L segments.
+        assert_eq!(cmds.matches('L').count(), 100, "{cmds}");
+    }
+
     /// DS-78: the frame command cache reuses the built string while
     /// its inputs are unchanged, rebuilds when an input moves, and
     /// the dashed line is built once.
@@ -13321,6 +14093,60 @@ mod tests {
             "a local tuning change wakes the frame"
         );
         assert!(!ctx.push_frame(&win, 4), "identical again after the change");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Perf (P1-4): the cheap frame key rests an idle frame BEFORE
+    /// any clone — the second `push_frame` stores the key and the
+    /// identical tick returns `false` without building
+    /// `FrameInputs`; a bare `bump_tuning_gen` (no value change)
+    /// moves the key (so the cheap path does NOT rest it) but the
+    /// full compare still rests the frame — no visible change, one
+    /// extra compare only; and a real local pedal echo wakes the
+    /// frame through the bump wired into the mutator. (`SimApi` is
+    /// not live, so the connection fingerprint is the constant 0
+    /// and the snapshot seq is 0.)
+    #[test]
+    fn perf_cheap_frame_key_rests_idle_frame_before_cloning() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("perf cheap-key test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        assert!(ctx.push_frame(&win, 0), "first frame always runs");
+        let key0 = ctx
+            .last_cheap_frame
+            .get()
+            .expect("key stored after the first frame");
+        assert!(
+            !ctx.push_frame(&win, 1),
+            "identical tick rests on the cheap key"
+        );
+        assert_eq!(
+            ctx.last_cheap_frame.get(),
+            Some(key0),
+            "resting tick keeps the same key"
+        );
+        ctx.bump_tuning_gen();
+        assert!(
+            !ctx.push_frame(&win, 3),
+            "bump alone changes nothing visible"
+        );
+        let key1 = ctx
+            .last_cheap_frame
+            .get()
+            .expect("key re-stored after the bump");
+        assert_ne!(
+            key1.tuning_gen, key0.tuning_gen,
+            "the bump moved the generation"
+        );
+        assert!(!ctx.push_frame(&win, 4), "identical again after the bump");
+        ctx.apply_pedal_deadzone_local(&win, 0, 12.0);
+        assert!(
+            ctx.push_frame(&win, 5),
+            "a local pedal echo wakes the frame"
+        );
+        assert!(!ctx.push_frame(&win, 6), "identical again after the echo");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -13424,6 +14250,18 @@ mod tests {
     }
 
     #[test]
+    fn fmt_elapsed_is_m_ss() {
+        // P1-6: the Backend busy strip shows the wait as m:ss —
+        // the same shape as the vJoy install elapsed.
+        assert_eq!(Ctx::fmt_elapsed(0), "0:00");
+        assert_eq!(Ctx::fmt_elapsed(7), "0:07");
+        assert_eq!(Ctx::fmt_elapsed(59), "0:59");
+        assert_eq!(Ctx::fmt_elapsed(60), "1:00");
+        assert_eq!(Ctx::fmt_elapsed(83), "1:23");
+        assert_eq!(Ctx::fmt_elapsed(420), "7:00");
+    }
+
+    #[test]
     fn fc2_busy_state_oldest_job_wins() {
         // B5/FC2: the strip shows one label — the oldest job's.
         let mut jobs: HashMap<JobKind, (String, Instant)> = HashMap::new();
@@ -13524,6 +14362,15 @@ mod tests {
         assert_eq!(JobKind::LearnToggle.order(), 17);
         assert_eq!(JobKind::LearnToggle.timeout(), Duration::from_secs(5));
         assert_eq!(JobKind::LearnOp.order(), 11);
+    }
+
+    #[test]
+    fn game_op_timeout_exceeds_the_game_ipc_budgets() {
+        // UI-4 (v2.0.12): the GameOp job timeout must exceed the
+        // 10 s game-write / launch IPC budgets, or a healthy 5–10 s
+        // write was declared timed out while the daemon was still
+        // working on it.
+        assert_eq!(JobKind::GameOp.timeout(), Duration::from_secs(15));
     }
 
     #[test]
@@ -13646,6 +14493,64 @@ mod tests {
         assert_eq!(clean_profile_name("   "), None);
     }
 
+    // CORE-P3-8 (v2.0.13): a fresh second-instance `info` record
+    // surfaces once (notification + info status-bar message) with
+    // its timestamp, never as a fatal banner — and the 1 Hz
+    // re-sync does not notify the same record again.
+    #[test]
+    #[cfg(unix)]
+    fn second_instance_info_surfaces_once_with_timestamp() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("second-instance test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        assert!(!ctx.is_live(), "test ctx starts down");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        std::fs::write(
+            dir.join("daemon-status.json"),
+            format!(
+                r#"{{"status":"info","code":"SecondInstanceStarting","detail":"already running (pid 1234) but its IPC endpoint never appeared","pid":5678,"at_unix":{now}}}"#
+            ),
+        )
+        .expect("status file");
+        let unread = || ctx.notifications.borrow().unread_count();
+        let before = unread();
+        ctx.sync_daemon_error(&win);
+        assert_eq!(
+            unread(),
+            before + 1,
+            "the info record notifies exactly once"
+        );
+        assert_eq!(
+            win.get_daemon_error().as_str(),
+            "",
+            "an info record never drives the fatal banner"
+        );
+        let last = ctx
+            .notifications
+            .borrow()
+            .to_model_items()
+            .into_iter()
+            .next_back()
+            .expect("one entry");
+        assert_eq!(last.title.as_str(), "Second RSH backend start noticed");
+        assert!(
+            last.body.as_str().contains(&format_unix_time(now)),
+            "the notification carries the record timestamp"
+        );
+        // The 1 Hz safety re-sync must not notify the same record again.
+        ctx.sync_daemon_error(&win);
+        assert_eq!(unread(), before + 1, "the same record does not re-notify");
+        // And the timestamp helper itself: midnight, one afternoon time, unknown.
+        assert_eq!(format_unix_time(0), "unknown time");
+        assert_eq!(format_unix_time(86_400), "00:00:00 UTC");
+        assert_eq!(format_unix_time(45_261), "12:34:21 UTC");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Minimal [`Ctx`] for the FC2 window test: the sim API, an
     /// isolated temp data dir (notifications + `daemon-status.json`
     /// never touch the real data dir), no health monitor, no frame
@@ -13708,6 +14613,7 @@ mod tests {
             games_cache: Rc::new(RefCell::new(Vec::new())),
             game_dialog_edit_id: Rc::new(RefCell::new(None)),
             game_dialog_profile_id: Rc::new(RefCell::new(None)),
+            game_dialog_idempotency_key: Rc::new(RefCell::new(None)),
             presets_games: Rc::new(RefCell::new(Vec::new())),
             games_profiles: Rc::new(RefCell::new(Vec::new())),
             pending_profile_id: Rc::new(RefCell::new(None)),
@@ -13737,6 +14643,8 @@ mod tests {
             wifi_rejoining: Rc::new(Cell::new(false)),
             wifi_rejoin_since: Rc::new(Cell::new(None)),
             backend_cooldown_until: Rc::new(Cell::new(None)),
+            backend_job_requested: Rc::new(Cell::new(None)),
+            backend_requery_in_flight: Rc::new(Cell::new(false)),
             wifi_password_set_known: Rc::new(Cell::new(None)),
             wifi_password_message_for: Rc::new(Cell::new(None)),
             confirm_pending: Rc::new(RefCell::new(None)),
@@ -13756,6 +14664,7 @@ mod tests {
             spawn_budget: Arc::new(live_probe::SpawnBudget::new()),
             spawn_latch: Rc::new(RefCell::new(None)),
             last_dead_detail: Rc::new(RefCell::new(None)),
+            last_second_instance_at: Rc::new(Cell::new(None)),
             down_since: Rc::new(Cell::new(None)),
             last_back_at: Rc::new(Cell::new(None)),
             last_flap_at: Rc::new(Cell::new(None)),
@@ -13781,6 +14690,8 @@ mod tests {
             diag_buttons_hash: Rc::new(Cell::new(None)),
             diag_events_hash: Rc::new(Cell::new(None)),
             last_frame: Rc::new(RefCell::new(None)),
+            tuning_gen: Rc::new(Cell::new(0)),
+            last_cheap_frame: Rc::new(Cell::new(None)),
             // Tests drive handlers directly (no frame timer), so
             // there is no first tick to run the deferred startup
             // syncs — they stay off here.
@@ -13795,7 +14706,12 @@ mod tests {
     /// F6 handlers apply on the drain, so tests assert after this,
     /// not right after the invoke.
     fn drain_all_jobs(ctx: &Ctx, win: &MainWindow) {
-        for _ in 0..150 {
+        // 500 × 20 ms = 10 s cap: the HID P3-5 polling re-query
+        // takes ~4-5 s when the daemon stays on the old backend
+        // (5 samples, 1 s apart), so the old 3 s cap gave up
+        // before its verdict landed. Returns the moment the busy
+        // set empties, so fast jobs cost nothing extra.
+        for _ in 0..500 {
             ctx.drain_jobs(win);
             if ctx.busy_jobs.borrow().is_empty() {
                 return;
@@ -14459,12 +15375,15 @@ mod tests {
         let (ctx, ctx_dir) = fc2_test_ctx();
         wire_callbacks(&win, &ctx);
         let unread = || ctx.notifications.borrow().unread_count();
+        // Newest first: the center stores the latest push at the
+        // front, so `.next()` — not `.next_back()` (the oldest) —
+        // is the verdict that just landed.
         let last_title = || {
             ctx.notifications
                 .borrow()
                 .to_model_items()
                 .into_iter()
-                .next_back()
+                .next()
                 .map(|item| item.title.as_str().to_string())
                 .unwrap_or_default()
         };
@@ -15213,8 +16132,8 @@ mod tests {
 
     // D17 (was DS-24): a failure shows in the status bar and NEVER
     // opens the drawer — the drawer opens only on bell click. The
-    // error lives 1 s, then the 1 Hz expiry clears it (P3-1: the
-    // old "8 s" here was stale — the code is 1 s). A success
+    // error lives 4 s (UI-5, v2.0.12 — the old 1 s flash was too
+    // short to read), then the 1 Hz expiry clears it. A success
     // shows the same way, with the ok-accent kind.
     #[test]
     fn d17_failure_status_never_opens_drawer() {
@@ -15248,7 +16167,7 @@ mod tests {
         ctx.check_status_expiry(&win);
         assert_ne!(win.get_status_text().as_str(), "");
 
-        // Past the 1 s deadline: the expiry clears it (and the kind
+        // Past the 4 s deadline: the expiry clears it (and the kind
         // resets to error).
         ctx.status_until.set(Some(
             Instant::now()
@@ -15542,6 +16461,359 @@ mod tests {
             "success clears the cooldown"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // HID-4 (v2.0.12): a vJoy-requested switch failure must NOT arm
+    // the 30 s selector cooldown — the daemon storm guard counts
+    // HIDMaestro attempts only, so a failed vJoy switch (e.g. vJoy
+    // not installed) must not lock the user out of HIDMaestro.
+    #[test]
+    fn backend_job_vjoy_failure_does_not_arm_cooldown() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("backend cooldown test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        assert_eq!(ctx.api().output_backend(), "vJoy");
+        assert_eq!(win.get_backend_cooldown_secs(), 0);
+
+        // A vJoy switch failure: the error toasts, the radio stays
+        // on the live backend (vJoy), and no cooldown arms.
+        win.set_controller(1);
+        let started = ctx.run_job(&win, JobKind::Backend, "Switching controller…", || {
+            JobDone::Backend {
+                index: 1,
+                result: Err(UserError {
+                    code: "Unknown".to_string(),
+                    title: "Something went wrong".to_string(),
+                    what_happened: "Something went wrong.".to_string(),
+                    what_to_do: "Try again.".to_string(),
+                    detail: Some("vJoy is not installed.".to_string()),
+                }),
+            }
+        });
+        assert!(started, "backend job should start");
+        drain_all_jobs(&ctx, &win);
+        assert_eq!(
+            win.get_controller(),
+            1,
+            "radio stays on the live backend (vJoy)"
+        );
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            0,
+            "a vJoy failure must not arm the cooldown"
+        );
+        // And a HIDMaestro-requested failure still arms (the
+        // mismatch arm counts too: Ok(vJoy) for a HIDMaestro
+        // request is a failure of the HIDMaestro switch).
+        win.set_controller(0);
+        let started = ctx.run_job(&win, JobKind::Backend, "Switching controller…", || {
+            JobDone::Backend {
+                index: 0,
+                result: Ok("vJoy".to_string()),
+            }
+        });
+        assert!(started, "backend job should start");
+        drain_all_jobs(&ctx, &win);
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            30,
+            "a HIDMaestro-requested failure must still arm the cooldown"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // HID-3 (v2.0.12): a backend-job timeout re-queries the LIVE
+    // backend from the daemon instead of trusting the UI-side
+    // cache — a switch that actually completed reports success,
+    // and one still running reports "still running" with no
+    // cooldown, never the false failure + 30 s lockout.
+    #[test]
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    fn backend_timeout_requeries_the_live_backend() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("HID-3 test skipped: no usable display/backend");
+            return;
+        };
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-hid3-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let api: Arc<dyn AppApi> = Arc::new(SimApi::new());
+        let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let server = Arc::new(rsh_ipc::IpcServer::new(api.clone(), tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                if let Ok((stream, _)) = listener.accept().await {
+                    server.serve_stream(stream).await;
+                }
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let live_api = IpcApi::connect(&sock).expect("connect");
+        let (ctx, ctx_dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        ctx.swap_to_live(live_api.clone());
+        ctx.state.borrow_mut().live = true;
+        let unread = || ctx.notifications.borrow().unread_count();
+        // Newest first: the center stores the latest push at the
+        // front, so `.next()` — not `.next_back()` (the oldest) —
+        // is the verdict that just landed.
+        let last_title = || {
+            ctx.notifications
+                .borrow()
+                .to_model_items()
+                .into_iter()
+                .next()
+                .map(|item| item.title.as_str().to_string())
+                .unwrap_or_default()
+        };
+        // A stale backend job stands in for the timed-out switch:
+        // the 420 s Backend bound makes a 421 s old entry due.
+        let stale_backend_job = || {
+            ctx.backend_job_requested.set(Some(0));
+            ctx.busy_jobs.borrow_mut().insert(
+                JobKind::Backend,
+                (
+                    "Switching controller…".to_string(),
+                    Instant::now()
+                        .checked_sub(Duration::from_secs(421))
+                        .expect("421 s ago exists"),
+                ),
+            );
+        };
+
+        // Leg 1: the daemon is still on vJoy, the UI asked for
+        // HIDMaestro — the timeout stays silent (the re-query
+        // reports), no cooldown arms, and the verdict is "still
+        // running", not a failure. The LIVE query proves the
+        // backend — `output_backend()` reads the async-filled
+        // cache, which is still "Unknown" until the connect
+        // poller first runs, so asserting on it here races the
+        // poller (pre-existing: the test only ever ran where a
+        // display exists, and failed at once under Xvfb).
+        assert_eq!(
+            live_api.query_output_backend().as_deref(),
+            Some("vJoy"),
+            "the daemon starts on vJoy"
+        );
+        stale_backend_job();
+        let before = unread();
+        ctx.check_job_timeouts(&win);
+        assert_eq!(
+            unread(),
+            before,
+            "the timeout itself must stay silent — the re-query reports"
+        );
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            0,
+            "no cooldown before the verdict"
+        );
+        assert!(
+            ctx.backend_requery_in_flight.get(),
+            "the timeout must start a live re-query"
+        );
+        drain_all_jobs(&ctx, &win);
+        assert!(
+            !ctx.backend_requery_in_flight.get(),
+            "the re-query flag clears on its verdict"
+        );
+        assert_eq!(unread(), before + 1, "the verdict notifies exactly once");
+        assert_eq!(last_title(), "Controller switch still running");
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            0,
+            "a still-running switch must not arm the cooldown"
+        );
+        assert_eq!(
+            win.get_controller(),
+            1,
+            "the segment re-syncs to the live backend (vJoy)"
+        );
+
+        // Leg 2: the daemon HAS switched to HIDMaestro by the time
+        // the re-query runs — the timeout reports the success, not
+        // the timeout.
+        assert_eq!(
+            live_api.set_output_backend("HIDMaestro").expect("switch"),
+            "HIDMaestro"
+        );
+        stale_backend_job();
+        let before = unread();
+        ctx.check_job_timeouts(&win);
+        assert_eq!(unread(), before, "the timeout itself stays silent");
+        drain_all_jobs(&ctx, &win);
+        assert_eq!(unread(), before + 1, "the verdict notifies exactly once");
+        assert_eq!(last_title(), "Controller switched");
+        assert_eq!(
+            win.get_controller(),
+            0,
+            "the segment shows the switched backend (HIDMaestro)"
+        );
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            0,
+            "a completed switch arms no cooldown"
+        );
+
+        // Leg 3 (HID P3-5, v2.0.13): the switch lands MID-POLL —
+        // the daemon is still on vJoy when the re-query starts
+        // and flips to HIDMaestro 1.2 s in. A single sample would
+        // have read vJoy and reported "still running"; the polling
+        // re-query must report the success. The 1.2 s delay sits
+        // between the first sample (~0 s) and the last (~4 s) with
+        // margin both ways, so the leg is not timing-fragile.
+        assert_eq!(
+            live_api.set_output_backend("vJoy").expect("switch back"),
+            "vJoy"
+        );
+        let switcher_api = api.clone();
+        let switcher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1200));
+            switcher_api
+                .set_output_backend("HIDMaestro")
+                .expect("mid-poll switch");
+        });
+        stale_backend_job();
+        let before = unread();
+        ctx.check_job_timeouts(&win);
+        assert_eq!(unread(), before, "the timeout itself stays silent");
+        drain_all_jobs(&ctx, &win);
+        switcher.join().expect("switcher thread");
+        // No unread-count assert here: this verdict is identical
+        // to Leg 2's ("Controller switched"), so the F12 dedupe
+        // folds it into that row ("Controller switched (×2)")
+        // instead of adding a new unread row when it lands within
+        // the 5 s cooldown — the verdict still landed, which the
+        // segment + title below prove.
+        assert!(
+            last_title().starts_with("Controller switched"),
+            "a switch that lands mid-poll reports success, not 'still running' (got {})",
+            last_title()
+        );
+        assert_eq!(
+            win.get_controller(),
+            0,
+            "the segment shows the switched backend (HIDMaestro)"
+        );
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            0,
+            "a completed switch arms no cooldown"
+        );
+
+        // Teardown: `mark_dead` drops the live link so the server
+        // thread ends when the client goes away.
+        ctx.mark_dead(&win);
+        drop(live_api);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ctx_dir);
+    }
+
+    // CORE-13 (v2.0.12): a reconnect seed whose `connect` Ok'd
+    // with `connect_started: Some(false)` — a retry was already in
+    // flight — must NOT toast "Wheel connected": the session is
+    // not established yet. A fresh connect still notifies.
+    #[test]
+    #[cfg(unix)]
+    fn reconnect_seed_noop_connect_does_not_notify_connected() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("CORE-13 test skipped: no usable display/backend");
+            return;
+        };
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-core13-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let api: Arc<dyn AppApi> = Arc::new(SimApi::new());
+        let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let server = Arc::new(rsh_ipc::IpcServer::new(api.clone(), tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                if let Ok((stream, _)) = listener.accept().await {
+                    server.serve_stream(stream).await;
+                }
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let live_api = IpcApi::connect(&sock).expect("connect");
+        let (ctx, ctx_dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        ctx.swap_to_live(live_api.clone());
+        ctx.state.borrow_mut().live = true;
+        let unread = || ctx.notifications.borrow().unread_count();
+        let last_title = || {
+            ctx.notifications
+                .borrow()
+                .to_model_items()
+                .into_iter()
+                .next_back()
+                .map(|item| item.title.as_str().to_string())
+                .unwrap_or_default()
+        };
+        let seed_with = |connect: Result<ConnectionInfo, UserError>| crate::ipc_api::LiveSeed {
+            backend: "vJoy".to_string(),
+            autostart: true,
+            connect,
+            wifi: WifiStatus {
+                ssid: None,
+                connected: false,
+                password_set: false,
+                board_mac: None,
+            },
+        };
+
+        // No-op connect (retry already in flight): silent.
+        let mut noop = api.connection();
+        noop.connect_started = Some(false);
+        let before = unread();
+        ctx.apply_reconnect_seed(&win, live_api.clone(), seed_with(Ok(noop)));
+        assert_eq!(
+            unread(),
+            before,
+            "a no-op connect must not notify 'Wheel connected'"
+        );
+
+        // Fresh connect: notifies exactly once.
+        let mut fresh = api.connection();
+        fresh.connect_started = Some(true);
+        let before = unread();
+        ctx.apply_reconnect_seed(&win, live_api.clone(), seed_with(Ok(fresh)));
+        assert_eq!(unread(), before + 1, "a fresh connect must notify once");
+        assert_eq!(last_title(), "Wheel connected");
+
+        ctx.mark_dead(&win);
+        drop(live_api);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ctx_dir);
     }
 
     // D15: the wizard's Connect step unlocks on `board_reachable`

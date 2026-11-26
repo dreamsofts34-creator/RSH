@@ -9,11 +9,18 @@
 //!   `ShellExecuteEx` (`runas` verb — the UAC prompt) and connects back
 //!   over a loopback TCP socket ([`transport::listen_loopback`] /
 //!   `accept_loopback`), because handle redirection does not survive a
-//!   `runas` launch. The one-time token travels in the sidecar's
-//!   environment ([`SIDECAR_TOKEN_ENV`], C-TOK-1 — never on the command
-//!   line) and is echoed in `hello` and verified; the accepted
-//!   socket's peer PID is additionally verified against the spawned
-//!   process (C-TOK-1).
+//!   `runas` launch. The one-time token travels on the sidecar's
+//!   command line (`--token <nonce>`, v2.0.12) and is echoed in
+//!   `hello` and verified; the accepted socket's peer PID is
+//!   additionally verified against the spawned process (C-TOK-1).
+//!   The token used to travel in the environment
+//!   (`RSH_HM_SIDECAR_TOKEN`, v2.0.11 and earlier) — AIS builds a
+//!   FRESH environment for a `runas` child, dropping runtime-set
+//!   variables, so the sidecar died with exit 2 before connecting
+//!   (proven on the owner's PC, v2.0.11 retest). The nonce is
+//!   single-use random and briefly visible in the process list /
+//!   WMI — accepted; it is never logged anywhere, only its
+//!   presence.
 //! * Windows, non-elevated (dev only — works when RSH itself runs
 //!   elevated): stdio spawn. A manifest elevation failure (OS error
 //!   740) is mapped to [`HidMaestroError::NotAdmin`].
@@ -53,8 +60,6 @@ use std::time::{Duration, Instant};
 /// unconditional import warned as unused in release builds.
 #[cfg(debug_assertions)]
 use crate::SIDECAR_PATH_ENV;
-#[cfg(windows)]
-use crate::SIDECAR_TOKEN_ENV;
 use crate::error::HidMaestroError;
 use crate::mapping::HidMaestroCapabilities;
 use crate::protocol::{
@@ -63,7 +68,7 @@ use crate::protocol::{
 };
 use crate::transport::{LiveTransport, TransportEvent, spawn_stdio};
 #[cfg(windows)]
-use crate::transport::{accept_loopback, generate_token, listen_loopback};
+use crate::transport::{accept_loopback_with_diagnostics, generate_token, listen_loopback};
 use crate::{PROFILE_ID, SIDECAR_EXE_NAME};
 
 /// Timeout budget (P1-1, update4-fix): the UI bound must EXCEED the
@@ -298,11 +303,47 @@ pub struct SidecarManager {
     /// round-trip on the 200 Hz tick. Cleared on the next successful
     /// heartbeat.
     last_alive_failure: Option<Instant>,
+    /// The cached heartbeat failure's own detail (P3-8, v2.0.12
+    /// scan): the cached arm used to return a bare fixed string
+    /// ("sidecar heartbeat failed recently (cached)") with no PID,
+    /// exit code, or timing — it now replays the original failure's
+    /// enriched detail instead. Set/cleared together with
+    /// `last_alive_failure`.
+    last_alive_failure_detail: Option<String>,
     last_submit_latency_us: Option<f64>,
     submit_count: u64,
     transport_index: Option<i32>,
     driver_version: Option<String>,
     sdk_version: Option<String>,
+}
+
+/// True when the sidecar process behind `process` is known to have
+/// exited (PERF P2-7). Windows: exit code present and not
+/// `STILL_ACTIVE` (259). Everywhere else: no process handle is kept,
+/// so this is always false.
+fn sidecar_exited(process: Option<usize>) -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::GetExitCodeProcess;
+        let Some(process) = process else {
+            return false;
+        };
+        let handle = HANDLE(process as *mut std::ffi::c_void);
+        let mut code = 0u32;
+        // SAFETY: `handle` is the live `SEE_MASK_NOCLOSEPROCESS`
+        // handle stored at spawn; `kill_transport` closes it exactly
+        // once, after reads like this one.
+        let Ok(()) = (unsafe { GetExitCodeProcess(handle, &raw mut code) }) else {
+            return false;
+        };
+        code != 259
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = process;
+        false
+    }
 }
 
 impl SidecarManager {
@@ -326,6 +367,7 @@ impl SidecarManager {
             healthy_submits: 0,
             last_reply: None,
             last_alive_failure: None,
+            last_alive_failure_detail: None,
             last_submit_latency_us: None,
             submit_count: 0,
             transport_index: None,
@@ -440,6 +482,12 @@ impl SidecarManager {
         if self.fallback_needed {
             return Err(HidMaestroError::FallbackNeeded);
         }
+        // HID P3-4 (polish round): a liveness-detected death and
+        // its in-call respawn used to count as TWO failures, so one
+        // sidecar death + one unlucky respawn latched the fallback
+        // permanently — harsher than the documented per-failure
+        // budget. They count as one failure per `connect()` call.
+        let mut liveness_failure_counted = false;
         if self.transport.is_some() {
             // M8: a transport that exists is not proof the sidecar is
             // alive — drain the event channel without blocking. A
@@ -451,11 +499,12 @@ impl SidecarManager {
                 Err(err) => {
                     self.kill_transport();
                     self.note_failure();
+                    liveness_failure_counted = true;
                     if self.fallback_needed {
                         return Err(HidMaestroError::FallbackNeeded);
                     }
                     // Fall through to spawn_and_hello for the retry;
-                    // its own failure path counts the second failure.
+                    // its failure does NOT count again (see below).
                     let _ = err;
                 }
             }
@@ -474,7 +523,9 @@ impl SidecarManager {
             }
             Err(err) => {
                 self.kill_transport();
-                self.note_failure();
+                if !liveness_failure_counted {
+                    self.note_failure();
+                }
                 Err(err)
             }
         }
@@ -525,9 +576,12 @@ impl SidecarManager {
             match transport.events.try_recv() {
                 Ok(TransportEvent::Line(_)) => {} // stray line: discard, keep draining
                 Ok(TransportEvent::Eof) => {
-                    return Err(HidMaestroError::SidecarDied(
-                        "sidecar exited (EOF queued)".to_string(),
-                    ));
+                    // P3-8 (v2.0.12 scan): the queued-EOF liveness
+                    // death carries the same PID + exit-code + timing
+                    // enrichment as the request-path EOF arm (captured
+                    // before the caller kills the transport) instead
+                    // of the bare fixed string.
+                    return Err(HidMaestroError::SidecarDied(self.describe_post_hello_eof()));
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -545,24 +599,21 @@ impl SidecarManager {
     fn spawn_windows_elevated(&mut self) -> Result<HelloInfo, HidMaestroError> {
         let (listener, port) = listen_loopback().map_err(HidMaestroError::from)?;
         let token = generate_token().map_err(HidMaestroError::from)?;
-        // C-TOK-1: the token travels in the sidecar's ENVIRONMENT, not
-        // on its command line (argv is world-readable via WMI /
-        // Process Explorer). `ShellExecuteEx` has no env-block
-        // parameter, so the variable is set in this process just for
-        // the spawn — the child inherits a copy — and removed
-        // immediately afterwards, even on spawn failure.
-        // SAFETY: edition-2024 `set_var`/`remove_var` are `unsafe`
-        // because concurrent env access is UB. This runs on the
-        // engine's connect path only (no other thread touches the
-        // process environment here), and the variable is removed
-        // before this function returns on every path.
-        unsafe {
-            std::env::set_var(SIDECAR_TOKEN_ENV, &token);
-        }
-        let spawned = spawn_elevated_runas(&self.config.sidecar_path, port);
-        unsafe {
-            std::env::remove_var(SIDECAR_TOKEN_ENV);
-        }
+        // v2.0.12 (H1 — PROVEN on the owner's PC): the token travels
+        // on the sidecar's command line (`--token <nonce>`), NOT in
+        // its environment. The old env transport
+        // (`RSH_HM_SIDECAR_TOKEN`, set just for the spawn) is dead:
+        // a non-elevated daemon launches the elevated sidecar via
+        // `ShellExecuteEx "runas"`, and AIS builds a FRESH
+        // environment for the elevated child, dropping the
+        // runtime-set variable — the sidecar logged `bad-args:
+        // --connect-back needs RSH_HM_SIDECAR_TOKEN...` and exited 2
+        // before connecting. The old comment's claim ("the child
+        // inherits a copy") was FALSE through AIS. The nonce is
+        // single-use random (128-bit hex) and briefly visible in the
+        // process list / WMI — accepted; it is NEVER logged anywhere
+        // (presence only, never the value).
+        let spawned = spawn_elevated_runas(&self.config.sidecar_path, port, &token);
         // B-2/A10: a declined UAC prompt latches the decline — the
         // next `connect()` fails fast with NotAdmin instead of
         // prompting again.
@@ -575,6 +626,13 @@ impl SidecarManager {
                 return Err(error);
             }
         };
+        // Keep the process handle BEFORE waiting for the connect-back:
+        // when the accept fails (slow UAC, foreign peer, I/O error) the
+        // elevated sidecar must be terminated and its handle closed,
+        // not leaked (a retry would otherwise spawn a second one).
+        // Stored before the PID check so the pid-0 fail-fast below
+        // can terminate it via `kill_transport`.
+        self.elevated_process = Some(process);
         let pid = {
             use windows::Win32::Foundation::HANDLE;
             use windows::Win32::System::Threading::GetProcessId;
@@ -582,29 +640,75 @@ impl SidecarManager {
             // with `SEE_MASK_NOCLOSEPROCESS`.
             unsafe { GetProcessId(HANDLE(process as *mut std::ffi::c_void)) }
         };
+        // (2b, v2.0.12) H4 pid-0 hole: `GetProcessId` returns 0 for
+        // an invalid handle — fail fast with `SpawnFailed`, never a
+        // silent 30 s accept timeout on a process that was never
+        // really spawned.
+        if pid == 0 {
+            self.kill_transport();
+            return Err(HidMaestroError::SpawnFailed(
+                "elevated sidecar spawn returned PID 0 (no live process — refusing to wait out the 30 s accept timeout)"
+                    .to_string(),
+            ));
+        }
         // P0 (v2.0.11): keep the spawn PID for the `SidecarDied`
         // message — the daemon log then names the process that died
         // before hello, per switch attempt.
         self.last_spawn_pid = Some(pid);
-        // Keep the process handle BEFORE waiting for the connect-back:
-        // when the accept fails (slow UAC, foreign peer, I/O error) the
-        // elevated sidecar must be terminated and its handle closed,
-        // not leaked (a retry would otherwise spawn a second one).
-        self.elevated_process = Some(process);
         // P1-1: the spawn (and the UAC prompt) has returned — start
         // the hello clock now, at accept start, so the accept→EOF
         // elapsed ms never includes the UAC dwell.
         self.hello_started = Some(Instant::now());
-        let transport = match accept_loopback(&listener, self.config.spawn_timeout, Some(pid)) {
+        let mut accept_diagnostics = Vec::new();
+        let transport = match accept_loopback_with_diagnostics(
+            &listener,
+            self.config.spawn_timeout,
+            Some(pid),
+            &mut accept_diagnostics,
+        ) {
             Ok(transport) => transport,
             Err(error) => {
+                // (2a, v2.0.12) P0: the accept-failure diagnostic —
+                // PID + exit code + elapsed ms — is captured BEFORE
+                // `kill_transport` (which takes the handle the exit
+                // code is read from) and folded into the returned
+                // error, which lands in the daemon log via the
+                // switch-failure line (`daemon_api::set_output_backend`
+                // logs `set_output_backend(HIDMaestro) failed:
+                // <reason>` — the same channel the v2.0.11 P0
+                // `SidecarDied` enrichment already uses). Exit 2 =
+                // the sidecar exited fast on its own (bad-args — see
+                // its file log); 259 = still running but never
+                // connected back; anything else = crash code.
+                let message = self.describe_accept_failure(&error, &accept_diagnostics);
                 self.kill_transport();
-                return Err(HidMaestroError::from(error));
+                return Err(HidMaestroError::Io(message));
             }
         };
         self.token = Some(token.clone());
         self.transport = Some(transport);
         self.read_hello(Some(token.as_str()))
+    }
+
+    /// Accept-failure diagnostic (2a, v2.0.12): `{source} (pid …,
+    /// exit code …, N ms since spawn; …)` plus any foreign-peer
+    /// drops (2c). Windows-only: the exit code comes from
+    /// `GetExitCodeProcess` on the stored elevated-process handle,
+    /// so this MUST be called before `kill_transport` (which closes
+    /// the handle). The pure formatting lives in
+    /// [`format_accept_failure`] so it is unit-testable off Windows.
+    #[cfg(windows)]
+    fn describe_accept_failure(&self, source: &std::io::Error, foreign_drops: &[String]) -> String {
+        let elapsed_ms = self
+            .hello_started
+            .map_or(0, |started| started.elapsed().as_millis());
+        format_accept_failure(
+            &source.to_string(),
+            self.last_spawn_pid,
+            self.sidecar_exit_code(),
+            elapsed_ms,
+            foreign_drops,
+        )
     }
 
     fn read_hello(&mut self, expected_token: Option<&str>) -> Result<HelloInfo, HidMaestroError> {
@@ -645,8 +749,39 @@ impl SidecarManager {
                     self.describe_hello_eof(elapsed_ms),
                 ))
             }
-            Err(_) => Err(HidMaestroError::HelloTimeout),
+            Err(_) => {
+                // P1-1 (v2.0.12 scan): the timeout arm used to
+                // return the bare unit `HelloTimeout` — no PID, no
+                // exit code, no elapsed ms — while the EOF arm in
+                // this same function is fully enriched. Capture the
+                // enriched diagnostic BEFORE the caller kills the
+                // transport (which takes the elevated-process handle
+                // the exit code is read from), exactly like the EOF
+                // arm.
+                let message = self.describe_hello_timeout();
+                Err(HidMaestroError::HelloTimeout(message))
+            }
         }
+    }
+
+    /// Describe a hello timeout (P1-1, v2.0.12 scan): which bound
+    /// was hit plus the same PID + exit-code + timing enrichment as
+    /// the EOF arms — the bound names the stage, and the exit code
+    /// tells a slow-but-alive sidecar (`STILL_ACTIVE`) from a
+    /// crashed one. Must be called BEFORE `kill_transport`, like the
+    /// EOF descriptions.
+    fn describe_hello_timeout(&self) -> String {
+        let elapsed_ms = self
+            .hello_started
+            .map_or(0, |started| started.elapsed().as_millis());
+        self.describe_eof(
+            &format!(
+                "sidecar did not answer hello within {:?}",
+                self.config.spawn_timeout
+            ),
+            elapsed_ms,
+            "after spawn",
+        )
     }
 
     /// Describe a sidecar death before hello (P0, v2.0.11): PID +
@@ -678,16 +813,38 @@ impl SidecarManager {
     /// elevated-process handle, after which the exit code is
     /// unknowable (see [`request_with_timeout`](Self::request_with_timeout)).
     fn describe_post_hello_eof(&self) -> String {
-        let elapsed_ms = self.last_reply.map_or_else(
+        self.describe_eof(
+            "sidecar closed the connection",
+            self.ms_since_last_reply(),
+            "since last reply",
+        )
+    }
+
+    /// Ms since the last reply (or since spawn when no reply ever
+    /// arrived): the elapsed clock shared by the post-hello EOF
+    /// and reply-timeout diagnostics.
+    fn ms_since_last_reply(&self) -> u128 {
+        self.last_reply.map_or_else(
             || {
                 self.hello_started
                     .map_or(0, |started| started.elapsed().as_millis())
             },
             |last| last.elapsed().as_millis(),
-        );
+        )
+    }
+
+    /// Describe a reply timeout (HID path sweep, v2.0.12): which
+    /// bound was hit plus the same PID + exit-code + timing
+    /// enrichment as the EOF arms — the bound names the stage (a
+    /// 120 s timeout is install/create, 10 s is the first neutral,
+    /// 200 ms is a submit/heartbeat), and the exit code tells a
+    /// hung sidecar (`STILL_ACTIVE`, still running) from a crashed
+    /// one. Must be called BEFORE `kill_transport`, like the EOF
+    /// descriptions.
+    fn describe_reply_timeout(&self, timeout: Duration) -> String {
         self.describe_eof(
-            "sidecar closed the connection",
-            elapsed_ms,
+            &format!("sidecar did not answer within {timeout:?}"),
+            self.ms_since_last_reply(),
             "since last reply",
         )
     }
@@ -775,16 +932,67 @@ impl SidecarManager {
             return Err(HidMaestroError::NotConnected);
         };
         if let Err(e) = transport.writer.write_line(&line) {
+            // P3-7 (v2.0.12 scan): the write-failure arm used to
+            // return the bare I/O string (e.g. "sidecar write queue
+            // full — sidecar is not reading"), with no PID, exit
+            // code, or timing — a hung sidecar that stops reading
+            // at 200 Hz read exactly like a dead one. Enrich it
+            // like the EOF/timeout arms, captured BEFORE
+            // `kill_transport`.
+            let message = self.describe_eof(
+                &format!("sidecar write failed ({e})"),
+                self.ms_since_last_reply(),
+                "since last reply",
+            );
             self.kill_transport();
             self.note_failure();
-            return Err(HidMaestroError::SidecarDied(e.to_string()));
+            return Err(HidMaestroError::SidecarDied(message));
         }
-        match transport.events.recv_timeout(timeout) {
-            Ok(TransportEvent::Line(line)) => {
+        // PERF P2-7 (polish round): fail fast when the sidecar
+        // process exits mid-wait instead of burning the whole reply
+        // timeout (up to 120 s on install/create). The reply channel
+        // is polled in 250 ms slices and the process handle is
+        // checked between slices — `sidecar_exited` is Windows-only
+        // (no process handle is kept elsewhere), so on other
+        // platforms this degrades to the old single wait.
+        // Borrow the process handle BEFORE borrowing the transport
+        // mutably — `sidecar_exited` needs the handle and the loop
+        // below holds `&mut self.transport`. The field only exists
+        // on Windows.
+        #[cfg(windows)]
+        let elevated_process = self.elevated_process;
+        #[cfg(not(windows))]
+        let elevated_process = None;
+        let deadline = Instant::now() + timeout;
+        let event = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let message = self.describe_reply_timeout(timeout);
+                self.kill_transport();
+                self.note_failure();
+                return Err(HidMaestroError::ReplyTimeout(message));
+            }
+            match transport
+                .events
+                .recv_timeout(remaining.min(Duration::from_millis(250)))
+            {
+                Ok(event) => break event,
+                Err(_) => {
+                    if sidecar_exited(elevated_process) {
+                        let message = self.describe_post_hello_eof();
+                        self.kill_transport();
+                        self.note_failure();
+                        return Err(HidMaestroError::SidecarDied(message));
+                    }
+                }
+            }
+        };
+        match event {
+            TransportEvent::Line(line) => {
                 self.last_reply = Some(Instant::now());
                 parse_reply(&line)
             }
-            Ok(TransportEvent::Eof) => {
+            TransportEvent::Eof => {
                 // P1-3: the post-hello death carries the same
                 // enrichment as the pre-hello one (PID + exit code +
                 // ms since last reply) — captured BEFORE
@@ -794,11 +1002,6 @@ impl SidecarManager {
                 self.kill_transport();
                 self.note_failure();
                 Err(HidMaestroError::SidecarDied(message))
-            }
-            Err(_) => {
-                self.kill_transport();
-                self.note_failure();
-                Err(HidMaestroError::ReplyTimeout)
             }
         }
     }
@@ -842,8 +1045,14 @@ impl SidecarManager {
         if let Some(failed_at) = self.last_alive_failure
             && failed_at.elapsed() < ALIVE_FAILURE_COOLDOWN
         {
+            // P3-8 (v2.0.12 scan): replay the original failure's
+            // enriched detail instead of a bare fixed string — the
+            // cached arm used to lose the PID / exit code / timing
+            // the live arm had captured.
             return Err(HidMaestroError::SidecarDied(
-                "sidecar heartbeat failed recently (cached)".to_string(),
+                self.last_alive_failure_detail
+                    .clone()
+                    .unwrap_or_else(|| "sidecar heartbeat failed recently (cached)".to_string()),
             ));
         }
         let outcome = self
@@ -852,10 +1061,12 @@ impl SidecarManager {
         match outcome {
             Ok(()) => {
                 self.last_alive_failure = None;
+                self.last_alive_failure_detail = None;
                 Ok(())
             }
             Err(error) => {
                 self.last_alive_failure = Some(Instant::now());
+                self.last_alive_failure_detail = Some(error.to_string());
                 Err(error)
             }
         }
@@ -895,6 +1106,19 @@ impl SidecarManager {
         // C2: parse the REAL sidecar shape — `axes` is a count
         // (`axes == 5` ⇒ all five axes). No `capabilities` object
         // (older sidecar) falls back to the custom-wheel caps.
+        // HID P2-1 (polish round): the 15-byte raw-report layout
+        // was assumed on both sides and never verified — `create`
+        // ignored the sidecar's derived `input_report_size`. A
+        // mismatch now fails the connect instead of misaligning
+        // every frame.
+        if let Some(size) = reply.input_report_size
+            && size != crate::mapping::CUSTOM_RAW_REPORT_SIZE
+        {
+            return Err(HidMaestroError::CreateFailed(format!(
+                "create reply input_report_size is {size}, expected {} — the HID descriptor layout does not match the Rust raw-report layout",
+                crate::mapping::CUSTOM_RAW_REPORT_SIZE
+            )));
+        }
         let caps = reply.capabilities.map_or_else(
             HidMaestroCapabilities::custom_wheel,
             CapabilitiesJson::to_capabilities,
@@ -907,6 +1131,133 @@ impl SidecarManager {
             driver_version: reply.driver.clone(),
             capabilities: caps,
         })
+    }
+
+    /// Verify the live profile against the expected descriptor
+    /// (HID P2-1, polish round): `describe-profile` reports the
+    /// descriptor + derived input-report size the sidecar built with
+    /// the SDK. A mismatch means the SDK packed the report
+    /// differently from the hardcoded 15-byte Rust layout, and every
+    /// frame would be silently misaligned — fail the connect instead
+    /// of shipping garbage to the game.
+    ///
+    /// # Errors
+    ///
+    /// Propagates request errors plus `CreateFailed` on a size /
+    /// descriptor mismatch.
+    pub fn describe_profile(&mut self) -> Result<Reply, HidMaestroError> {
+        let reply =
+            self.request_with_timeout(&Command::DescribeProfile, self.config.driver_op_timeout)?;
+        reply_to_error(&reply)?;
+        match reply.input_report_size {
+            Some(size) if size == crate::mapping::CUSTOM_RAW_REPORT_SIZE => Ok(reply),
+            Some(size) => Err(HidMaestroError::CreateFailed(format!(
+                "sidecar input_report_size is {size}, expected {} — the HID descriptor layout does not match the Rust raw-report layout",
+                crate::mapping::CUSTOM_RAW_REPORT_SIZE
+            ))),
+            None => Err(HidMaestroError::CreateFailed(
+                "describe-profile reply carries no input_report_size".to_string(),
+            )),
+        }
+    }
+
+    /// Submit one frame without waiting for the reply (PERF P1-1,
+    /// polish round): the synchronous `submit` paid a full IPC
+    /// round-trip (~276 µs p99, up to a 200 ms stall) on EVERY
+    /// 200 Hz engine tick. The async path only enqueues the command
+    /// on the writer queue (~1–5 µs) and drains any replies that
+    /// have already arrived (updating `last_reply` / submit stats
+    /// and surfacing a refused submit on the NEXT call). A dead
+    /// sidecar is still caught within ~1 s by the `ensure_alive`
+    /// heartbeat the backend runs before every submit, and by the
+    /// write-queue-full fail-fast below — the 200 ms bound is an
+    /// async watchdog now, never a tick block. The synchronous
+    /// `submit` stays for the first/neutral submit and tests.
+    ///
+    /// # Errors
+    ///
+    /// Fails fast when the transport is gone or the write queue is
+    /// full (sidecar not reading), or when a previously drained
+    /// reply refused a submit.
+    pub fn submit_async(&mut self, frame: crate::GamepadFrame) -> Result<(), HidMaestroError> {
+        self.drain_async_replies()?;
+        let line = encode_command(&Command::Submit {
+            axes: frame.into(),
+            buttons: frame.buttons,
+        })?;
+        self.write_async_line(&line)
+    }
+
+    /// Async raw-report submit — same contract as
+    /// [`submit_async`](Self::submit_async).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`submit_async`](Self::submit_async).
+    pub fn submit_raw_async(&mut self, report: &[u8]) -> Result<(), HidMaestroError> {
+        self.drain_async_replies()?;
+        let encoded = bytes_to_hex(report);
+        let line = encode_command(&Command::SubmitRaw { bytes: encoded })?;
+        self.write_async_line(&line)
+    }
+
+    /// Enqueue one encoded command line on the writer queue without
+    /// waiting for a reply. A write failure is a sidecar death
+    /// (enriched + counted, like the sync path).
+    fn write_async_line(&mut self, line: &str) -> Result<(), HidMaestroError> {
+        let Some(transport) = self.transport.as_mut() else {
+            return Err(HidMaestroError::NotConnected);
+        };
+        if let Err(e) = transport.writer.write_line(line) {
+            let message = self.describe_eof(
+                &format!("sidecar async write failed ({e})"),
+                self.ms_since_last_reply(),
+                "since last reply",
+            );
+            self.kill_transport();
+            self.note_failure();
+            return Err(HidMaestroError::SidecarDied(message));
+        }
+        Ok(())
+    }
+
+    /// Drain already-arrived submit replies without blocking: each
+    /// updates `last_reply` and the submit stats; a refused reply
+    /// (`ok: false`) is returned as [`HidMaestroError::UpdateFailed`]
+    /// so the backend fails the NEXT tick, not this one; EOF is a
+    /// sidecar death. An empty queue is the common case (one
+    /// `try_recv` each) and costs ~nothing.
+    fn drain_async_replies(&mut self) -> Result<(), HidMaestroError> {
+        loop {
+            let Some(transport) = self.transport.as_mut() else {
+                return Ok(());
+            };
+            match transport.events.try_recv() {
+                Ok(TransportEvent::Line(line)) => {
+                    self.last_reply = Some(Instant::now());
+                    // A garbled async reply is not fatal to the
+                    // tick — the heartbeat re-proves liveness at
+                    // 1 Hz. Drop it.
+                    if let Ok(reply) = parse_reply(&line) {
+                        if !reply.ok {
+                            let msg = reply
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "submit refused".to_string());
+                            return Err(HidMaestroError::UpdateFailed(msg));
+                        }
+                        self.record_submit(&reply);
+                    }
+                }
+                Ok(TransportEvent::Eof) => {
+                    let message = self.describe_post_hello_eof();
+                    self.kill_transport();
+                    self.note_failure();
+                    return Err(HidMaestroError::SidecarDied(message));
+                }
+                Err(_) => return Ok(()),
+            }
+        }
     }
 
     /// Submit one frame (`SubmitState` path). Returns the sidecar's
@@ -1043,12 +1394,16 @@ impl SidecarManager {
     }
 
     /// Best-effort shutdown (H4): fire `dispose` + `exit` into the
-    /// writer queue and kill the transport immediately — NEVER wait
-    /// for an `exit` reply. The sidecar disposes the device on stdin
-    /// EOF / socket close as well, so killing the transport is itself
-    /// the clean-shutdown signal; waiting for the reply used to stall
+    /// writer queue and kill the transport — NEVER wait for an `exit`
+    /// reply. The sidecar disposes the device on stdin EOF / socket
+    /// close as well, so killing the transport is itself the
+    /// clean-shutdown signal; waiting for the reply used to stall
     /// the caller for up to the reply timeout. Never panics, never
-    /// blocks long. Idempotent.
+    /// blocks long. Idempotent. P1-2 (v2.0.12 scan): the kill itself
+    /// now grants the sidecar a ~1 s grace period to exit on its own
+    /// after the EOF signal before terminating it (see
+    /// `kill_transport`) — that is a bounded wait for process exit,
+    /// not a wait for a reply.
     pub fn shutdown(&mut self) {
         if self.transport.is_none() {
             return;
@@ -1063,7 +1418,6 @@ impl SidecarManager {
             }
         }
         self.kill_transport();
-        self.token = None;
         self.last_reply = None;
     }
 
@@ -1071,19 +1425,52 @@ impl SidecarManager {
         if let Some(mut transport) = self.transport.take() {
             transport.writer.kill();
         }
+        // HID path sweep (v2.0.12): the one-time nonce is cleared
+        // on EVERY teardown, not only on `shutdown()` — the
+        // `connect()` failure path (`kill_transport` + `note_failure`)
+        // used to leave a stale nonce from a failed attempt stored
+        // in the manager (the field is never read after hello, so
+        // this was dead state, but a stale single-use secret must
+        // not linger past the attempt that issued it). The same
+        // applies to the spawn PID: a later failure on the stdio
+        // path (which spawns no elevated process) must not name a
+        // dead PID from an earlier elevated attempt. Both are safe
+        // to clear here: every diagnostic read of the PID / exit
+        // code happens BEFORE `kill_transport` is called.
+        self.token = None;
+        #[cfg(windows)]
+        {
+            self.last_spawn_pid = None;
+        }
         // M4: terminate the elevated sidecar process itself (the
         // handle was kept via `SEE_MASK_NOCLOSEPROCESS`) — closing
         // the pipe alone leaves a hung elevated process holding the
         // device.
         #[cfg(windows)]
         if let Some(process) = self.elevated_process.take() {
-            use windows::Win32::Foundation::{CloseHandle, HANDLE};
-            use windows::Win32::System::Threading::TerminateProcess;
+            use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+            use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
             // SAFETY: `process` is the live handle address stored at
             // spawn; it is reconstructed and closed exactly once, here.
             let handle = HANDLE(process as *mut std::ffi::c_void);
             unsafe {
-                let _ = TerminateProcess(handle, 1);
+                // P1-2 (v2.0.12 scan): grace period — the socket
+                // shutdown above is the sidecar's dispose-on-EOF
+                // signal (`finally { DisposeAll(); }`), so give it
+                // up to ~1 s to dispose the created device and exit
+                // on its own before terminating it. The old code
+                // `TerminateProcess`d at once, so the dispose almost
+                // never ran and a created device could be orphaned
+                // (whether the driver auto-removes a device whose
+                // owner died is not established — the next `create`
+                // with the same identity could fail or duplicate).
+                // `WaitForSingleObject` on the stored handle waits
+                // for exactly this process; `WAIT_OBJECT_0` means
+                // it exited on its own and needs no terminate.
+                let exited = WaitForSingleObject(handle, 1000) == WAIT_OBJECT_0;
+                if !exited {
+                    let _ = TerminateProcess(handle, 1);
+                }
                 let _ = CloseHandle(handle);
             }
         }
@@ -1101,6 +1488,43 @@ impl Drop for SidecarManager {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Pure accept-failure formatter (2a/2c, v2.0.12): the source error
+/// plus spawn PID, sidecar exit code, accept→deadline elapsed ms,
+/// and any foreign-peer drops — never the token (it is not an
+/// argument here by design; the caller must not pass it). `exit_code`
+/// `Some(259)` (`STILL_ACTIVE`) means the process was alive but
+/// never connected back; `Some(2)` is the sidecar's own fast-exit
+/// code (bad-args — the sidecar file log names it); `None` means the
+/// code could not be read. Kept free of Windows APIs so the
+/// formatting is unit-testable on Linux; the Windows-only
+/// [`SidecarManager::describe_accept_failure`] gathers the values.
+/// Windows-only in non-test builds (its only production caller is
+/// Windows-only); compiled on every target under `test` for the
+/// unit tests below.
+#[cfg(any(windows, test))]
+fn format_accept_failure(
+    source: &str,
+    pid: Option<u32>,
+    exit_code: Option<u32>,
+    elapsed_ms: u128,
+    foreign_drops: &[String],
+) -> String {
+    let pid = pid.map_or("?".to_string(), |pid| pid.to_string());
+    let exit = match exit_code {
+        Some(259) => "process still running".to_string(),
+        Some(code) => format!("exit code 0x{code:08X}"),
+        None => "exit code unknown".to_string(),
+    };
+    let mut message = format!(
+        "{source} (pid {pid}, {exit}, {elapsed_ms} ms since spawn; exit 2 = sidecar exited fast on its own — see its file log; 259 = still running but never connected back; sidecar log: %PROGRAMDATA%\\RSH\\logs\\rsh-sidecar-YYYYMMDD.log)"
+    );
+    if !foreign_drops.is_empty() {
+        message.push_str("; foreign loopback peers dropped: ");
+        message.push_str(&foreign_drops.join("; "));
+    }
+    message
 }
 
 /// Map a spawn I/O error: Windows elevation-required (OS error 740)
@@ -1131,17 +1555,24 @@ fn outcome_static(outcome: &str) -> &'static str {
 ///
 /// M4 / C-TOK-1: `SEE_MASK_NOCLOSEPROCESS` is set and the returned
 /// process handle is kept by the manager, so a hung sidecar can be
-/// terminated on kill. The loopback token is NOT on the command line
-/// (argv is world-readable) — it travels in the sidecar's environment
-/// ([`SIDECAR_TOKEN_ENV`], set by the caller just for the spawn; see
-/// [`SidecarManager::spawn_windows_elevated`]).
+/// terminated on kill. The one-time loopback token travels on the
+/// command line (`--token <nonce>`, v2.0.12 — see
+/// [`SidecarManager::spawn_windows_elevated`]): AIS builds a fresh
+/// environment for a `runas` child, so the old env transport dropped
+/// the token and the sidecar died with exit 2 before connecting. The
+/// nonce is single-use random and briefly visible in the process
+/// list / WMI — accepted; it is never logged (presence only).
 ///
 /// Windows-only. The `windows` crate code here is **not** compiled in
 /// the Linux sandbox — it is verified by the Windows target check
 /// (`cargo check --target x86_64-pc-windows-msvc`) and the Windows CI
 /// publish job / owner-PC gate (H-HID-5).
 #[cfg(windows)]
-fn spawn_elevated_runas(path: &std::path::Path, port: u16) -> Result<usize, HidMaestroError> {
+fn spawn_elevated_runas(
+    path: &std::path::Path,
+    port: u16,
+    token: &str,
+) -> Result<usize, HidMaestroError> {
     use windows::Win32::Foundation::{ERROR_CANCELLED, HINSTANCE, HWND, WIN32_ERROR};
     use windows::Win32::UI::Shell::{
         SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
@@ -1153,7 +1584,13 @@ fn spawn_elevated_runas(path: &std::path::Path, port: u16) -> Result<usize, HidM
     }
 
     let file = wide(&path.to_string_lossy());
-    let params = wide(&format!("--connect-back 127.0.0.1:{port}"));
+    // The token is 32 lowercase hex chars (see
+    // `transport::generate_token`), so it needs no quoting — it
+    // contains no spaces or shell metacharacters.
+    let params = wide(&format!(
+        "--connect-back 127.0.0.1:{port} {} {token}",
+        crate::SIDECAR_TOKEN_ARG
+    ));
     let verb = wide("runas");
     // SAFETY: all three wide strings are NUL-terminated and live for
     // the whole call; `cbSize` is the struct's own size.
@@ -1181,7 +1618,18 @@ fn spawn_elevated_runas(path: &std::path::Path, port: u16) -> Result<usize, HidM
         // The handle address (not the `HANDLE` itself — it is not
         // `Send`, and the backend must stay `Send`); the manager
         // reconstructs it only to terminate + close it.
-        Ok(()) => Ok(info.hProcess.0 as usize),
+        // (2b, v2.0.12): a success with no process handle is a
+        // spawn failure, not a process to wait on — fail fast with
+        // `SpawnFailed` instead of a silent 30 s accept timeout.
+        Ok(()) => {
+            if info.hProcess.0.is_null() {
+                return Err(HidMaestroError::SpawnFailed(
+                    "ShellExecuteEx (runas) succeeded but returned no process handle (hProcess is NULL) — refusing to wait out the accept timeout"
+                        .to_string(),
+                ));
+            }
+            Ok(info.hProcess.0 as usize)
+        }
         Err(e) => {
             let win32 = WIN32_ERROR::from_error(&e);
             if win32 == Some(ERROR_CANCELLED) {
@@ -1301,6 +1749,79 @@ mod tests {
         assert_eq!(info.dll_sha256_ok, Some(true));
     }
 
+    /// (2a, v2.0.12): the accept-failure diagnostic names the spawn
+    /// PID, the sidecar exit code, and the accept→deadline elapsed
+    /// ms — the three facts the v2.0.11 retest was missing. Exit 2
+    /// is the sidecar's own fast-exit code (bad-args).
+    #[test]
+    fn accept_failure_names_pid_exit_code_and_elapsed() {
+        let message = format_accept_failure(
+            "sidecar did not connect back in time",
+            Some(4848),
+            Some(2),
+            32,
+            &[],
+        );
+        assert!(
+            message.contains("sidecar did not connect back in time"),
+            "{message}"
+        );
+        assert!(message.contains("pid 4848"), "{message}");
+        assert!(message.contains("exit code 0x00000002"), "{message}");
+        assert!(message.contains("32 ms since spawn"), "{message}");
+    }
+
+    /// (2a, v2.0.12): exit 259 (`STILL_ACTIVE`) reads as "process
+    /// still running", not as a crash code — a live-but-stuck sidecar
+    /// is a different failure from a dead one.
+    #[test]
+    fn accept_failure_still_active_reads_as_running() {
+        let message = format_accept_failure(
+            "sidecar did not connect back in time",
+            Some(1234),
+            Some(259),
+            30_000,
+            &[],
+        );
+        assert!(message.contains("pid 1234"), "{message}");
+        assert!(message.contains("process still running"), "{message}");
+        assert!(!message.contains("exit code 0x00000103"), "{message}");
+    }
+
+    /// (2a, v2.0.12): an unreadable exit code reports "unknown",
+    /// never a guessed code; a missing PID reports "?", never 0
+    /// (0 is not a PID — it is the H4 hole).
+    #[test]
+    fn accept_failure_unknown_exit_code_is_not_guessed() {
+        let message =
+            format_accept_failure("sidecar did not connect back in time", None, None, 5, &[]);
+        assert!(message.contains("pid ?"), "{message}");
+        assert!(message.contains("exit code unknown"), "{message}");
+        assert!(!message.contains("pid 0"), "{message}");
+    }
+
+    /// (2c, v2.0.12): foreign-peer drops ride in the diagnostic
+    /// with expected-vs-actual PID — and the token is never part of
+    /// the message (it is not even an argument to the formatter).
+    #[test]
+    fn accept_failure_carries_foreign_peer_drops() {
+        let drops = vec!["loopback peer is PID 9999, not the spawned sidecar PID 4848".to_string()];
+        let message = format_accept_failure(
+            "sidecar did not connect back in time",
+            Some(4848),
+            Some(2),
+            30_000,
+            &drops,
+        );
+        assert!(
+            message.contains("foreign loopback peers dropped"),
+            "{message}"
+        );
+        assert!(message.contains("loopback peer is PID 9999"), "{message}");
+        assert!(message.contains("spawned sidecar PID 4848"), "{message}");
+        assert!(!message.contains("abcdef0123456789"), "{message}");
+    }
+
     /// P1-3 (update4-fix): a sidecar death AFTER hello reports the
     /// same enrichment as a pre-hello death — the phase ("closed the
     /// connection") plus the ms since the last reply — not the bare
@@ -1346,5 +1867,29 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("closed the connection"), "{message}");
         assert!(message.contains("ms since last reply"), "{message}");
+    }
+
+    /// HID path sweep (v2.0.12): `kill_transport` clears the
+    /// stored one-time nonce (and, on Windows, the spawn PID) —
+    /// a failed attempt must not leave a stale nonce / dead PID
+    /// behind for a later failure to report. `shutdown()` funnels
+    /// through here, so the disconnect path is covered too.
+    #[test]
+    fn kill_transport_clears_token_and_spawn_pid() {
+        let mut manager = SidecarManager::new(SidecarConfig::with_path(PathBuf::from(
+            "/nonexistent/rsh-hidmaestro-sidecar",
+        )));
+        manager.token = Some("0123456789abcdef0123456789abcdef".to_string());
+        #[cfg(windows)]
+        {
+            manager.last_spawn_pid = Some(4848);
+        }
+        manager.kill_transport();
+        assert!(manager.token.is_none(), "stale nonce survived teardown");
+        #[cfg(windows)]
+        assert!(
+            manager.last_spawn_pid.is_none(),
+            "stale spawn PID survived teardown"
+        );
     }
 }

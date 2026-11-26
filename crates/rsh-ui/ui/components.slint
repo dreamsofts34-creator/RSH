@@ -86,10 +86,13 @@ export component PageScaffold inherits VerticalLayout {
 // ---------------------------------------------------------------- modal (P1, B19 wiring is P2): centred
 // 420px card over a 40% scrim, overlay shadow. The caller owns
 // the open state (places `if open : Modal { ... }` over the area
-// it covers) and closes on `closed()` — scrim click, or Escape
-// when the modal has focus (the root keyboard scope also
-// forwards Escape to the same callback). The scrim is a child
-// Rectangle so its opacity never dims the card.
+// it covers) and closes on `closed()` — scrim click only. Escape
+// is NOT owned here (UI-10, v2.0.12): the Modal's FocusScope
+// rejects it so it bubbles to the root keyboard scope, whose
+// single Rust handler closes the TOPMOST overlay first — the old
+// direct `closed()` here made one key close the dialog or only
+// clear the status bar depending on invisible focus state. The
+// scrim is a child Rectangle so its opacity never dims the card.
 export component Modal inherits Rectangle {
     in property <string> title;
     callback closed();
@@ -105,10 +108,12 @@ export component Modal inherits Rectangle {
         width: 100%;
         height: 100%;
         key-pressed(event) => {
-            if (event.text == Key.Escape) {
-                closed();
-                return accept;
-            }
+            // UI-10: Escape is rejected on purpose — it bubbles to
+            // the root keyboard scope, the single Esc owner (see
+            // `wire_keyboard`), which closes the topmost overlay.
+            // Accepting it here used to close the dialog while a
+            // status message stayed, or (focus elsewhere) clear the
+            // status while the dialog stayed — one key, two outcomes.
             return reject;
         }
     }
@@ -188,7 +193,9 @@ export component Switch inherits Rectangle {
         background: white;
         animate x { duration: 120ms; easing: ease-out; }
     }
-    ta := TouchArea { mouse-cursor: pointer; clicked => { toggled(); } }
+    // P2-5: the hit target extends 2px past the visual on every
+    // side (20px -> 24px tall) — the visual is unchanged.
+    ta := TouchArea { x: -2px; y: -2px; width: parent.width + 4px; height: parent.height + 4px; mouse-cursor: pointer; clicked => { toggled(); } }
 }
 
 // ---------------------------------------------------------------- pill (§6: Ok / warn / neutral / accent)
@@ -239,7 +246,11 @@ export component Btn inherits Rectangle {
     // P3-2: clip so an over-long label (fixed btn-w caller) can
     // never paint outside the button's rounded edge.
     clip: true;
-    border-width: ghost ? 0px : 1px;
+    // P1-4: the focus border is 2px, not 1px — an outside ring
+    // would be clipped away by `clip` above, so the thicker accent
+    // border IS the focus ring here (same colour + weight as the
+    // Switch/BellButton outside rings).
+    border-width: fs.has-focus ? 2px : ghost ? 0px : 1px;
     // A5: hover + pressed feedback — primary lightens/darkens the
     // accent, secondary/destructive lift the border + fill on
     // hover, ghost only fills on hover. A disabled button never
@@ -331,6 +342,16 @@ export component IconBtn inherits Rectangle {
             return reject;
         }
     }
+    // P1-4: visible 2px focus ring (Switch pattern).
+    if fs.has-focus : Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: Theme.radius-control + 2px;
+        border-width: 2px;
+        border-color: Theme.accent-text;
+    }
     Image {
         x: 8px;
         y: 8px;
@@ -367,6 +388,17 @@ export component NavItem inherits Rectangle {
             }
             return reject;
         }
+    }
+    // P1-4: visible 2px focus ring (Switch pattern) — the acc-bg
+    // background change alone is too subtle to show Tab focus.
+    if fs.has-focus : Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: 10px;
+        border-width: 2px;
+        border-color: Theme.accent-text;
     }
     HorizontalLayout {
         padding-left: 10px;
@@ -422,6 +454,16 @@ export component SubItem inherits Rectangle {
             }
             return reject;
         }
+    }
+    // P1-4: visible 2px focus ring (Switch pattern).
+    if fs.has-focus : Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: 10px;
+        border-width: 2px;
+        border-color: Theme.accent-text;
     }
     Text {
         x: 38px;
@@ -510,8 +552,33 @@ export component SegmentedControl inherits Rectangle {
     min-width: 160px;
     border-radius: 8px;
     border-width: 1px;
-    border-color: Theme.line;
+    // P2-8: the border is the focus border while the control has
+    // focus (roving tabindex below — one Tab stop, not three).
+    border-color: fs.has-focus ? Theme.accent-text : Theme.line;
     background: Theme.panel;
+    // P2-8: roving tabindex — ONE FocusScope on the control, not
+    // one per option, so Tab stops once here instead of three
+    // times; Left/Right/Up/Down move the selection with wraparound
+    // (count = 2 or 3 options), Return/Space re-confirms it.
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.LeftArrow || event.text == Key.UpArrow) {
+                selected-changed(Math.mod(selected - 1 + (option-2 == "" ? 2 : 3), option-2 == "" ? 2 : 3));
+                return accept;
+            }
+            if (event.text == Key.RightArrow || event.text == Key.DownArrow) {
+                selected-changed(Math.mod(selected + 1, option-2 == "" ? 2 : 3));
+                return accept;
+            }
+            if (event.text == Key.Return || event.text == Key.Space) {
+                selected-changed(selected);
+                return accept;
+            }
+            return reject;
+        }
+    }
     HorizontalLayout {
         padding: 2px;
         spacing: 0px;
@@ -522,19 +589,15 @@ export component SegmentedControl inherits Rectangle {
             border-radius: 6px;
             accessible-label: option-0;
             accessible-role: button;
-            background: fs0.has-focus ? Theme.line : (selected == 0 ? Theme.panel2 : (ta0.has-hover ? Theme.hover-bg : transparent));
+            background: selected == 0 ? Theme.panel2 : (ta0.has-hover ? Theme.hover-bg : transparent);
             // D4: 120ms background transition on hover/select.
             animate background { duration: 120ms; easing: ease-out; }
-            fs0 := FocusScope {
-                width: 100%;
-                height: 100%;
-                key-pressed(event) => {
-                    if (event.text == Key.Return || event.text == Key.Space) {
-                        selected-changed(0);
-                        return accept;
-                    }
-                    return reject;
-                }
+            // P2-8: the 2px ring on the selected option while the
+            // control has focus — inset, so it never spills into
+            // the next option.
+            if fs.has-focus && selected == 0 : Rectangle {
+                x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px;
+                border-radius: 5px; border-width: 2px; border-color: Theme.accent-text;
             }
             Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-0; font-size: Theme.fs-hint; font-weight: 600; color: selected == 0 ? Theme.sel-text : (ta0.has-hover ? Theme.text : Theme.mute); overflow: elide; }
             ta0 := TouchArea { mouse-cursor: pointer; clicked => { selected-changed(0); } }
@@ -546,19 +609,12 @@ export component SegmentedControl inherits Rectangle {
             border-radius: 6px;
             accessible-label: option-1;
             accessible-role: button;
-            background: fs1.has-focus ? Theme.line : (selected == 1 ? Theme.panel2 : (ta1.has-hover ? Theme.hover-bg : transparent));
+            background: selected == 1 ? Theme.panel2 : (ta1.has-hover ? Theme.hover-bg : transparent);
             // D4: 120ms background transition on hover/select.
             animate background { duration: 120ms; easing: ease-out; }
-            fs1 := FocusScope {
-                width: 100%;
-                height: 100%;
-                key-pressed(event) => {
-                    if (event.text == Key.Return || event.text == Key.Space) {
-                        selected-changed(1);
-                        return accept;
-                    }
-                    return reject;
-                }
+            if fs.has-focus && selected == 1 : Rectangle {
+                x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px;
+                border-radius: 5px; border-width: 2px; border-color: Theme.accent-text;
             }
             Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-1; font-size: Theme.fs-hint; font-weight: 600; color: selected == 1 ? Theme.sel-text : (ta1.has-hover ? Theme.text : Theme.mute); overflow: elide; }
             ta1 := TouchArea { mouse-cursor: pointer; clicked => { selected-changed(1); } }
@@ -570,19 +626,12 @@ export component SegmentedControl inherits Rectangle {
             border-radius: 6px;
             accessible-label: option-2;
             accessible-role: button;
-            background: fs2.has-focus ? Theme.line : (selected == 2 ? Theme.panel2 : (ta2.has-hover ? Theme.hover-bg : transparent));
+            background: selected == 2 ? Theme.panel2 : (ta2.has-hover ? Theme.hover-bg : transparent);
             // D4: 120ms background transition on hover/select.
             animate background { duration: 120ms; easing: ease-out; }
-            fs2 := FocusScope {
-                width: 100%;
-                height: 100%;
-                key-pressed(event) => {
-                    if (event.text == Key.Return || event.text == Key.Space) {
-                        selected-changed(2);
-                        return accept;
-                    }
-                    return reject;
-                }
+            if fs.has-focus && selected == 2 : Rectangle {
+                x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px;
+                border-radius: 5px; border-width: 2px; border-color: Theme.accent-text;
             }
             Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-2; font-size: Theme.fs-hint; font-weight: 600; color: selected == 2 ? Theme.sel-text : (ta2.has-hover ? Theme.text : Theme.mute); overflow: elide; }
             ta2 := TouchArea { mouse-cursor: pointer; clicked => { selected-changed(2); } }
@@ -617,6 +666,16 @@ export component ProfileButton inherits Rectangle {
             }
             return reject;
         }
+    }
+    // P1-4: visible 2px focus ring (Switch pattern).
+    if fs.has-focus : Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: 10px;
+        border-width: 2px;
+        border-color: Theme.accent-text;
     }
     HorizontalLayout {
         padding-left: 10px;
@@ -714,7 +773,9 @@ export component SliderRow inherits VerticalLayout {
             height: Theme.value-box-h;
             border-radius: Theme.radius-chip;
             border-width: 1px;
-            border-color: edit-invalid ? Theme.bad : Theme.line;
+            // P1-3: the focus border is the accent text colour —
+            // invalid (empty) still wins over focus for the red.
+            border-color: edit-invalid ? Theme.bad : num.has-focus ? Theme.accent-text : Theme.line;
             background: Theme.bg;
             // Raw TextInput (not the std LineEdit widget): the Fluent
             // widget hardcodes its own palette and a 160px min-width.
@@ -729,6 +790,16 @@ export component SliderRow inherits VerticalLayout {
                 font-size: Theme.fs-value;
                 font-weight: 500;
                 color: Theme.text;
+                // P1-5: Up/Down stay in the field, and Return is
+                // accepted here too — otherwise it bubbles to the
+                // root keyboard scope and triggers Save while the
+                // user is typing a value.
+                key-pressed(event) => {
+                    if (event.text == Key.UpArrow || event.text == Key.DownArrow || event.text == Key.Return) {
+                        return accept;
+                    }
+                    return reject;
+                }
                 edited => { edit-invalid = num.text == ""; value-edited(num.text); }
                 changed has-focus => {
                     if (!self.has-focus) {
@@ -794,9 +865,16 @@ export component SliderRow inherits VerticalLayout {
             border-radius: 7px;
             border-width: fs.has-focus || ta.has-hover ? 2px : 1px;
             border-color: ta.has-hover ? Theme.accent-text : Theme.accent;
-            background: white;
+            // P3-3: Light theme — a white thumb on the pale track
+            // was invisible; panel2 reads as a thumb there. Dark
+            // stays white (visible against the dark track).
+            background: Theme.is-light ? Theme.panel2 : white;
         }
+        // P2-7: the hit target is 24px tall (±2px past the 20px
+        // visual track) — the visual is unchanged.
         ta := TouchArea {
+            y: -2px;
+            height: parent.height + 4px;
             mouse-cursor: disabled ? MouseCursor.default : MouseCursor.pointer;
             clicked => { if (!disabled) { changed(Math.max(0, Math.min(1, self.mouse-x / track.width))); } }
             moved => { if (self.pressed && !disabled) { changed(Math.max(0, Math.min(1, self.mouse-x / track.width))); } }
@@ -835,6 +913,16 @@ export component PresetChip inherits Rectangle {
             }
             return reject;
         }
+    }
+    // P1-4: visible 2px focus ring (Switch pattern).
+    if fs.has-focus : Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: Theme.radius-chip + 2px;
+        border-width: 2px;
+        border-color: Theme.accent-text;
     }
     Text {
         width: 100%;
@@ -1129,6 +1217,10 @@ export component GameTile inherits Rectangle {
     // Overview diagnostics link, so the tile stays one row tall.
     callback edit-clicked();
     callback remove-clicked();
+    // P3-7: tap-to-expand for the game name — a long name is
+    // capped at two lines by default; tapping it shows the full
+    // name (the tile grows; the grid row follows).
+    property <bool> name-expanded: false;
     // Phase 2 (F-8): clip so the Launch button can never paint
     // outside the tile when the name squeezes the row.
     clip: true;
@@ -1165,24 +1257,39 @@ export component GameTile inherits Rectangle {
         VerticalLayout {
             horizontal-stretch: 1;
             spacing: 1px;
+            // UI-9 (v2.0.12): the name and sub elide at two lines
+            // max — a long game name used to wrap without limit and
+            // stretch its whole grid row. The caps are two lines at
+            // the token sizes (fs-label 13 px / fs-hint 12 px, ~17 px
+            // and ~16 px a line); `overflow: elide` puts the "…"
+            // on the last visible line. The tile clips, so nothing
+            // can paint outside it.
             Text {
                 text: name;
                 font-size: Theme.fs-label;
                 font-weight: 600;
                 color: Theme.text;
                 wrap: word-wrap;
+                overflow: elide;
+                // P3-7: capped at two lines until tapped (above).
+                max-height: name-expanded ? 1000px : 34px;
+                TouchArea { width: 100%; height: 100%; mouse-cursor: pointer; clicked => { name-expanded = !name-expanded; } }
             }
             Text {
                 text: sub;
                 font-size: Theme.fs-hint;
                 color: sub-warn ? Theme.warn : Theme.mute;
                 wrap: word-wrap;
+                overflow: elide;
+                max-height: 32px;
             }
         }
         // Edit / Remove links (manual games): text links with the
         // same keyboard activation as the diagnostics link.
+        // P2-5: 8px spacing (was 4px) so the ±4px TouchArea
+        // extensions below meet without overlapping.
         VerticalLayout {
-            spacing: 4px;
+            spacing: 8px;
             Text {
                 text: "Edit";
                 font-size: Theme.fs-hint;
@@ -1190,9 +1297,12 @@ export component GameTile inherits Rectangle {
                 color: edit-fs.has-focus || edit-ta.has-hover ? Theme.text : Theme.accent-text;
                 accessible-label: "Edit " + name;
                 accessible-role: button;
+                // P2-5: the FocusScope + TouchArea extend 4px
+                // above/below the text (see "Open diagnostics").
                 edit-fs := FocusScope {
+                    y: -4px;
                     width: 100%;
-                    height: 100%;
+                    height: parent.height + 8px;
                     key-pressed(event) => {
                         if (event.text == Key.Return || event.text == Key.Space) {
                             edit-clicked();
@@ -1201,7 +1311,17 @@ export component GameTile inherits Rectangle {
                         return reject;
                     }
                 }
-                edit-ta := TouchArea { mouse-cursor: pointer; clicked => { edit-clicked(); } }
+                // P1-4: visible focus ring (About link pattern).
+                if edit-fs.has-focus : Rectangle {
+                    x: -6px;
+                    y: -3px;
+                    width: parent.width + 12px;
+                    height: parent.height + 6px;
+                    border-radius: 6px;
+                    border-width: 2px;
+                    border-color: Theme.accent-text;
+                }
+                edit-ta := TouchArea { y: -4px; width: 100%; height: parent.height + 8px; mouse-cursor: pointer; clicked => { edit-clicked(); } }
             }
             Text {
                 text: "Remove";
@@ -1211,8 +1331,9 @@ export component GameTile inherits Rectangle {
                 accessible-label: "Remove " + name;
                 accessible-role: button;
                 remove-fs := FocusScope {
+                    y: -4px;
                     width: 100%;
-                    height: 100%;
+                    height: parent.height + 8px;
                     key-pressed(event) => {
                         if (event.text == Key.Return || event.text == Key.Space) {
                             remove-clicked();
@@ -1221,7 +1342,17 @@ export component GameTile inherits Rectangle {
                         return reject;
                     }
                 }
-                remove-ta := TouchArea { mouse-cursor: pointer; clicked => { remove-clicked(); } }
+                // P1-4: visible focus ring (About link pattern).
+                if remove-fs.has-focus : Rectangle {
+                    x: -6px;
+                    y: -3px;
+                    width: parent.width + 12px;
+                    height: parent.height + 6px;
+                    border-radius: 6px;
+                    border-width: 2px;
+                    border-color: Theme.accent-text;
+                }
+                remove-ta := TouchArea { y: -4px; width: 100%; height: parent.height + 8px; mouse-cursor: pointer; clicked => { remove-clicked(); } }
             }
         }
         // No action for "Not installed" games (A14): an empty action
@@ -1237,7 +1368,8 @@ export component CheckRow inherits Rectangle {
     in property <bool> warn;
     height: 26px;
     HorizontalLayout {
-        spacing: 9px;
+        // P3-1: 8px spacing (was 9px) — the token grid is 4/8/12/16.
+        spacing: 8px;
         // UI-UX polish (a): preview `.chk` is align-items:center —
         // the 18px tick centres against the label in the 26px row.
         cross-axis-alignment: center;
@@ -1312,6 +1444,16 @@ export component RadioOptionCard inherits Rectangle {
             return reject;
         }
     }
+    // P1-4: visible 2px focus ring (Switch pattern).
+    if fs.has-focus : Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: 12px;
+        border-width: 2px;
+        border-color: Theme.accent-text;
+    }
     HorizontalLayout {
         padding: 12px;
         spacing: 10px;
@@ -1352,6 +1494,9 @@ export component EmptyBanner inherits Rectangle {
     // DS-54: the action button disables + dims while its job runs
     // (Overview binds this to the banner's job kind: Reconnect 0).
     in property <bool> action-disabled: false;
+    // P2-12: why the action is disabled ("Reconnecting…") — shown
+    // next to the button instead of a silently dead one.
+    in property <string> action-disabled-text: "";
     // D2: optional 16px icon on the action button (Reconnect).
     in property <image> action-icon;
     in property <bool> action-has-icon: false;
@@ -1383,6 +1528,7 @@ export component EmptyBanner inherits Rectangle {
             font-size: Theme.fs-hint;
             color: is-error ? Theme.bad : Theme.mute;
         }
+        if action-label != "" && action-disabled && action-disabled-text != "" : Text { vertical-alignment: center; text: action-disabled-text; font-size: Theme.fs-hint; color: Theme.mute; }
         if action-label != "" : Btn { label: action-label; icon: action-icon; has-icon: action-has-icon; disabled: action-disabled; clicked => { action-clicked(); } }
     }
 }

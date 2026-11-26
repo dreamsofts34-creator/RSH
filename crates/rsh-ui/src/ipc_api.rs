@@ -312,6 +312,25 @@ impl Drop for LongCallGuard<'_> {
 /// refresh on the daemon, which can exceed the default 500 ms.
 const GAME_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound for launch / stop game (UI-3, v2.0.12): spawning or
+/// killing a game process routinely exceeds the 500 ms default —
+/// the old bound timed out healthy launches and reported a bogus
+/// "Connection dropped" while the daemon kept launching. Same
+/// 10 s budget as the game writes.
+const GAME_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// HID P3-5 (v2.0.13): the backend-timeout re-query polls the
+/// LIVE backend this many times, this far apart, instead of
+/// sampling once — one sample cannot tell "still switching" from
+/// "failed", and a switch that lands just after the single sample
+/// left a stale verdict until the ~1 Hz poll re-synced it. Five
+/// samples at 1 s (each call bounded at 500 ms) is ~5 s worst
+/// case on the background job thread — far inside the re-query
+/// job's own 420 s timeout, and short enough that the verdict
+/// still lands promptly.
+const BACKEND_REQUERY_SAMPLES: u32 = 5;
+const BACKEND_REQUERY_INTERVAL: Duration = Duration::from_secs(1);
+
 const JOB_LANE_A_METHODS: &[&str] = &[
     "set_tuning",
     "save_draft",
@@ -821,6 +840,70 @@ impl IpcApi {
         self.rt.block_on(refresh_slow(&self.client, &self.cache));
     }
 
+    /// One-shot LIVE backend query (HID-3, v2.0.12): ask the daemon
+    /// for the CURRENT output backend over IPC instead of reading
+    /// the UI-side cache. The cache is only as fresh as the slow
+    /// poller's last cycle — while a `set_output_backend` call is
+    /// still running in the daemon, the poller's `slow_poll` calls
+    /// fail against the daemon's single-flight lock and the cache
+    /// keeps the PRE-switch backend, so a backend-job timeout that
+    /// trusted the cache declared a live switch dead and armed a
+    /// cooldown for nothing. A fresh answer also refreshes the
+    /// cache slot; no answer (`None`) leaves it untouched. Only
+    /// ever called from a job thread — it blocks on the runtime
+    /// like `refresh_slow_blocking`, never on the UI thread.
+    pub fn query_output_backend(&self) -> Option<String> {
+        let got: Result<String, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async("output_backend", serde_json::json!({}))
+                .await?;
+            value
+                .get("output_backend")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    IpcError::Protocol("output_backend has no output_backend".to_string())
+                })
+        });
+        match got {
+            Ok(backend) => {
+                if let Ok(mut slot) = self.cache.backend.lock() {
+                    *slot = Some(backend.clone());
+                }
+                Some(backend)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Polled LIVE backend query (HID P3-5, v2.0.13): sample
+    /// [`Self::query_output_backend`] up to
+    /// `BACKEND_REQUERY_SAMPLES` times, `BACKEND_REQUERY_INTERVAL`
+    /// apart, and stop early the moment the daemon reports the
+    /// `requested` backend — a switch that completes mid-poll is
+    /// reported as the success it is, not as the stale "still
+    /// running" the single sample returned. A sample that still
+    /// shows the old backend, or no answer at all (transient —
+    /// the daemon's single-flight lock can refuse a poll while
+    /// the switch runs), is retried, not verdicted: only the
+    /// LAST sample decides, so the caller can tell "still
+    /// switching after N polls" from "failed". Only ever called
+    /// from a job thread — it blocks on the runtime like the
+    /// one-shot query, never on the UI thread.
+    pub fn query_output_backend_polled(&self, requested: &str) -> Option<String> {
+        let mut last: Option<String> = None;
+        for attempt in 0..BACKEND_REQUERY_SAMPLES {
+            if attempt > 0 {
+                std::thread::sleep(BACKEND_REQUERY_INTERVAL);
+            }
+            last = self.query_output_backend();
+            if last.as_deref() == Some(requested) {
+                break;
+            }
+        }
+        last
+    }
+
     /// Mark the cached draft dirty for `module` (F6): the daemon
     /// marks the draft dirty on `set_tuning` /
     /// `set_module_enabled`, so a successful write dirties the
@@ -868,20 +951,37 @@ impl IpcApi {
 
     /// Build the [`UserError`] for a failed session `connect`
     /// (F26): the daemon's `IpcError::Api` payload carries its
-    /// `UserError` code first (`"{code}: {message}"` — see
-    /// `IpcClient::call_once`), so a no-board `Unreachable` comes
-    /// back typed instead of collapsing into `TransportClosed`
-    /// (which used to notify "Reconnect failed" on every no-board
-    /// (re)connect). The code is the text before the first `:` —
-    /// the real server sends `"{code}: daemon API error: {code}"`
-    /// and the fake daemon an empty message (`"{code}: "`), and
-    /// both must parse. An unrecognised payload is still the
-    /// generic link failure — only the daemon's own typed reason
-    /// is preserved, nothing is invented.
+    /// `UserError` code first. Since CORE-2 the dispatch payload is
+    /// the detailed `"{code}|{detail}"` shape (`detailed_api_error`),
+    /// and the client re-wraps it as `"{code}: daemon API error:
+    /// {payload}"` — so the real payload reaching the UI is
+    /// `"Unreachable|<detail>: daemon API error:
+    /// Unreachable|<detail>"`. Parse it like the other detailed
+    /// parsers (`game_call_error`, `capture_code_detail`): strip
+    /// the client double-wrap (the LAST half is the complete one),
+    /// then split on `|` first — NEVER on `:` (the old
+    /// `split(':')` yielded `"Unreachable|no board …"` as the
+    /// "code", `from_code` returned `None`, and every no-board
+    /// connect collapsed into `TransportClosed` / "daemon IPC link
+    /// failed" instead of "Wheel not found"). The old
+    /// `"{code}: {reason}"` shape is the fallback split. An
+    /// unrecognised code is still the generic link failure — only
+    /// the daemon's own typed reason is preserved, nothing is
+    /// invented.
     fn daemon_connect_error(payload: &str) -> UserError {
-        let code = payload.split(':').next().unwrap_or(payload).trim();
+        let tail = payload
+            .rsplit_once(": daemon API error: ")
+            .map_or(payload, |(_, tail)| tail);
+        let (code, detail) = tail
+            .split_once('|')
+            .or_else(|| tail.split_once(": "))
+            .map_or((tail.trim(), ""), |(code, detail)| {
+                (code.trim(), detail.trim())
+            });
         match ConnectionError::from_code(code) {
-            Some(error) => UserError::from_connection(error, payload.to_string()),
+            Some(error) => {
+                UserError::from_connection(error, if detail.is_empty() { code } else { detail })
+            }
             None => Self::ipc_failed(),
         }
     }
@@ -987,7 +1087,23 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
     // failure — old daemon without the method, an unparseable reply
     // — fall through to the sequential per-slot pass below, which
     // keeps exactly its old behaviour (including `link_dead` checks).
-    let slow_state = match client.call("slow_poll", serde_json::json!({})).await {
+    // R2-21: the combined call is best-effort at the 500 ms
+    // default — `timeout_for_method("slow_poll")` is 5 s (P2-3: a
+    // cache-miss re-read), but a silent daemon must not cost this
+    // cycle 5 s before the budgeted fallback even starts (that
+    // broke the ~2.5 s budget: 5 s + 3 x 500 ms = 6.5 s). A slow
+    // daemon falls through to the per-slot pass below, which
+    // fetches the same data inside the 2 s / 3-failure budget;
+    // the next ~1 s cycle retries the combined call against the
+    // warm cache.
+    let slow_state = match client
+        .call_with_timeout(
+            "slow_poll",
+            serde_json::json!({}),
+            Duration::from_millis(500),
+        )
+        .await
+    {
         Ok(value) => serde_json::from_value::<SlowPollState>(value).ok(),
         Err(_) => None,
     };
@@ -1520,12 +1636,25 @@ impl AppApi for IpcApi {
     }
 
     fn set_output_enabled(&self, enabled: bool) {
-        let _ = self.rt.block_on(self.call_async(
-            "set_output_enabled",
-            serde_json::json!({"enabled": enabled}),
-        ));
-        if let Ok(mut slot) = self.cache.output.lock() {
-            *slot = Some(enabled);
+        // CORE-P1-2 (frontend half): cache only the APPLIED value.
+        // The call can time out at 500 ms while the daemon keeps
+        // switching for up to minutes (the daemon-side bound is the
+        // backend team's arm) — caching the REQUESTED value on
+        // error showed ON until the next poll corrected it to OFF,
+        // then ON again when the switch landed: the toggle flickered
+        // and lied for the whole switch. On error the cache is left
+        // to the next fast poll (~50 ms), which reports the real flag.
+        let applied = self
+            .rt
+            .block_on(self.call_async(
+                "set_output_enabled",
+                serde_json::json!({"enabled": enabled}),
+            ))
+            .is_ok();
+        if applied {
+            if let Ok(mut slot) = self.cache.output.lock() {
+                *slot = Some(enabled);
+            }
         }
     }
 
@@ -1894,7 +2023,30 @@ impl AppApi for IpcApi {
         exe_path: &str,
         profile_id: Option<String>,
     ) -> Result<GameSummary, UserError> {
-        self.game_write_call("add_game", None, name, exe_path, profile_id)
+        self.game_write_call("add_game", None, name, exe_path, profile_id, None)
+    }
+
+    /// [`add_game`](Self::add_game) with the dialog-session
+    /// idempotency key (P1-3, v2.0.12): the daemon dedupes a retry
+    /// carrying the same key, so a save retried after a client-side
+    /// timeout returns the already-created entry instead of a
+    /// duplicate game. The UI mints one key per add-dialog session
+    /// (see `Ctx::open_game_dialog`).
+    fn add_game_with_key(
+        &self,
+        name: &str,
+        exe_path: &str,
+        profile_id: Option<String>,
+        idempotency_key: Option<&str>,
+    ) -> Result<GameSummary, UserError> {
+        self.game_write_call(
+            "add_game",
+            None,
+            name,
+            exe_path,
+            profile_id,
+            idempotency_key,
+        )
     }
 
     /// Update a manually added game's name / exe path / bound
@@ -1906,7 +2058,7 @@ impl AppApi for IpcApi {
         exe_path: &str,
         profile_id: Option<String>,
     ) -> Result<GameSummary, UserError> {
-        self.game_write_call("update_game", Some(id), name, exe_path, profile_id)
+        self.game_write_call("update_game", Some(id), name, exe_path, profile_id, None)
     }
 
     /// Remove a manually added game; returns `true` when removed.
@@ -2484,6 +2636,75 @@ impl AppApi for IpcApi {
 }
 
 impl IpcApi {
+    /// Cheap connection fingerprint for `push_frame`'s rest
+    /// pre-check (PERF P1-4): a 64-bit FNV-1a hash over everything
+    /// a frame reads from the connection — state variant + error
+    /// code + `retry_in_ms` / backoff wait + label + transport +
+    /// address + session flag + board-reachable latch + error +
+    /// hint + whether a connect started — computed under the cache
+    /// lock WITHOUT cloning the `String`s (`connection()` clones
+    /// three of them on every 50 ms tick). `0` = no cached
+    /// connection yet. A changed fingerprint means the connection
+    /// moved; an unchanged one means the frame's connection inputs
+    /// are identical — the pre-check may skip the frame. The hash
+    /// is a change detector, not an identity: a 64-bit collision
+    /// is the only miss, and a missed frame is re-caught by the
+    /// next moving input (the snapshot seq moves on every live
+    /// tick) or the 1 Hz safety re-sync.
+    pub fn connection_fingerprint(&self) -> u64 {
+        let Ok(slot) = self.cache.connection.lock() else {
+            return 0;
+        };
+        let Some(conn) = slot.as_ref() else {
+            return 0;
+        };
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |bytes: &[u8]| {
+            for byte in bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        match &conn.state {
+            ConnectionState::Idle => mix(b"Idle"),
+            ConnectionState::LinkUp => mix(b"LinkUp"),
+            ConnectionState::Hello => mix(b"Hello"),
+            ConnectionState::Active => mix(b"Active"),
+            ConnectionState::Error {
+                reason,
+                hint,
+                retry_in_ms,
+            } => {
+                mix(b"Error");
+                mix(reason.code().as_bytes());
+                mix(hint.as_bytes());
+                mix(&retry_in_ms.unwrap_or(u64::MAX).to_le_bytes());
+            }
+            ConnectionState::Backoff { wait_ms, attempt } => {
+                mix(b"Backoff");
+                mix(&wait_ms.to_le_bytes());
+                mix(&attempt.to_le_bytes());
+            }
+        }
+        mix(conn.label.as_bytes());
+        mix(conn.transport.as_str().as_bytes());
+        mix(conn.address.as_bytes());
+        mix(&[
+            u8::from(conn.session_active),
+            u8::from(conn.board_reachable),
+        ]);
+        match &conn.error {
+            Some(error) => mix(error.code().as_bytes()),
+            None => mix(b"no-error"),
+        }
+        match &conn.hint {
+            Some(hint) => mix(hint.as_bytes()),
+            None => mix(b"no-hint"),
+        }
+        mix(&[u8::from(conn.connect_started.is_some())]);
+        hash
+    }
+
     /// One capture round-trip: `{"mv": n}` out, or the daemon's
     /// reason as the [`UserError`] title (see
     /// [`capture_code_detail`]).
@@ -2528,12 +2749,28 @@ impl IpcApi {
     /// keeps its code + reason; anything else (link down, timeout,
     /// protocol) is the generic link failure. The UI's
     /// `notify_error` maps known codes to a plain title + next step.
+    ///
+    /// CORE-P1-4: the client re-wraps the payload as `"{code}:
+    /// daemon API error: {code}|{detail}"`, so the raw payload
+    /// repeats the detail inside IPC framing — splitting it on
+    /// `|` directly used to show `"<detail>: daemon API error:
+    /// Unknown|<detail>"` to the user. Strip the double-wrap
+    /// first (the LAST half is the complete payload, same tail
+    /// split as `game_call_error`), then split on `|`; the
+    /// fallback path uses the stripped tail too, never the wrapped
+    /// payload. A detail containing `": "` survives whole — the
+    /// split is on `|`, never on `": "`.
     fn api_error(error: &IpcError) -> UserError {
         if let IpcError::Api(payload) = error {
-            if let Some((code, detail)) = payload.split_once('|') {
+            let tail = payload
+                .rsplit(": daemon API error: ")
+                .next()
+                .unwrap_or(payload.as_str());
+            if let Some((code, detail)) = tail.split_once('|') {
+                let detail = detail.trim();
                 if !detail.is_empty() {
                     return UserError {
-                        code: code.to_string(),
+                        code: code.trim().to_string(),
                         title: detail.to_string(),
                         what_happened: detail.to_string(),
                         what_to_do: "Try again.".to_string(),
@@ -2541,7 +2778,15 @@ impl IpcApi {
                     };
                 }
             }
-            return UserError::from_connection(ConnectionError::Unknown, payload.clone());
+            // No `|` — a bare code or the old `"{code}: {reason}"`
+            // shape: the stripped tail is the message, never the
+            // wrapped payload. An empty tail carries nothing the
+            // user can act on — the generic link failure.
+            let tail = tail.trim();
+            if tail.is_empty() {
+                return Self::ipc_failed();
+            }
+            return UserError::from_connection(ConnectionError::Unknown, tail.to_string());
         }
         Self::ipc_failed()
     }
@@ -2633,6 +2878,7 @@ impl IpcApi {
         name: &str,
         exe_path: &str,
         profile_id: Option<String>,
+        idempotency_key: Option<&str>,
     ) -> Result<GameSummary, UserError> {
         let profile_id = profile_id.filter(|s| !s.is_empty());
         let got: Result<GameSummary, IpcError> = self.rt.block_on(async {
@@ -2644,6 +2890,7 @@ impl IpcApi {
                         "name": name,
                         "exe_path": exe_path,
                         "profile_id": profile_id,
+                        "idempotency_key": idempotency_key,
                     }),
                     GAME_WRITE_TIMEOUT,
                 )
@@ -2676,11 +2923,17 @@ impl IpcApi {
     /// stays the generic link failure.
     fn game_write_error(error: &IpcError) -> UserError {
         if let IpcError::Api(payload) = error {
-            let head = payload
-                .split(": daemon API error: ")
+            // CORE-P1-3/P1-4 (polish round): the client rebuilds
+            // the error as `"{bare_code}: daemon API error:
+            // {code}|{reason}"` — the head before the separator
+            // is the bare code, only the TAIL carries the reason.
+            // A head-strip here used to lose it and collapse into
+            // the generic link failure.
+            let tail = payload
+                .rsplit(": daemon API error: ")
                 .next()
                 .unwrap_or(payload);
-            if let Some((code, reason)) = head.split_once('|') {
+            if let Some((code, reason)) = tail.split_once('|') {
                 if !reason.is_empty() {
                     return UserError {
                         code: code.to_string(),
@@ -2692,15 +2945,78 @@ impl IpcApi {
                 }
             }
         }
-        // Timeout / closed link / protocol: say what actually
-        // happened instead of the misleading "Connection dropped".
-        UserError {
-            code: "Unknown".to_string(),
-            title: "Couldn't save the game".to_string(),
-            what_happened: format!("RSH didn't complete the request ({error})."),
-            what_to_do: "Try again.".to_string(),
-            detail: Some(error.to_string()),
+        // Timeout / closed link / protocol: the raw IPC wording
+        // must never reach the user (UI-7, v2.0.12) — the old
+        // fallback embedded the `IpcError` Display ("IPC unknown
+        // method: …", "IPC protocol version … is not supported")
+        // in the dialog's inline error and the status bar. The
+        // generic link failure says the link failed, without IPC
+        // internals; the daemon's own typed reason still arrives
+        // through the `Api` arm above.
+        Self::ipc_failed()
+    }
+
+    /// The [`UserError`] for a failed launch / stop game call
+    /// (UI-3, v2.0.12): the daemon's reason survives instead of
+    /// collapsing into the generic "Connection dropped". The
+    /// `Api` payload carries it code-first — detailed
+    /// (`"{code}|{reason}"`, post-CORE-2 dispatch) or `"{code}:
+    /// {reason}"` — and a bare code (pre-CORE-2 dispatch) still
+    /// names the refusal instead of blaming the link. A timeout
+    /// is its own plain reason (the daemon did not answer in
+    /// 10 s); any other link failure stays the generic link
+    /// failure.
+    fn game_call_error(method: &str, error: &IpcError) -> UserError {
+        let verb = if method == "stop_game" {
+            "stop"
+        } else {
+            "launch"
+        };
+        if let IpcError::Api(payload) = error {
+            // The client formats the payload as `"{code}:
+            // {message}"` with both halves carrying the dispatch
+            // payload — the LAST half is the complete one.
+            let tail = payload
+                .rsplit(": daemon API error: ")
+                .next()
+                .unwrap_or(payload.as_str());
+            let (code, reason) = tail
+                .split_once('|')
+                .or_else(|| tail.split_once(": "))
+                .unwrap_or((tail, ""));
+            let reason = reason.trim();
+            if !reason.is_empty() {
+                return UserError {
+                    code: code.trim().to_string(),
+                    title: format!("Couldn't {verb} game"),
+                    what_happened: format!("{reason}."),
+                    what_to_do: "Try again.".to_string(),
+                    detail: Some(reason.to_string()),
+                };
+            }
+            return UserError {
+                code: code.trim().to_string(),
+                title: format!("Couldn't {verb} game"),
+                what_happened: format!("RSH couldn't {verb} the game."),
+                what_to_do: "Try again.".to_string(),
+                detail: None,
+            };
         }
+        // A timeout is its own plain reason (the client-side
+        // `call_with_timeout` reports it as `Io("IPC call '…' timed
+        // out after … ms")`) — not a dropped link.
+        if let IpcError::Io(message) = error {
+            if message.contains("timed out after") {
+                return UserError {
+                    code: "Timeout".to_string(),
+                    title: format!("Couldn't {verb} game"),
+                    what_happened: "RSH didn't answer in time.".to_string(),
+                    what_to_do: "Try again.".to_string(),
+                    detail: None,
+                };
+            }
+        }
+        Self::ipc_failed()
     }
 
     /// Shared `{"id": …}` game call: one game id in, its
@@ -2708,7 +3024,7 @@ impl IpcApi {
     fn game_call(&self, method: &str, id: &str) -> Result<GameSummary, UserError> {
         let got: Result<GameSummary, IpcError> = self.rt.block_on(async {
             let value = self
-                .call_async(method, serde_json::json!({"id": id}))
+                .call_async_slow(method, serde_json::json!({"id": id}), GAME_LAUNCH_TIMEOUT)
                 .await?;
             serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
         });
@@ -2726,7 +3042,7 @@ impl IpcApi {
                 self.request_slow_refresh();
                 Ok(summary)
             }
-            Err(_) => Err(Self::ipc_failed()),
+            Err(e) => Err(Self::game_call_error(method, &e)),
         }
     }
 
@@ -2756,11 +3072,17 @@ impl IpcApi {
 fn capture_code_detail(error: &IpcError) -> (String, String) {
     const FALLBACK: &str = "RSH isn't running — reconnect to capture.";
     if let IpcError::Api(payload) = error {
-        let head = payload
-            .split(": daemon API error: ")
+        // CORE-P1-3/P1-4 (polish round): same tail-strip as
+        // `api_error` — the client rebuilds the error as
+        // `"{bare_code}: daemon API error: {code}|{detail}"`, so
+        // the head before the separator is the bare code and only
+        // the TAIL carries the detail. A head-strip here lost the
+        // reason and fell back to the reconnect text.
+        let tail = payload
+            .rsplit(": daemon API error: ")
             .next()
             .unwrap_or(payload);
-        if let Some((code, detail)) = head.split_once('|') {
+        if let Some((code, detail)) = tail.split_once('|') {
             if !detail.is_empty() {
                 return (code.to_string(), detail.to_string());
             }
@@ -2958,6 +3280,25 @@ mod tests {
         assert_eq!(client.output_backend(), "vJoy");
         assert!(client.set_output_backend("bogus").is_err());
         assert_eq!(client.output_backend(), "vJoy");
+        // HID-3 (v2.0.12): the one-shot live query reads the
+        // daemon's CURRENT backend (not the cache) and refreshes
+        // the cache slot with it.
+        assert_eq!(
+            client.query_output_backend().as_deref(),
+            Some("vJoy"),
+            "live query must read the daemon's backend"
+        );
+        assert_eq!(client.output_backend(), "vJoy");
+        assert_eq!(
+            client.set_output_backend("HIDMaestro").expect("HIDMaestro"),
+            "HIDMaestro"
+        );
+        assert_eq!(
+            client.query_output_backend().as_deref(),
+            Some("HIDMaestro"),
+            "live query must follow a switch at once"
+        );
+        assert_eq!(client.output_backend(), "HIDMaestro");
         // Sim never pretends a backup happened.
         assert!(client.backup_now().is_err());
         // v2.0.1 BACKEND-2 over the same socket: the sim never fakes
@@ -2995,6 +3336,182 @@ mod tests {
         assert!(client.cancel_learn().is_err());
         assert!(!client.is_learning());
         assert_eq!(client.take_learned_button(), None);
+        drop(client);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Recording `AppApi` for the P1-3 key test: delegates to a
+    /// `SimApi` and records the idempotency key each dispatched add
+    /// carried. Unix-only: the test that uses it binds a real Unix
+    /// socket.
+    #[cfg(unix)]
+    struct KeyRecordingApi {
+        inner: SimApi,
+        keys: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    #[cfg(unix)]
+    impl KeyRecordingApi {
+        fn summary(name: &str) -> GameSummary {
+            GameSummary {
+                id: "race".to_string(),
+                name: name.to_string(),
+                exe_path: r"C:\race.exe".to_string(),
+                running: false,
+                installed: true,
+                bound_profile_id: None,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl AppApi for KeyRecordingApi {
+        fn version(&self) -> String {
+            self.inner.version()
+        }
+
+        fn connection(&self) -> ConnectionInfo {
+            self.inner.connection()
+        }
+
+        fn connect(&self, transport: ApiTransport) -> Result<ConnectionInfo, UserError> {
+            self.inner.connect(transport)
+        }
+
+        fn disconnect(&self) -> Result<ConnectionInfo, UserError> {
+            self.inner.disconnect()
+        }
+
+        fn wifi_status(&self) -> WifiStatus {
+            self.inner.wifi_status()
+        }
+
+        fn snapshot(&self) -> SnapshotInfo {
+            self.inner.snapshot()
+        }
+
+        fn output_enabled(&self) -> bool {
+            self.inner.output_enabled()
+        }
+
+        fn set_output_enabled(&self, enabled: bool) {
+            self.inner.set_output_enabled(enabled);
+        }
+
+        fn get_tuning(&self, module: &str) -> TuningSettings {
+            self.inner.get_tuning(module)
+        }
+
+        fn set_tuning(&self, tuning: &TuningSettings) -> Result<TuningSettings, UserError> {
+            self.inner.set_tuning(tuning)
+        }
+
+        fn draft_status(&self) -> Option<DraftStatus> {
+            self.inner.draft_status()
+        }
+
+        fn save_draft(&self) -> Result<bool, UserError> {
+            self.inner.save_draft()
+        }
+
+        fn discard_draft(&self) -> bool {
+            self.inner.discard_draft()
+        }
+
+        fn list_profiles(&self) -> Vec<ProfileSummary> {
+            self.inner.list_profiles()
+        }
+
+        fn set_output_backend(&self, name: &str) -> Result<String, UserError> {
+            self.inner.set_output_backend(name)
+        }
+
+        fn add_game(
+            &self,
+            name: &str,
+            _exe_path: &str,
+            _profile_id: Option<String>,
+        ) -> Result<GameSummary, UserError> {
+            self.keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(None);
+            Ok(Self::summary(name))
+        }
+
+        fn add_game_with_key(
+            &self,
+            name: &str,
+            _exe_path: &str,
+            _profile_id: Option<String>,
+            idempotency_key: Option<&str>,
+        ) -> Result<GameSummary, UserError> {
+            self.keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(idempotency_key.map(str::to_string));
+            Ok(Self::summary(name))
+        }
+    }
+
+    /// P1-3 (v2.0.12): the dialog-session idempotency key actually
+    /// travels over IPC — `add_game_with_key` sends the key the
+    /// dialog minted, plain `add_game` sends none. The dispatch
+    /// comment always claimed the UI sends a key; it never did, so
+    /// a save retried after a client-side timeout duplicated the
+    /// game. A recording stub Api stands in for the daemon.
+    #[test]
+    #[cfg(unix)]
+    fn add_game_with_key_sends_the_key_over_ipc() {
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-ipc-key-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api: Arc<dyn AppApi> = Arc::new(KeyRecordingApi {
+            inner: SimApi::new(),
+            keys: Arc::clone(&keys),
+        });
+        let (tx, _rx) = broadcast::channel(64);
+        let server = Arc::new(IpcServer::new(api, tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                if let Ok((stream, _)) = listener.accept().await {
+                    server.serve_stream(stream).await;
+                }
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let client = IpcApi::connect(&sock).expect("connect");
+        let added = client
+            .add_game_with_key("Race", r"C:\race.exe", None, Some("dialog-1"))
+            .expect("keyed add must succeed");
+        assert_eq!(added.name, "Race");
+        let added_plain = client
+            .add_game("Race 2", r"C:\race2.exe", None)
+            .expect("plain add must succeed");
+        assert_eq!(added_plain.name, "Race 2");
+        let recorded = keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            recorded,
+            vec![Some("dialog-1".to_string()), None],
+            "the keyed add carries its key, the plain add carries none"
+        );
         drop(client);
         handle.join().expect("server thread");
         let _ = std::fs::remove_dir_all(&dir);
@@ -3512,6 +4029,18 @@ mod tests {
             "the range reason must survive: {}",
             detail(&bad_range)
         );
+        // CORE-P1-3/P1-4 (polish round): the server now sends the
+        // bare code in the body's `code` field, so the client
+        // rebuilds `"{bare_code}: daemon API error:
+        // {code}|{detail}"` — the head before the separator is the
+        // bare code, only the TAIL carries the detail. A head-strip
+        // here used to lose the reason and fall back to the
+        // reconnect text (caught by
+        // `capture_round_trips_over_real_socket`).
+        let new_shape = IpcError::Api(
+            "UnknownPedal: daemon API error: UnknownPedal|unknown pedal 'gear'".to_string(),
+        );
+        assert_eq!(detail(&new_shape), "unknown pedal 'gear'");
         // A dead link (not a daemon error) is the reconnect reason,
         // never a silent empty string.
         assert_eq!(
@@ -3559,6 +4088,74 @@ mod tests {
     }
 
     #[test]
+    fn daemon_connect_error_parses_code_detail_shape() {
+        // CORE-P1-3: the dispatch payload is now
+        // `"Unreachable|<detail>"` and the client re-wraps it, so
+        // the UI sees `"Unreachable|<detail>: daemon API error:
+        // Unreachable|<detail>"` — the code is before the `|`,
+        // never before the first `:`. A detail containing `": "`
+        // survives whole (the split is on `|`, not `":"`).
+        let error = IpcApi::daemon_connect_error(
+            "Unreachable|no board serial port detected: daemon API error: Unreachable|no board serial port detected",
+        );
+        assert_eq!(error.code, "Unreachable");
+        assert_eq!(error.title, "Wheel not found");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("no board serial port detected")
+        );
+        // A detail with its own ": " is not truncated at the colon.
+        let error = IpcApi::daemon_connect_error(
+            "Timeout|wheel did not answer: waited 3 s: daemon API error: Timeout|wheel did not answer: waited 3 s",
+        );
+        assert_eq!(error.code, "Timeout");
+        assert_eq!(error.title, "Wheel did not answer");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("wheel did not answer: waited 3 s")
+        );
+        // The bare detailed payload (no client wrap) parses too.
+        let error = IpcApi::daemon_connect_error("Unreachable|no board found");
+        assert_eq!(error.code, "Unreachable");
+        assert_eq!(error.title, "Wheel not found");
+    }
+
+    #[test]
+    fn api_error_strips_client_double_wrap() {
+        // CORE-P1-4: the client wraps the payload as `"{code}:
+        // daemon API error: {code}|{detail}"` — the title must be
+        // the bare detail, with no IPC framing and no duplication,
+        // and a detail containing `": "` survives whole.
+        let error = IpcApi::api_error(&IpcError::Api(
+            "Unknown: daemon API error: Unknown|cannot save manual games: disk full".to_string(),
+        ));
+        assert_eq!(error.code, "Unknown");
+        assert_eq!(error.title, "cannot save manual games: disk full");
+        assert_eq!(error.what_happened, "cannot save manual games: disk full");
+        assert!(
+            !error.title.contains("daemon API error"),
+            "no IPC framing may reach the user"
+        );
+        // The old bare-code shape still parses, framing-free.
+        let error = IpcApi::api_error(&IpcError::Api(
+            "Unknown: daemon API error: Unknown".to_string(),
+        ));
+        assert_eq!(error.code, "Unknown");
+        assert_eq!(error.detail.as_deref(), Some("Unknown"));
+        assert!(
+            !error
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("daemon API error"),
+            "the fallback must use the stripped tail, never the wrapped payload"
+        );
+        // A non-Api error stays the generic link failure.
+        let error = IpcApi::api_error(&IpcError::Closed);
+        assert_eq!(error.code, "TransportClosed");
+    }
+
+    #[test]
     fn daemon_backend_error_keeps_the_daemons_reason() {
         // Bug 4/8: a failed switch arrives as
         // `IpcError::Api("Unknown: daemon API error: Unknown:
@@ -3600,6 +4197,95 @@ mod tests {
         assert_eq!(error.code, "TransportClosed");
         let error = IpcApi::daemon_backend_error(&IpcError::Io("connection refused".to_string()));
         assert_eq!(error.code, "TransportClosed");
+    }
+
+    #[test]
+    fn game_call_error_keeps_the_daemons_reason() {
+        // UI-3 (v2.0.12): a launch / stop failure keeps the
+        // daemon's reason instead of collapsing into the generic
+        // "Connection dropped".
+        // Detailed payload (post-CORE-2 dispatch): `code|reason`.
+        let detailed = IpcError::Api(
+            "game_not_found|That game isn't in the list any more.: daemon API error: game_not_found|That game isn't in the list any more."
+                .to_string(),
+        );
+        let error = IpcApi::game_call_error("launch_game", &detailed);
+        assert_eq!(error.title, "Couldn't launch game");
+        assert!(
+            error.what_happened.contains("isn't in the list"),
+            "reason must survive: {}",
+            error.what_happened
+        );
+        // Bare code (pre-CORE-2 dispatch): still a refusal with
+        // the right verb, never a link failure.
+        let bare = IpcError::Api("game_not_found: daemon API error: game_not_found".to_string());
+        let error = IpcApi::game_call_error("stop_game", &bare);
+        assert_eq!(error.title, "Couldn't stop game");
+        assert_eq!(error.code, "game_not_found");
+        // A timeout names the timeout, not a dropped link.
+        let timeout = IpcError::Io("IPC call 'launch_game' timed out after 10000 ms".to_string());
+        let error = IpcApi::game_call_error("launch_game", &timeout);
+        assert_eq!(error.title, "Couldn't launch game");
+        assert!(
+            error.what_happened.contains("didn't answer in time"),
+            "timeout must say so: {}",
+            error.what_happened
+        );
+        // Any other link failure stays the generic link failure.
+        let error = IpcApi::game_call_error("launch_game", &IpcError::Closed);
+        assert_eq!(error.code, "TransportClosed");
+    }
+
+    #[test]
+    fn game_write_error_never_embeds_raw_ipc_text() {
+        // UI-7 (v2.0.12): a non-`Api` error maps to the generic
+        // link failure — no "IPC …" wording reaches the dialog's
+        // inline error or the status bar.
+        for error in [
+            IpcError::Closed,
+            IpcError::Protocol("garbage".to_string()),
+            IpcError::UnknownMethod("add_game".to_string()),
+            IpcError::UnsupportedVersion(3),
+            IpcError::Io("socket gone".to_string()),
+        ] {
+            let mapped = IpcApi::game_write_error(&error);
+            assert_eq!(
+                mapped.code, "TransportClosed",
+                "non-Api error must map to the link failure: {error:?}"
+            );
+            assert!(
+                !mapped.what_happened.contains("IPC"),
+                "raw IPC wording must not reach the user: {}",
+                mapped.what_happened
+            );
+            assert!(
+                !mapped.what_happened.contains("protocol"),
+                "raw IPC wording must not reach the user: {}",
+                mapped.what_happened
+            );
+        }
+    }
+
+    /// CORE-P1-3/P1-4 (polish round): same new wire shape as the
+    /// capture parser — the client rebuilds `"{bare_code}: daemon
+    /// API error: {code}|{reason}"`, so the reason lives in the
+    /// tail, not the head. A head-strip here used to collapse the
+    /// real reason into the generic link failure.
+    #[test]
+    fn game_write_error_keeps_reason_in_new_wire_shape() {
+        let error = IpcError::Api(
+            "SaveFailed: daemon API error: SaveFailed|cannot save manual games: disk full"
+                .to_string(),
+        );
+        let mapped = IpcApi::game_write_error(&error);
+        assert_eq!(mapped.code, "SaveFailed");
+        assert!(
+            mapped
+                .what_happened
+                .contains("cannot save manual games: disk full"),
+            "the save reason must survive: {}",
+            mapped.what_happened
+        );
     }
 
     /// Minimal `AppApi` for the capture test: only the capture

@@ -1516,6 +1516,13 @@ impl IJoystickOutput for VJoyOutput {
         self.connect_with_plan(Some(plan))
     }
 
+    /// The driver version `connect_with_plan` measured (`status`
+    /// carries it after a successful connect; `None` before the
+    /// first connect — an unmeasured version is never invented).
+    fn vjoy_driver_version(&self) -> Option<String> {
+        self.status.driver_version.clone()
+    }
+
     fn disconnect(&mut self) {
         self.disconnect_inner();
     }
@@ -2487,6 +2494,22 @@ mod tests {
         assert_eq!(status.driver_version.as_deref(), Some("2.2.2"));
         assert_eq!(out.capabilities().button_count, 32);
         assert!(out.capabilities().has_axis_slider);
+    }
+
+    /// P3-9 (v2.0.12 scan): the trait surfaces the driver version
+    /// `connect_with_plan` measured, so `vjoy_status()` can report
+    /// it instead of always `None`.
+    #[test]
+    fn vjoy_driver_version_is_measured_at_connect() {
+        let (mock, _) = MockDll::with_defaults();
+        let mut out = VJoyOutput::with_dll(1, Box::new(mock));
+        assert_eq!(out.vjoy_driver_version(), None, "nothing measured yet");
+        out.try_connect().expect("mock connect succeeds");
+        assert_eq!(
+            out.vjoy_driver_version().as_deref(),
+            Some("2.2.2"),
+            "the measured driver version is surfaced"
+        );
     }
 
     #[test]

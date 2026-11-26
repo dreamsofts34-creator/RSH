@@ -499,6 +499,63 @@ pub fn read_daemon_status_fresh(
     }
 }
 
+/// CORE-P3-8 (v2.0.13): the non-fatal second-instance `info`
+/// record — `{"status": "info", "code":
+/// "SecondInstanceStarting", "detail": "...", "pid": ...,
+/// "at_unix": ...}` — written by a second daemon that exits
+/// because the first is still starting (~11 s after a UI spawn,
+/// the duplicate-spawn death that used to leave no trace).
+/// `read_daemon_status` only ever reads `status == "fatal"`, so
+/// this record was invisible to the UI. Returns
+/// `(detail, at_unix)` only for a FRESH info record with that
+/// code — a missing / fatal / `ok` / unparseable file, any other
+/// code, or a stale record is `None`. A record with no usable
+/// timestamp counts as fresh (fail-safe: the evidence must not
+/// be dropped on a missing clock, same rule as the fatal reader).
+/// The caller surfaces it once per `at_unix` (notification +
+/// diagnostics log) — never as a fatal banner, and never as a
+/// spawn latch: the first daemon is still starting, not dead.
+#[must_use]
+pub fn read_second_instance_info(
+    data_dir: Option<&Path>,
+    max_age: Duration,
+) -> Option<(String, u64)> {
+    let dir = resolve_data_dir(data_dir)?;
+    let path = dir.join("daemon-status.json");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if value.get("status").and_then(serde_json::Value::as_str) != Some("info") {
+        return None;
+    }
+    if value.get("code").and_then(serde_json::Value::as_str) != Some("SecondInstanceStarting") {
+        return None;
+    }
+    let detail = value
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let at_unix = value.get("at_unix").and_then(serde_json::Value::as_u64);
+    let fresh = match at_unix {
+        Some(0) | None => std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map_or(true, |mtime| {
+                mtime.elapsed().map_or(true, |age| age <= max_age)
+            }),
+        Some(at_unix) => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            now.saturating_sub(at_unix) <= max_age.as_secs()
+        }
+    };
+    if fresh {
+        Some((detail, at_unix.unwrap_or(0)))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +620,79 @@ mod tests {
         assert_eq!(read_daemon_status(Some(&dir)), None);
         std::fs::write(dir.join("daemon-status.json"), "not json at all").expect("status file");
         assert_eq!(read_daemon_status(Some(&dir)), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_second_instance_info_surfaces_fresh_info_record() {
+        // CORE-P3-8: the `info` / `SecondInstanceStarting`
+        // record is the evidence for the ~11 s UI-spawned daemon
+        // death — it must read back with its timestamp, while a
+        // fatal record, any other info code, and a stale record
+        // stay invisible to this reader.
+        let dir = std::env::temp_dir().join(format!("rsh-status-2nd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert_eq!(
+            read_second_instance_info(Some(&dir), FATAL_FRESHNESS),
+            None,
+            "missing file reads as nothing"
+        );
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        std::fs::write(
+            dir.join("daemon-status.json"),
+            format!(
+                r#"{{"status":"info","code":"SecondInstanceStarting","detail":"already running (pid 1234) but its IPC endpoint never appeared","pid":5678,"at_unix":{now}}}"#
+            ),
+        )
+        .expect("status file");
+        assert_eq!(
+            read_second_instance_info(Some(&dir), FATAL_FRESHNESS),
+            Some((
+                "already running (pid 1234) but its IPC endpoint never appeared".to_string(),
+                now
+            )),
+            "a fresh second-instance record surfaces with its timestamp"
+        );
+        std::fs::write(
+            dir.join("daemon-status.json"),
+            format!(
+                r#"{{"status":"fatal","code":"IpcBindFailed","detail":"bind failed","pid":1,"at_unix":{now}}}"#
+            ),
+        )
+        .expect("status file");
+        assert_eq!(
+            read_second_instance_info(Some(&dir), FATAL_FRESHNESS),
+            None,
+            "a fatal record is not a second-instance record"
+        );
+        std::fs::write(
+            dir.join("daemon-status.json"),
+            format!(
+                r#"{{"status":"info","code":"SomethingElse","detail":"other","pid":1,"at_unix":{now}}}"#
+            ),
+        )
+        .expect("status file");
+        assert_eq!(
+            read_second_instance_info(Some(&dir), FATAL_FRESHNESS),
+            None,
+            "another info code is not a second-instance record"
+        );
+        let stale = now.saturating_sub(FATAL_FRESHNESS.as_secs() + 60);
+        std::fs::write(
+            dir.join("daemon-status.json"),
+            format!(
+                r#"{{"status":"info","code":"SecondInstanceStarting","detail":"old","pid":1,"at_unix":{stale}}}"#
+            ),
+        )
+        .expect("status file");
+        assert_eq!(
+            read_second_instance_info(Some(&dir), FATAL_FRESHNESS),
+            None,
+            "a stale second-instance record stays silent"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

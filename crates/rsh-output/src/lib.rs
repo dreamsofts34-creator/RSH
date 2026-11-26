@@ -17,12 +17,14 @@
 pub mod error;
 pub mod selector;
 pub mod vjoy;
+pub mod vjoy_config;
 
 use rsh_engine::pipeline::{OutputState, PipelinePlan};
 
 pub use error::OutputError;
 pub use selector::{BackendFactories, BackendKind, SwitchOutcome, switch_backend};
 pub use vjoy::{VJoyError, VJoyOutput, VJoyStateKind, VJoyStatus};
+pub use vjoy_config::{VJOY_FH4_DEVICE_ID, VJoyConfigError, vjoy_config_argv};
 
 /// The processed state the engine hands to an output backend.
 ///
@@ -74,6 +76,18 @@ pub trait IJoystickOutput: Send {
     fn try_connect_with_plan(&mut self, plan: &PipelinePlan) -> Result<(), VJoyError> {
         let _ = plan;
         self.try_connect()
+    }
+
+    /// The vJoy driver version (`"2.2.2"` form) this backend
+    /// measured at connect, when this backend IS vJoy and has
+    /// connected. The default is [`None`] — only vJoy measures a
+    /// vJoy driver version (P3-9, v2.0.12 scan:
+    /// `vjoy_status().version` was always `None` because nothing
+    /// ever surfaced the measured version). The app core caches
+    /// the last measured value so the version survives a switch
+    /// away to another backend.
+    fn vjoy_driver_version(&self) -> Option<String> {
+        None
     }
 
     /// Best-effort neutral send, then release the device. Never

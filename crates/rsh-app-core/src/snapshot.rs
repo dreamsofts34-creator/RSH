@@ -237,6 +237,16 @@ impl LoopRateTracker {
     }
 
     /// The measured loop rate in Hz right now.
+    ///
+    /// Deliberately NOT cached (PERF P1-3 follow-up): a time-based
+    /// cache served the value computed before the latest ticks for
+    /// up to 100 ms — after two ticks `rate_hz()` still answered
+    /// the pre-tick `None` (the `ingest_…_loop_rate` test caught
+    /// it). The scan is a ~200 ns linear pass over at most 200
+    /// `Instant`s; the real P1-3 win is the p99 cache in
+    /// `EngineMetrics`, kept. A cache here would have to invalidate
+    /// on every tick, which is exactly the per-tick call pattern —
+    /// so it could never hit anyway.
     #[must_use]
     pub fn rate_hz(&self) -> Option<f64> {
         self.rate_hz_at(Instant::now())
@@ -340,6 +350,23 @@ pub fn build_engine_stats(metrics: &EngineMetrics, loop_hz: Option<f64>) -> Engi
         jitter_ms_p99: metrics.jitter_p99().map(us_to_ms),
         output_latency_ms: metrics.output_latency_p99().map(us_to_ms),
         e2e_ms: metrics.e2e_latency_p99().map(us_to_ms),
+    }
+}
+
+/// Hot-path variant of [`build_engine_stats`] (PERF P1-3): the p99s
+/// come from the metrics' 100 ms cache instead of three fresh sorts,
+/// so the 200 Hz `ingest_frame` tick pays ~0.1 µs of stats work
+/// instead of ~14 µs. The 1 Hz diag path keeps using the exact
+/// `build_engine_stats`.
+#[must_use]
+pub fn build_engine_stats_cached(metrics: &mut EngineMetrics, loop_hz: Option<f64>) -> EngineStats {
+    let (jitter, output, e2e) = metrics.cached_p99s();
+    EngineStats {
+        loop_hz,
+        loss_pct: loss_fraction_to_pct(metrics.loss_fraction()),
+        jitter_ms_p99: jitter.map(us_to_ms),
+        output_latency_ms: output.map(us_to_ms),
+        e2e_ms: e2e.map(us_to_ms),
     }
 }
 

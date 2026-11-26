@@ -18,6 +18,7 @@
 
 import { Theme } from "../tokens.slint";
 import { Card, Btn, Pill } from "../components.slint";
+import { ScrollView } from "std-widgets.slint";
 
 export struct ProfileItem {
     name: string,
@@ -52,6 +53,16 @@ component ProfileRowItem inherits Rectangle {
             }
             return reject;
         }
+    }
+    // P1-4: visible 2px focus ring (Switch pattern).
+    if fs.has-focus : Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: 10px;
+        border-width: 2px;
+        border-color: Theme.accent-text;
     }
     HorizontalLayout {
         padding-left: 10px;
@@ -100,6 +111,11 @@ export component ProfilePopover inherits Card {
     in property <bool> unsaved: false;
     in property <bool> show-unsaved-prompt: false;
     in property <string> pending-name: "";
+    // P2-3: the height cap, passed by the shell (window height
+    // minus 76px: 64px top offset + 12px bottom margin) — the
+    // component root cannot read `parent` itself. Default is
+    // effectively uncapped.
+    in property <length> height-cap: 100000px;
     // DS-54: which job kind the busy strip shows, as a
     // JobKind::order value (-1 = idle) — Use / New / Duplicate /
     // Delete / Link / Save / Discard all run ProfileOp jobs (8).
@@ -144,8 +160,12 @@ export component ProfilePopover inherits Card {
     // (gate-measured 580 px), so the popover used to render as a
     // full-height panel. The layout's preferred height is content-driven
     // (fixed 300 px width, grows with the profile list), so binding
-    // to it sizes the card to its content.
-    height: layout.preferred-height;
+    // to it sizes the card to its content. P2-3: capped at
+    // `height-cap` (window height minus 76px, passed by the shell)
+    // — with 10+ profiles the lists scroll inside instead of
+    // running off the bottom edge; the header / buttons / rename
+    // stay outside the scroll below.
+    height: Math.min(layout.preferred-height, height-cap);
     // P2-5: a blocking TouchArea over the whole card, FIRST so the
     // content paints above it — clicks on popover background stop
     // here instead of falling through to the shell backdrop
@@ -157,6 +177,10 @@ export component ProfilePopover inherits Card {
     // FocusScope here: it was never focused by Rust, so it could
     // never fire.
     layout := VerticalLayout {
+        // P2-3: fills the card so the ScrollView below gets a
+        // bounded height to scroll within when the card is capped.
+        width: 100%;
+        height: 100%;
         padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 12px;
         spacing: 10px;
         HorizontalLayout {
@@ -164,33 +188,43 @@ export component ProfilePopover inherits Card {
             Rectangle { horizontal-stretch: 1; }
             if unsaved : Text { text: "● Unsaved changes"; font-size: Theme.fs-label; font-weight: 600; color: Theme.warn; }
         }
-        Text { text: "Presets"; font-size: Theme.fs-label; font-weight: 600; color: Theme.faint; }
-        VerticalLayout {
-            spacing: 2px;
-            for p[i] in presets : ProfileRowItem {
-                name: p.name;
-                game: p.game;
-                active: p.active;
-                selected: selected == i;
-                is-preset: true;
-                use-disabled: busy-kind == 8;
-                clicked => { selected = i; }
-                use-clicked => { use-preset(i); }
-            }
-        }
-        Text { text: "My profiles"; font-size: Theme.fs-label; font-weight: 600; color: Theme.faint; }
-        VerticalLayout {
-            spacing: 2px;
-            if profiles.length == 0 : Text { text: "No profiles yet — press New to create one."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
-            for p[i] in profiles : ProfileRowItem {
-                name: p.name;
-                game: p.game;
-                active: p.active;
-                selected: selected == presets.length + i;
-                is-preset: false;
-                use-disabled: busy-kind == 8;
-                clicked => { selected = presets.length + i; }
-                use-clicked => { use-profile(i); }
+        // P2-3: the two lists scroll as one when the card is capped
+        // (10+ profiles) — the header above and the buttons / rename /
+        // prompt below stay put.
+        ScrollView {
+            vertical-stretch: 1;
+            content-width: self.visible-width;
+            VerticalLayout {
+                spacing: 10px;
+                Text { text: "Presets"; font-size: Theme.fs-label; font-weight: 600; color: Theme.faint; }
+                VerticalLayout {
+                    spacing: 2px;
+                    for p[i] in presets : ProfileRowItem {
+                        name: p.name;
+                        game: p.game;
+                        active: p.active;
+                        selected: selected == i;
+                        is-preset: true;
+                        use-disabled: busy-kind == 8;
+                        clicked => { selected = i; }
+                        use-clicked => { use-preset(i); }
+                    }
+                }
+                Text { text: "My profiles"; font-size: Theme.fs-label; font-weight: 600; color: Theme.faint; }
+                VerticalLayout {
+                    spacing: 2px;
+                    if profiles.length == 0 : Text { text: "No profiles yet — press New to create one."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
+                    for p[i] in profiles : ProfileRowItem {
+                        name: p.name;
+                        game: p.game;
+                        active: p.active;
+                        selected: selected == presets.length + i;
+                        is-preset: false;
+                        use-disabled: busy-kind == 8;
+                        clicked => { selected = presets.length + i; }
+                        use-clicked => { use-profile(i); }
+                    }
+                }
             }
         }
         Rectangle { height: 1px; background: Theme.line; }
@@ -221,9 +255,10 @@ export component ProfilePopover inherits Card {
                     height: 28px;
                     border-radius: 7px;
                     border-width: 1px;
-                    border-color: Theme.line;
+                    // P1-3: the focus border is the accent text colour.
+                    border-color: rename-input.has-focus ? Theme.accent-text : Theme.line;
                     background: Theme.bg;
-                    TextInput {
+                    rename-input := TextInput {
                         x: 10px;
                         width: parent.width - 20px;
                         height: 100%;
@@ -233,6 +268,15 @@ export component ProfilePopover inherits Card {
                         font-weight: 500;
                         color: Theme.text;
                         selection-background-color: Theme.accent;
+                        // P1-5: Up/Down stay in the field — Return
+                        // rejects so it still reaches `accepted`
+                        // below and saves.
+                        key-pressed(event) => {
+                            if (event.text == Key.UpArrow || event.text == Key.DownArrow) {
+                                return accept;
+                            }
+                            return reject;
+                        }
                         accepted => { rename-open = false; rename-confirmed(selected, rename-text); }
                     }
                 }

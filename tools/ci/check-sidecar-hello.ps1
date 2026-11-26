@@ -12,11 +12,19 @@
 # v2.0.11 (P3): the stdio check never exercised the production
 # TCP connect-back path — the v2.0.10 failure mode (sidecar dies
 # between tcp.Connect and hello) passed it. The script now ALSO
-# spawns the sidecar with --connect-back + RSH_HM_SIDECAR_TOKEN,
+# spawns the sidecar with --connect-back --token <nonce>,
 # accepts the loopback connection, and asserts a hello arrives
 # over the socket with the token echoed. It then asserts the
 # sidecar file log (%PROGRAMDATA%\RSH\logs\rsh-sidecar-*.log)
 # exists with the 'hello sent' milestone (P0).
+#
+# v2.0.12 (H1): the token travels on argv, NOT the environment —
+# AIS drops env vars set by the non-elevated daemon when it
+# launches the sidecar elevated via `runas`, so the old
+# RSH_HM_SIDECAR_TOKEN transport died with exit 2 before
+# connecting (proven on the owner's PC). The script also runs the
+# negative case: --connect-back WITHOUT --token must exit 2 and
+# write a 'bad-args' line to the sidecar file log.
 #
 # update4-fix (P1-2 / P2-5): the stdio run now asserts exit code 0
 # (it never checked $p.ExitCode), the TCP run's exit path is
@@ -121,7 +129,8 @@ Write-Host "Sidecar hello OK (stdio): sdk $($hello.sdk), dll_sha256_ok $($hello.
 # died between tcp.Connect and hello, and the stdio check above
 # never exercised the connect-back at all (CI hello check ran the
 # sidecar directly with stdin closed). So: listen on loopback,
-# spawn the sidecar with --connect-back + RSH_HM_SIDECAR_TOKEN,
+# spawn the sidecar with --connect-back --token <nonce> (v2.0.12,
+# H1 — the token is on argv, never the environment),
 # accept, and assert a hello line arrives OVER THE SOCKET with the
 # token echoed and the DLL verdict OK. Fail closed on timeout, on
 # a non-hello first line, or on a bad verdict / wrong token echo.
@@ -129,14 +138,13 @@ $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopba
 $listener.Start()
 $tcpPort = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
 $token = -join ((1..32) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) })
-$env:RSH_HM_SIDECAR_TOKEN = $token
 $tcpErrFile = Join-Path $tmp "tcp.stderr.txt"
 Remove-Item $tcpErrFile -Force -ErrorAction SilentlyContinue
 $tcpClient = $null
 $p2 = $null
 try {
   $p2 = Start-Process -FilePath (Resolve-Path $Exe).Path `
-    -ArgumentList "--connect-back", "127.0.0.1:$tcpPort" `
+    -ArgumentList "--connect-back", "127.0.0.1:$tcpPort", "--token", $token `
     -RedirectStandardError $tcpErrFile -PassThru -NoNewWindow
   $acceptTask = $listener.AcceptTcpClientAsync()
   if (-not $acceptTask.Wait(15000)) {
@@ -188,7 +196,6 @@ try {
 } finally {
   if ($null -ne $tcpClient) { $tcpClient.Close() }
   $listener.Stop()
-  Remove-Item Env:\RSH_HM_SIDECAR_TOKEN -ErrorAction SilentlyContinue
 }
 # P1-2: the TCP run's exit path is checked too — closing the socket
 # is the sidecar's EOF, so it must exit 0 promptly, like the stdio
@@ -205,6 +212,35 @@ if ($null -ne $p2) {
     exit 1
   }
 }
+
+# --- Token-missing negative case (v2.0.12, H1) --------------------
+# --connect-back WITHOUT --token must exit 2 fast AND write a
+# 'bad-args' line to the sidecar file log — the exact failure the
+# owner's PC proved (AIS dropped the env token, the sidecar died
+# before connecting). The file-log assertion matters: stderr is
+# discarded on the elevated path, so the file log is the only
+# trace this failure leaves. Today's log already exists from the
+# runs above (deleted before them, so it is from this run only).
+$negErrFile = Join-Path $tmp "neg.stderr.txt"
+Remove-Item $negErrFile -Force -ErrorAction SilentlyContinue
+$p3 = Start-Process -FilePath (Resolve-Path $Exe).Path `
+  -ArgumentList "--connect-back", "127.0.0.1:$tcpPort" `
+  -RedirectStandardError $negErrFile -PassThru -NoNewWindow
+if (-not $p3.WaitForExit(15000)) {
+  $p3.Kill()
+  Write-Error "Sidecar hello check (token-missing): sidecar with --connect-back but no --token did not exit within 15 s (expected fast exit 2)."
+  exit 1
+}
+if ($p3.ExitCode -ne 2) {
+  Write-Error "Sidecar hello check (token-missing): sidecar exited $($p3.ExitCode) (expected 2 for a missing --token)."
+  exit 1
+}
+$negLog = Get-Content $todayLog -Raw -ErrorAction SilentlyContinue
+if ($negLog -notmatch "bad-args") {
+  Write-Error "Sidecar hello check (token-missing): today's sidecar file log contains no 'bad-args' line — the token-missing failure left no trace in the file log."
+  exit 1
+}
+Write-Host "Sidecar token-missing check OK: exit 2 with 'bad-args' in the file log."
 
 # --- Sidecar file log (v2.0.11, P0; P1-2/P2-5 update4-fix) --------
 # Both runs above must have written TODAY'S file log

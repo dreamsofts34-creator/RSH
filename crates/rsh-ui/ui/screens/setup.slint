@@ -75,8 +75,8 @@ component StepRow inherits HorizontalLayout {
 }
 
 export component SetupWizard inherits Rectangle {
-    width: Theme.window-width;
-    height: Theme.window-height;
+    width: 100%;
+    height: 100%;
     background: Theme.bg;
 
     // 0 Connect, 1 Drivers, 2 Calibrate, 3 Games (D16: 4 steps;
@@ -155,13 +155,14 @@ export component SetupWizard inherits Rectangle {
     property <string> step-lead: step == 0 ? "Join the wheel's Wi-Fi, or plug in a USB cable." : step == 1 ? "Games need a controller driver — vJoy is the default." : step == 2 ? "Centre the wheel and set the pedals, so the game gets true inputs." : "Add your racing games — pick the exe or shortcut for each game. RSH switches profile automatically when a game starts.";
 
     HorizontalLayout {
-        // P1-6: 100% of the window, not an explicit 920px — at
-        // 1366x768 @150% the window is 880px wide and a 920px
-        // wizard clipped 40px off the right edge. The right column
-        // sizes to content here, so full-width elements still carry
-        // explicit 584px widths ((920 - 264 - 2*36) — the same
-        // explicit-width pattern as the Pedals/Settings fixes);
-        // at 880px the column is 616px, so the 584px widths fit.
+        // P1-2: 100% of the window — the component ROOT used to pin
+        // an explicit 920px (Theme.window-width), clipping 40px off
+        // the right edge at 1366x768 @150% (880px window). The right
+        // column sizes to content here, so full-width elements still
+        // carry explicit 584px widths ((920 - 264 - 2*36) — the same
+        // explicit-width pattern as the Pedals/Settings fixes); those
+        // are preferred widths with horizontal-stretch, so at 880px
+        // they shrink to the 544px column.
         width: 100%;
         height: 100%;
         // Left column: logo + steps + Skip (preview: 264px).
@@ -419,6 +420,13 @@ export component SetupWizard inherits Rectangle {
                         Btn { label: centre-done ? "Set" : "Set centre"; primary: !centre-done; disabled: !calibration-available || busy-kind == 10; clicked => { calibrate-action("centre"); } }
                     }
                 }
+                // HID P3-3 (v2.0.13): the board treats the wheel
+                // position at power-on as its centre — a wheel
+                // turned at boot stays off-centre until it is
+                // re-captured here (or the board is rebooted with
+                // the wheel straight). Say so on the step itself,
+                // not just in docs.
+                Text { text: "Tip: switch the board on with the wheel straight — it treats the power-on position as its centre. If steering feels off-centre, hold the wheel straight and press Set centre."; font-size: Theme.fs-label; color: Theme.mute; wrap: word-wrap; }
                 Rectangle {
                     horizontal-stretch: 1;
                     width: 584px;
@@ -497,6 +505,9 @@ export component SetupWizard inherits Rectangle {
                 horizontal-stretch: 1;
                 width: 584px;
                 spacing: 8px;
+                // P2-12: why Next is disabled — a silently dead
+                // button reads as broken. Step 3 never disables.
+                if !next-enabled : Text { vertical-alignment: center; text: step == 0 ? "Connect the wheel to continue." : step == 1 ? "Install vJoy or choose HIDMaestro to continue." : "Set the centre and pedals to continue."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
                 Rectangle { horizontal-stretch: 1; }
                 if step > 0 : Btn { label: "Back"; clicked => { back(); } }
                 if next-enabled : Btn { label: step == 3 ? "Finish" : "Next"; primary: true; clicked => { next(); } }

@@ -300,6 +300,18 @@ unsafe extern "system" fn recovery_callback(pvparameter: *mut std::ffi::c_void) 
 mod tests {
     use super::*;
 
+    /// Process-wide test mutex (P1-5, v2.0.12 scan): WER
+    /// Application Restart registration is per-process global state,
+    /// and the harness runs the tests below in the same process on
+    /// parallel threads — one test's `UnregisterApplicationRestart`
+    /// landing between the other's register and
+    /// `GetApplicationRestartSettings` produced exactly
+    /// `HRESULT 0x80070490` (`ERROR_NOT_FOUND`). Both tests hold this
+    /// lock across their whole register → get → unregister sequence,
+    /// so they can never interleave. Poison is recovered (a test
+    /// that panicked mid-sequence must not wedge the other one).
+    static RESTART_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("rsh-restart-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -390,6 +402,12 @@ mod tests {
 
     #[test]
     fn register_is_noop_off_windows() {
+        // P1-5 (v2.0.12 scan): hold the process-wide WER lock —
+        // on Windows this test unregisters the process registration
+        // the round-trip test reads, so the two must never overlap.
+        let _guard = RESTART_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_dir("noop");
         let outcome = register_application_restart(&dir, false).expect("register must not fail");
         #[cfg(not(windows))]
@@ -425,20 +443,64 @@ mod tests {
         use windows::Win32::System::Threading::GetCurrentProcess;
         use windows::core::PWSTR;
 
+        // P1-5 (v2.0.12 scan): hold the process-wide WER lock for
+        // the whole register → get → unregister sequence (see
+        // `RESTART_TEST_LOCK`).
+        let _guard = RESTART_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_dir("round-trip");
         let outcome = register_application_restart(&dir, false).expect("register");
         assert_eq!(outcome, RestartOutcome::Registered);
         let mut buf = vec![0u16; 4096];
         let mut size = u32::try_from(buf.len()).unwrap_or(u32::MAX);
         let mut flags = 0u32;
-        unsafe {
-            GetApplicationRestartSettings(
-                GetCurrentProcess(),
-                Some(PWSTR(buf.as_mut_ptr())),
-                &raw mut size,
-                Some(&raw mut flags),
-            )
-            .expect("get settings");
+        // P1-5 (v2.0.12 scan): retry the Get instead of a single
+        // `.expect` — a transient unregistration (e.g. a racing
+        // test, or WER itself) must not produce a bare `0x80070490`
+        // panic; assert on the last error after the budget below.
+        //
+        // Evidence note (v2.0.13 polish): the cited failing run
+        // 45640120547 panicked at `restart.rs:441` with the OLD
+        // single-attempt `.expect("get settings")` — that run was
+        // on commit 37e9bca, BEFORE this retry landed in 3579f75,
+        // so no post-hardening failure is on record; the retry is
+        // unproven, not disproven. The budget below is widened
+        // anyway (5 x 100 ms -> 10 x 200 ms = 2 s, backoff): a
+        // registration-propagation delay has no documented bound,
+        // and the test only pays the budget when the Get actually
+        // fails. The sleep is skipped after the final attempt
+        // (the old code slept 100 ms and then panicked).
+        let mut last_error = None;
+        let mut attempts = 0;
+        for attempt in 0..10 {
+            attempts = attempt + 1;
+            // A failed Get may have consumed `size` — reset the
+            // buffer length each attempt.
+            size = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+            let result = unsafe {
+                GetApplicationRestartSettings(
+                    GetCurrentProcess(),
+                    Some(PWSTR(buf.as_mut_ptr())),
+                    &raw mut size,
+                    Some(&raw mut flags),
+                )
+            };
+            match result {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < 9 {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            panic!("get settings (after {attempts} attempts): {error}");
         }
         let expected = RESTART_NO_PATCH.0 | RESTART_NO_REBOOT.0;
         assert_eq!(flags & expected, expected, "flags: {flags:#x}");

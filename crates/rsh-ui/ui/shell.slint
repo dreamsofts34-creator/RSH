@@ -5,7 +5,7 @@
 // stub was deleted in the v2.0.1 hotfix — screens/extras.slint owns
 // Extras now, A6.)
 import { Theme } from "tokens.slint";
-import { AboutSlint } from "std-widgets.slint";
+import { AboutSlint, ScrollView } from "std-widgets.slint";
 import { Card, NavItem, SubItem, StatusCard, Btn } from "components.slint";
 
 // Page ids (shared with Rust): 0 Overview, 1 Steering, 2 Pedals,
@@ -22,110 +22,130 @@ export component Sidebar inherits Rectangle {
     callback open-about();
     width: Theme.sidebar-width;
     background: Theme.side;
-    VerticalLayout {
-        padding-top: 14px;
-        padding-left: 10px;
-        padding-right: 10px;
-        // B06: the bottom bar is a real 40px StatusBar now — the
-        // sidebar keeps 40px + 12px gap of empty padding below the
-        // About link, so the bar never covers the link (or the
-        // StatusCard's bottom edge) while a job runs. The window
-        // never resizes; this is the reserve.
-        padding-bottom: 52px;
-        spacing: 2px;
-        HorizontalLayout {
-            padding-left: 8px;
-            padding-right: 8px;
-            padding-bottom: 14px;
-            spacing: 10px;
-            // UI-UX polish (a): preview `.brand` is
-            // align-items:center — the 28px logo centres against the
-            // two-line wordmark.
-            cross-axis-alignment: center;
-            Rectangle {
-                width: 28px;
-                height: 28px;
-                border-radius: 8px;
-                background: Theme.accent;
-                Image {
-                    x: 5px;
-                    y: 5px;
-                    width: 18px;
-                    height: 18px;
-                    source: @image-url("../assets/icons/wheel.svg");
-                }
-            }
-            VerticalLayout {
-                spacing: 0px;
-                Text { text: "RSH"; font-size: Theme.fs-card; font-weight: 700; color: Theme.text; }
-                Text { text: "Real Sim Hub"; font-size: Theme.fs-hint; color: Theme.faint; }
-            }
-        }
-        NavItem { label: "Overview"; icon: @image-url("../assets/icons/grid.svg"); active: page == 0; clicked => { nav(0); } }
-        // UI-UX polish (a): preview `.lbl` is padding 12px 10px 4px —
-        // the section label sits 12px below the nav item above it and
-        // 4px above the next one. The column gap is 2px, so the row
-        // padding makes up the rest (2+10=12 above, 2+2=4 below).
-        // (x=20: sidebar padding 10 + this 10 — preview `.lbl`
-        // padding-left 10px puts the label over the nav icons.)
-        HorizontalLayout {
-            padding-top: 10px;
-            padding-bottom: 2px;
+    // UI-6 (v2.0.12): the sidebar scrolls — at 150% scaling the
+    // fixed content (~454 px) + the 52 px bottom reserve (~506 px)
+    // exceeds the 480 px minimum window height, and the About link
+    // used to slide under the StatusBar with no way to reach it.
+    // `min-height` keeps the column viewport-tall while the content
+    // is short, so the stretch spacer below still pushes the
+    // StatusCard + About to the bottom exactly as before; when the
+    // content is taller the column grows past the viewport and
+    // scrolls instead of clipping. `content-width` keeps the column
+    // viewport-wide (PageScaffold pattern), so no horizontal
+    // scrollbar ever appears.
+    side-scroll := ScrollView {
+        width: 100%;
+        height: 100%;
+        content-width: self.visible-width;
+        VerticalLayout {
+            min-height: side-scroll.visible-height;
+            padding-top: 14px;
             padding-left: 10px;
-            Text { text: "DEVICE"; font-size: Theme.fs-hint; font-weight: 600; color: Theme.faint; }
-        }
-        NavItem { label: "RSH Wheel"; icon: @image-url("../assets/icons/wheel.svg"); active: page >= 1 && page <= 4; show-dot: connected; clicked => { nav(1); } }
-        SubItem { label: "Steering"; active: page == 1; clicked => { nav(1); } }
-        SubItem { label: "Pedals"; active: page == 2; clicked => { nav(2); } }
-        SubItem { label: "Buttons"; active: page == 3; clicked => { nav(3); } }
-        SubItem { label: "Extras"; active: page == 4; clicked => { nav(4); } }
-        HorizontalLayout {
-            padding-top: 10px;
-            padding-bottom: 2px;
-            padding-left: 10px;
-            Text { text: "APP"; font-size: Theme.fs-hint; font-weight: 600; color: Theme.faint; }
-        }
-        NavItem { label: "Settings"; icon: @image-url("../assets/icons/gear.svg"); active: page == 5 || page == 6; clicked => { nav(5); } }
-        Rectangle { vertical-stretch: 1; }
-        StatusCard {
-            connected: connected;
-            conn-warn: conn-warn;
-            label: conn-label;
-            sub: conn-sub;
-            send-to-game: send-to-game;
-            toggled-send => { toggled-send(); }
-        }
-        Text {
-            horizontal-alignment: center;
-            text: "About";
-            font-size: Theme.fs-hint;
-            color: fs.has-focus || about-ta.has-hover ? Theme.text : Theme.faint;
-            accessible-label: "About";
-            accessible-role: button;
-            // FIX-4: keyboard activation for this text link.
-            fs := FocusScope {
-                width: 100%;
-                height: 100%;
-                key-pressed(event) => {
-                    if (event.text == Key.Return || event.text == Key.Space) {
-                        open-about();
-                        return accept;
+            padding-right: 10px;
+            // B06: the bottom bar is a real 40px StatusBar now — the
+            // sidebar keeps 40px + 12px gap of empty padding below the
+            // About link, so the bar never covers the link (or the
+            // StatusCard's bottom edge) while a job runs. The window
+            // never resizes; this is the reserve.
+            padding-bottom: 52px;
+            spacing: 2px;
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                padding-bottom: 14px;
+                spacing: 10px;
+                // UI-UX polish (a): preview `.brand` is
+                // align-items:center — the 28px logo centres against the
+                // two-line wordmark.
+                cross-axis-alignment: center;
+                Rectangle {
+                    width: 28px;
+                    height: 28px;
+                    border-radius: 8px;
+                    background: Theme.accent;
+                    Image {
+                        x: 5px;
+                        y: 5px;
+                        width: 18px;
+                        height: 18px;
+                        source: @image-url("../assets/icons/wheel.svg");
                     }
-                    return reject;
+                }
+                VerticalLayout {
+                    spacing: 0px;
+                    Text { text: "RSH"; font-size: Theme.fs-card; font-weight: 700; color: Theme.text; }
+                    Text { text: "Real Sim Hub"; font-size: Theme.fs-hint; color: Theme.faint; }
                 }
             }
-            // Visible focus ring (compare-fix): the colour change
-            // alone is too subtle to show Tab focus on this link.
-            if fs.has-focus : Rectangle {
-                x: -6px;
-                y: -3px;
-                width: parent.width + 12px;
-                height: parent.height + 6px;
-                border-radius: 6px;
-                border-width: 2px;
-                border-color: Theme.accent-text;
+            NavItem { label: "Overview"; icon: @image-url("../assets/icons/grid.svg"); active: page == 0; clicked => { nav(0); } }
+            // UI-UX polish (a): preview `.lbl` is padding 12px 10px 4px —
+            // the section label sits 12px below the nav item above it and
+            // 4px above the next one. The column gap is 2px, so the row
+            // padding makes up the rest (2+10=12 above, 2+2=4 below).
+            // (x=20: sidebar padding 10 + this 10 — preview `.lbl`
+            // padding-left 10px puts the label over the nav icons.)
+            HorizontalLayout {
+                padding-top: 10px;
+                padding-bottom: 2px;
+                padding-left: 10px;
+                Text { text: "DEVICE"; font-size: Theme.fs-hint; font-weight: 600; color: Theme.faint; }
             }
-            about-ta := TouchArea { mouse-cursor: pointer; clicked => { open-about(); } }
+            NavItem { label: "RSH Wheel"; icon: @image-url("../assets/icons/wheel.svg"); active: page >= 1 && page <= 4; show-dot: connected; clicked => { nav(1); } }
+            SubItem { label: "Steering"; active: page == 1; clicked => { nav(1); } }
+            SubItem { label: "Pedals"; active: page == 2; clicked => { nav(2); } }
+            SubItem { label: "Buttons"; active: page == 3; clicked => { nav(3); } }
+            SubItem { label: "Extras"; active: page == 4; clicked => { nav(4); } }
+            HorizontalLayout {
+                padding-top: 10px;
+                padding-bottom: 2px;
+                padding-left: 10px;
+                Text { text: "APP"; font-size: Theme.fs-hint; font-weight: 600; color: Theme.faint; }
+            }
+            NavItem { label: "Settings"; icon: @image-url("../assets/icons/gear.svg"); active: page == 5 || page == 6; clicked => { nav(5); } }
+            Rectangle { vertical-stretch: 1; }
+            StatusCard {
+                connected: connected;
+                conn-warn: conn-warn;
+                label: conn-label;
+                sub: conn-sub;
+                send-to-game: send-to-game;
+                toggled-send => { toggled-send(); }
+            }
+            Text {
+                horizontal-alignment: center;
+                text: "About";
+                font-size: Theme.fs-hint;
+                color: fs.has-focus || about-ta.has-hover ? Theme.text : Theme.faint;
+                accessible-label: "About";
+                accessible-role: button;
+                // FIX-4: keyboard activation for this text link.
+                // P2-5: the FocusScope + TouchArea extend 4px
+                // above/below the text (see "Open diagnostics").
+                fs := FocusScope {
+                    y: -4px;
+                    width: 100%;
+                    height: parent.height + 8px;
+                    key-pressed(event) => {
+                        if (event.text == Key.Return || event.text == Key.Space) {
+                            open-about();
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+                // Visible focus ring (compare-fix): the colour change
+                // alone is too subtle to show Tab focus on this link.
+                if fs.has-focus : Rectangle {
+                    x: -6px;
+                    y: -3px;
+                    width: parent.width + 12px;
+                    height: parent.height + 6px;
+                    border-radius: 6px;
+                    border-width: 2px;
+                    border-color: Theme.accent-text;
+                }
+                about-ta := TouchArea { y: -4px; width: 100%; height: parent.height + 8px; mouse-cursor: pointer; clicked => { open-about(); } }
+            }
         }
     }
     Rectangle { x: 183px; width: 1px; height: 100%; background: Theme.line; }

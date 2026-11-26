@@ -88,7 +88,11 @@ pub enum HidMaestroStateKind {
     /// install / device create was never attempted.
     ContextUnavailable,
     /// One retry used up — vJoy fallback is in effect until the user
-    /// re-selects this backend.
+    /// re-selects this backend. Retained for the status vocabulary
+    /// (the Output page renders it with a "switched to vJoy"
+    /// banner); `fail()` no longer produces it (P2-5, v2.0.12 scan
+    /// — the retry-budget error maps to `Error`, because on the
+    /// explicit path no fallback happens and the banner lied).
     FallbackToVJoy,
     /// Any other failure (message carries the detail).
     Error,
@@ -266,6 +270,11 @@ impl HidMaestroOutput {
 
     fn connect_inner(&mut self, plan: Option<&PipelinePlan>) -> Result<(), HidMaestroError> {
         let _hello: HelloInfo = self.manager.connect()?;
+        // HID P2-1 (polish round): production `connect` never called
+        // `describe-profile` — the only callers were the stub sidecar
+        // and tests. Verify the descriptor/size before the first
+        // submit so a packing mismatch fails here, not in-game.
+        self.manager.describe_profile()?;
         self.manager.install_driver()?;
         let created: CreateInfo = self.manager.create()?;
         self.capabilities = created.capabilities;
@@ -338,12 +347,24 @@ impl HidMaestroOutput {
                 HidMaestroStateKind::CreateFailed
             }
             HidMaestroError::SidecarDied(_)
-            | HidMaestroError::ReplyTimeout
-            | HidMaestroError::HelloTimeout
+            | HidMaestroError::ReplyTimeout(_)
+            | HidMaestroError::HelloTimeout(_)
             | HidMaestroError::BadHello(_)
             | HidMaestroError::BadReply(_) => HidMaestroStateKind::SidecarFailed,
             HidMaestroError::ContextUnavailable(_) => HidMaestroStateKind::ContextUnavailable,
-            HidMaestroError::FallbackNeeded => HidMaestroStateKind::FallbackToVJoy,
+            // P2-5 (v2.0.12 scan): the retry-budget error is an
+            // `Error`, NOT `FallbackToVJoy` — on the explicit path
+            // no fallback happens (the selector errors and the slot
+            // stays untouched), so the old mapping told the Output
+            // page the backend had "switched to vJoy" when vJoy was
+            // not active at all. The automatic path never shows
+            // this status: its fallback installs vJoy and reports
+            // vJoy `Ready`. The arm stays explicit even though its
+            // body matches the wildcard — it pins this decision, so
+            // a later wildcard change cannot silently re-label the
+            // retry-budget error as a fallback again.
+            #[allow(clippy::match_same_arms)]
+            HidMaestroError::FallbackNeeded => HidMaestroStateKind::Error,
             _ => HidMaestroStateKind::Error,
         };
         self.status = HidMaestroStatus {
@@ -449,27 +470,27 @@ impl IJoystickOutput for HidMaestroOutput {
             self.fail(&err);
             return Err(VJoyError::from(err));
         }
+        // PERF P1-1 (polish round): the 200 Hz tick submits
+        // async — enqueue only, no round-trip wait. A refused
+        // submit surfaces on the next tick via the drained reply;
+        // a dead sidecar is caught by `ensure_alive` above.
         let result = if self.config.use_raw_report {
             build_raw_report(state, &self.current_caps(), &mut self.raw_report);
             let report = self.raw_report;
-            self.manager.submit_raw(&report)
+            self.manager.submit_raw_async(&report)
         } else {
             let frame = build_gamepad_frame(state, &self.current_caps());
-            self.manager.submit(frame)
+            self.manager.submit_async(frame)
         };
-        match result {
-            Ok(_) => {
-                self.refresh_status_after_submit();
-                Ok(())
-            }
-            Err(err) => {
-                // The device is gone (or refused the frame): mark
-                // disconnected so the next try_connect is the retry.
-                // The engine sends neutral and keeps ticking.
-                self.fail(&err);
-                Err(VJoyError::from(err))
-            }
+        if let Err(err) = result {
+            // The device is gone (or refused the frame): mark
+            // disconnected so the next try_connect is the retry.
+            // The engine sends neutral and keeps ticking.
+            self.fail(&err);
+            return Err(VJoyError::from(err));
         }
+        self.refresh_status_after_submit();
+        Ok(())
     }
 
     fn send_neutral(&mut self) -> Result<(), VJoyError> {

@@ -49,8 +49,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rsh_api::{
     ApiTransport, AppApi, AppEvent, ButtonBinding, CalibrationInfo, ConnEvent, ConnectionError,
     ConnectionInfo, ConnectionState, DiagStats, DraftStatus, FirmwareCheck, FirmwareUpdateStatus,
-    GameSummary, ManagerAction, PollState, ProfileSummary, RawMv, SnapshotInfo, TuningSettings,
-    UserError, VjoyStatus, WifiStatus,
+    GameSummary, ManagerAction, PollState, ProfileSummary, RawMv, SlowPollState, SnapshotInfo,
+    TuningSettings, UserError, VjoyStatus, WifiStatus,
 };
 use rsh_app_core::diagnostics::{
     append_startup_log_both, fresh_fatal_daemon_status, install_panic_hook, log_fatal,
@@ -214,6 +214,12 @@ async fn manager_loop(
     let mut last_error: Option<ConnectionError> = None;
     let mut last_reachable = false;
     let mut last_want_escalated = false;
+    // PERF P1-5 (polish round): last snapshot seq already
+    // pushed as an `AppEvent::Snapshot` — the push the UI's
+    // subscribe path consumes, so it can drop its 20 Hz poll to
+    // a 1 Hz fallback. Published at most once per 250 ms tick,
+    // only when the seq actually advanced.
+    let mut last_snapshot_seq: u64 = 0;
     // D6 migration (lazy, per board): board MACs whose legacy
     // device-key entry was already deleted this run — the entry
     // is deleted once, on the first HELLO observed from that
@@ -269,32 +275,23 @@ async fn manager_loop(
                     }
                 }
                 TrayAction::ToggleSend => {
-                    // R3-D-03: the backend switch behind this toggle
-                    // can take up to 60 s (HIDMaestro sidecar spawn
-                    // + UAC dwell) — running it here, on the
-                    // manager-loop task, stalled the 250 ms tick
-                    // (watchdog, retry timer, tray drain) and the
-                    // resume then fired a spurious watchdog rebuild.
-                    // Same `spawn_blocking` fix as `RestartWheel`
-                    // below; the loop awaits the outcome and logs it
-                    // like every other tray action.
+                    // CORE-P2-4 (polish round): the switch behind
+                    // this toggle can take up to 310 s — awaiting
+                    // the `spawn_blocking` join here still suspended
+                    // the manager loop for the whole switch (the old
+                    // comment claimed the move fixed the stall; it
+                    // only moved the work, not the wait). Fire it
+                    // on the blocking pool and return at once; the
+                    // next poll surfaces the applied state.
                     let enabled = !api.output_enabled();
                     let api_clone = Arc::clone(&api);
-                    match tokio::task::spawn_blocking(move || {
+                    tokio::task::spawn_blocking(move || {
                         api_clone.set_output_enabled(enabled);
-                    })
-                    .await
-                    {
-                        Ok(()) => {
-                            log_line(verbose, &format!("tray: Send to game = {enabled}"));
-                        }
-                        Err(error) => {
-                            log_line(
-                                verbose,
-                                &format!("tray: Send to game toggle failed: {error}"),
-                            );
-                        }
-                    }
+                    });
+                    log_line(
+                        verbose,
+                        &format!("tray: Send to game toggle started (target {enabled})"),
+                    );
                 }
                 TrayAction::ProfileSelected(name) => match resolve_profile_id(&api, &name) {
                     Some(id) => match api.state.activate_profile(&id) {
@@ -412,6 +409,14 @@ async fn manager_loop(
             let _ = action;
         }
         last_gate = gate;
+        // PERF P1-5: push the live snapshot when it advanced.
+        // `snapshot()` clones a cheap Arc-backed struct; the seq
+        // check keeps this to one publish per tick at most.
+        let snapshot = api.snapshot();
+        if snapshot.seq != last_snapshot_seq {
+            last_snapshot_seq = snapshot.seq;
+            publish(&event_tx, AppEvent::Snapshot(snapshot));
+        }
         let error = api.state.session_last_error_typed();
         if error != last_error {
             if let Some(reason) = error {
@@ -506,8 +511,24 @@ async fn manager_loop(
                 verbose,
                 "connection: heartbeat watchdog fired — rebuilding transport",
             );
-            let _ = api.state.disconnect_transport();
-            let _ = api.state.connect_transport(TransportKind::Udp);
+            // CORE-P1-1 (polish round): rebuild on the RECORDED
+            // transport, never hard-coded UDP — a USB wheel whose
+            // stream stalls was silently rebuilt on Wi-Fi, rebuilt
+            // 5x and latched WatchdogStall. Errors are logged,
+            // not discarded.
+            let recorded = api.state.transport_request().0;
+            if let Err(error) = api.state.disconnect_transport() {
+                log_line(
+                    verbose,
+                    &format!("connection: watchdog rebuild disconnect failed: {error}"),
+                );
+            }
+            if let Err(error) = api.state.connect_transport(recorded) {
+                log_line(
+                    verbose,
+                    &format!("connection: watchdog rebuild connect ({recorded:?}) failed: {error}"),
+                );
+            }
             publish(&event_tx, connection_changed_event(&api));
         }
         // Backoff retry timer. R3-D-02: ONE loop owns the retry —
@@ -1272,10 +1293,13 @@ async fn serve_ipc(
 const DAEMON_STATUS_FILE: &str = "daemon-status.json";
 
 /// Write `daemon-status.json` (M8/L8): `{"status": "fatal" |
-/// "running" | "degraded", "code": ..., "detail": ..., "pid": ...,
-/// "at_unix": ...}`. `degraded` (P1-4) is the manager-loop watchdog
+/// "running" | "degraded" | "info", "code": ..., "detail": ...,
+/// "pid": ..., "at_unix": ...}`. `degraded` (P1-4) is the manager-loop watchdog
 /// budget exhausting: the daemon keeps serving IPC/tray but the
-/// manager loop is dead. Atomic (temp file in the same directory,
+/// manager loop is dead. `info` (P3-5, v2.0.12 scan) is a
+/// non-fatal note — a second daemon exiting because the first is
+/// still starting — which readers must NOT treat as fatal (the UI
+/// only treats `status == "fatal"` as fatal). Atomic (temp file in the same directory,
 /// then rename). Best effort — a failure is swallowed, never fatal: the
 /// dual-location fatal log is the other channel, and a status
 /// write must never mask the fatal exit itself.
@@ -1473,6 +1497,56 @@ impl DeferredApi {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    /// Starting-values `slow_poll` (pre-install fallback for the
+    /// `slow_poll` forward above): the same composition as the
+    /// trait default, built from this wrapper's starting getters.
+    fn default_slow_poll(&self) -> SlowPollState {
+        SlowPollState {
+            version: self.version(),
+            firmware_version: self.firmware_version(),
+            backend: self.output_backend(),
+            autostart: self.autostart(),
+            board_address: self.board_address(),
+            diag_stats: self.diag_stats().ok(),
+            wifi_status: self.wifi_status(),
+            calibration: self.calibration().ok(),
+            raw_mv: self.raw_mv().ok(),
+            profiles: self.list_profiles(),
+            games: self.list_games(),
+            firmware_check: self.firmware_check().ok(),
+            firmware_update_status: self.firmware_update_status(),
+            vjoy_status: self.vjoy_status().ok(),
+            close_to_tray: self.close_to_tray(),
+            auto_pause: self.auto_pause(),
+            bindings: self.list_bindings(),
+            knobs: self.knob_actions(),
+            draft: self.draft_status(),
+            tunings: {
+                let mut tunings = std::collections::BTreeMap::new();
+                for module in [
+                    "steering",
+                    "throttle",
+                    "brake",
+                    "clutch",
+                    "handbrake",
+                    "led",
+                    "shifter",
+                    "horn",
+                ] {
+                    tunings.insert(module.to_string(), self.get_tuning(module));
+                }
+                tunings
+            },
+            modules: {
+                let mut modules = std::collections::BTreeMap::new();
+                for module in ["handbrake", "shifter", "horn", "led"] {
+                    modules.insert(module.to_string(), self.module_enabled(module));
+                }
+                modules
+            },
+        }
+    }
 }
 
 /// Forward one [`AppApi`] method to the installed [`DaemonApi`]:
@@ -1513,6 +1587,29 @@ impl AppApi for DeferredApi {
     fwd!(value wifi_status() -> WifiStatus = starting_wifi_status());
     fwd!(result set_wifi_password(password: &str, confirm: &str) -> WifiStatus);
     fwd!(result clear_wifi_password() -> WifiStatus);
+    // Bug 2 (v2.0.11 retest, v2.0.12): the game + Wi-Fi + shifter
+    // + long-press + capture methods below MUST be forwarded like
+    // everything else — a method missing here silently falls
+    // through to the TRAIT DEFAULT, and that is not just a startup
+    // gap: the IPC server holds this `DeferredApi` permanently (the
+    // live `DaemonApi` is only ever *installed into* it), so an
+    // un-forwarded method returns the default FOREVER. `add_game`
+    // returned "games are not supported by this API" on every Add
+    // Game click with the daemon fully running — the user saw it
+    // four times (notification ×4). Before install these fail with
+    // `starting_error` ("RSH is still starting"), never the trait
+    // default, and never a silent success.
+    //
+    // Deliberately NOT forwarded: `cache_generation` — its
+    // default `0` IS the documented daemon behaviour, and it is
+    // never dispatched over IPC. `slow_poll` IS forwarded below
+    // (CORE-P2-1 / PERF F-6, polish round): the trait default
+    // re-reads every slow getter fresh on every call, so the
+    // daemon's 5 s / 10 s / 30 s TTL cache never engaged in
+    // production and every ~1 Hz poll paid full disk/DLL probes.
+    fwd!(value scan_rsh_networks() -> Vec<String> = Vec::new());
+    fwd!(result rejoin_wifi_open(ssid: &str) -> WifiStatus);
+    fwd!(result rejoin_wifi(ssid: &str, password: &str) -> WifiStatus);
     fwd!(value snapshot() -> SnapshotInfo = SnapshotInfo::default());
     fwd!(value output_enabled() -> bool = false);
     fwd!(unit set_output_enabled(enabled: bool));
@@ -1531,6 +1628,8 @@ impl AppApi for DeferredApi {
     fwd!(result set_board_address(address: &str) -> String);
     fwd!(value module_enabled(module: &str) -> bool = false);
     fwd!(result set_module_enabled(module: &str, enabled: bool) -> bool);
+    fwd!(result shifter_sensitivity() -> Option<u8>);
+    fwd!(result set_shifter_sensitivity(sensitivity: u8) -> u8);
     fwd!(value auto_pause() -> bool = false);
     fwd!(result set_auto_pause(paused: bool) -> bool);
     fwd!(value close_to_tray() -> bool = true);
@@ -1544,6 +1643,10 @@ impl AppApi for DeferredApi {
     fwd!(result duplicate_profile(id: &str) -> String);
     fwd!(result delete_profile(id: &str) -> bool);
     fwd!(value list_games() -> Vec<GameSummary> = Vec::new());
+    fwd!(result add_game(name: &str, exe_path: &str, profile_id: Option<String>) -> GameSummary);
+    fwd!(result add_game_with_key(name: &str, exe_path: &str, profile_id: Option<String>, idempotency_key: Option<&str>) -> GameSummary);
+    fwd!(result update_game(id: &str, name: &str, exe_path: &str, profile_id: Option<String>) -> GameSummary);
+    fwd!(result remove_game(id: &str) -> bool);
     fwd!(result launch_game(id: &str) -> GameSummary);
     fwd!(result stop_game(id: &str) -> GameSummary);
     fwd!(result game_state(id: &str) -> GameSummary);
@@ -1556,9 +1659,14 @@ impl AppApi for DeferredApi {
     fwd!(result capture_centre() -> u16);
     fwd!(result capture_pedal_min(pedal: &str) -> u16);
     fwd!(result capture_pedal_max(pedal: &str) -> u16);
+    fwd!(result capture_steering_left() -> u16);
+    fwd!(result capture_steering_right() -> u16);
     fwd!(value list_bindings() -> Vec<ButtonBinding> = Vec::new());
     fwd!(result set_binding(button: u8, action: &str) -> ButtonBinding);
     fwd!(result clear_binding(button: u8) -> bool);
+    fwd!(value list_long_press_bindings() -> Vec<ButtonBinding> = Vec::new());
+    fwd!(result set_long_press_binding(button: u8, action: &str) -> ButtonBinding);
+    fwd!(result clear_long_press_binding(button: u8) -> bool);
     fwd!(result rename_profile(id: &str, name: &str) -> String);
     fwd!(result link_profile(id: &str, game_slug: &str) -> String);
     fwd!(result restore_backup() -> String);
@@ -1567,6 +1675,17 @@ impl AppApi for DeferredApi {
     fwd!(result vjoy_status() -> VjoyStatus);
     fwd!(result install_vjoy() -> String);
     fwd!(result diag_stats() -> DiagStats);
+
+    /// CORE-P2-1 / PERF F-6 (polish round): forward `slow_poll`
+    /// to the installed `DaemonApi` so its TTL cache engages; before
+    /// install, fall back to the trait default (which composes the
+    /// starting getters and is correct, just uncached).
+    fn slow_poll(&self) -> SlowPollState {
+        match self.inner() {
+            Some(api) => api.slow_poll(),
+            None => self.default_slow_poll(),
+        }
+    }
 
     /// DS-81: delegate — do NOT fall back to the trait default's
     /// three separate reads, which would undo
@@ -1634,8 +1753,10 @@ fn main() {
         &format!("daemon: elevation: {}", elevation_state()),
     );
     // Round 3 WS-6 (R3-AK-01): a Task-Scheduler respawn
-    // (`--scheduled-respawn`, the "RSH Daemon" task the installer
-    // creates) must stay blocked on the fatal latches — a daemon
+    // (`--scheduled-respawn` — the "RSH Daemon" task the installer
+    // used to create; the task was removed in v2.0.13, P2-1, but
+    // the flag is kept for manual/debug launches) must stay
+    // blocked on the fatal latches — a daemon
     // that died `IpcBindFailed` / `DaemonHung` exits 1 on purpose,
     // and the task's restart-on-failure would otherwise resurrect
     // it in a loop. Exit 0 here: Task Scheduler only restarts on
@@ -1778,20 +1899,29 @@ fn main() {
                     std::process::exit(1);
                 }
                 single_instance::AlreadyRunningVerdict::Starting => {
-                    // No fatal status: the first daemon is still
+                    // No FATAL status: the first daemon is still
                     // starting (its IPC endpoint never appeared in
                     // ~10 s). Exiting 1 without writing `DaemonHung`,
                     // so the UI does not latch a false fatal for a
                     // daemon that is still coming up — the first
                     // daemon will either answer or leave its own
-                    // trace.
-                    log_line(
-                        verbose,
-                        &format!(
-                            "daemon: already running (pid {pid:?}) but its IPC endpoint never appeared after {} tries — the first daemon is still starting; not declaring it hung, not taking over",
-                            single_instance::PING_ATTEMPTS
-                        ),
+                    // trace. P3-5 (v2.0.12 scan): the exit used to
+                    // be silent (UI-spawned daemons dying ~11 s
+                    // after spawn left no trace — the UI spawn path
+                    // discards stdio), so write a NON-FATAL `info`
+                    // status instead: the UI only treats
+                    // `status == "fatal"` as fatal
+                    // (`read_daemon_status` / `fresh_fatal_daemon_status`),
+                    // so this can never latch a false fatal — but a
+                    // user-PC repro now has a timestamped, PID-named
+                    // record of the duplicate-spawn exit in
+                    // `daemon-status.json`.
+                    let detail = format!(
+                        "already running (pid {pid:?}) but its IPC endpoint never appeared after {} tries — the first daemon is still starting; not declaring it hung, not taking over (second-instance exit)",
+                        single_instance::PING_ATTEMPTS
                     );
+                    write_daemon_status(&data_dir, "info", "SecondInstanceStarting", &detail);
+                    log_line(verbose, &format!("daemon: {detail}"));
                     std::process::exit(1);
                 }
             }
@@ -3304,6 +3434,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// P3-5 (v2.0.12 scan): the second-instance `Starting` exit
+    /// writes a non-fatal `info` status (same writer, same shape)
+    /// so the ~11 s duplicate-spawn death leaves a trace — and the
+    /// vocabulary is exactly what the UI's fatal reader ignores
+    /// (`status == "fatal"` only).
+    #[test]
+    fn daemon_status_info_round_trip() {
+        let dir = temp_dir("status-info");
+        write_daemon_status(
+            &dir,
+            "info",
+            "SecondInstanceStarting",
+            "already running (pid 1234) but its IPC endpoint never appeared — second-instance exit",
+        );
+        let path = dir.join(DAEMON_STATUS_FILE);
+        assert!(path.is_file(), "the info status file is written");
+        let text = std::fs::read_to_string(&path).expect("read status");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("status is valid JSON");
+        assert_eq!(value["status"], "info");
+        assert_eq!(value["code"], "SecondInstanceStarting");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn ui_quit_request_file_is_written() {
         let dir = temp_dir("ui-quit");
@@ -3529,5 +3682,151 @@ mod tests {
             now
         ));
         assert!(tray_theme_stale(Some(ago(Duration::from_secs(5))), now));
+    }
+
+    /// Bug 2 (v2.0.11 retest, v2.0.12): `DeferredApi` is the
+    /// `Arc<dyn AppApi>` the IPC server holds permanently — the live
+    /// `DaemonApi` is only ever installed INTO it — so a game method
+    /// it does not forward falls through to the trait default
+    /// ("games are not supported by this API") on EVERY Add Game
+    /// click, daemon fully running or not. This test drives
+    /// `add_game` through the installed `DeferredApi` over a real
+    /// `DaemonApi` with NO board ever connected (temp data dir):
+    /// the add must succeed — games are local data, the board is
+    /// irrelevant — and a same-key retry must return the same entry
+    /// instead of duplicating it.
+    #[test]
+    fn deferred_api_forwards_game_methods_after_install() {
+        let dir = temp_dir("deferred-games");
+        let state =
+            Arc::new(AppStateCore::open_with_null_sink(&dir).expect("open state with null sink"));
+        let live = Arc::new(DaemonApi::new(state));
+        let deferred = DeferredApi::new();
+        deferred.install(Arc::clone(&live));
+
+        let added = deferred
+            .add_game("Race", r"C:\race.exe", None)
+            .expect("add_game through the installed DeferredApi must succeed");
+        assert_eq!(added.name, "Race");
+        assert_eq!(deferred.list_games().len(), 1, "one game listed");
+
+        // P1-3: a retry carrying the same idempotency key returns
+        // the already-created entry — no duplicate.
+        let retry = deferred
+            .add_game_with_key("Race", r"C:\race.exe", None, Some("dialog-1"))
+            .expect("first keyed add must succeed");
+        let replay = deferred
+            .add_game_with_key("Race", r"C:\race.exe", None, Some("dialog-1"))
+            .expect("same-key retry must return the existing entry");
+        assert_eq!(retry.id, replay.id, "same key returns the same entry");
+        assert_eq!(
+            deferred.list_games().len(),
+            2,
+            "keyed add is a second entry; the retry adds none"
+        );
+
+        let updated = deferred
+            .update_game(&added.id, "Race 2", r"C:\race2.exe", None)
+            .expect("update_game through the installed DeferredApi must succeed");
+        assert_eq!(updated.name, "Race 2");
+        assert!(
+            deferred
+                .remove_game(&added.id)
+                .expect("remove_game through the installed DeferredApi must succeed"),
+            "remove reports true"
+        );
+        assert!(deferred.list_games().iter().all(|g| g.id != added.id));
+    }
+
+    /// Bug 2 (v2.0.12): before install the forwarded game methods
+    /// fail with the honest "still starting" error — never the
+    /// trait default ("games are not supported by this API"), and
+    /// never a silent success. The same holds for the sibling
+    /// forwards (Wi-Fi rejoin, steering capture). (The reason
+    /// travels in `UserError::detail` — `what_happened` is the
+    /// generic "Something went wrong." for `Unknown` — so the
+    /// assertions read `detail`, the same field the IPC error
+    /// payload and the UI's game dialog show.)
+    #[test]
+    fn deferred_api_game_methods_fail_starting_before_install() {
+        fn reason(err: &UserError) -> String {
+            err.detail.clone().unwrap_or_default()
+        }
+        let deferred = DeferredApi::new();
+        let err = deferred
+            .add_game("Race", r"C:\race.exe", None)
+            .expect_err("add_game before install must fail");
+        assert!(
+            reason(&err).contains("still starting"),
+            "before install the error must say starting, got: {}",
+            reason(&err)
+        );
+        assert!(
+            !reason(&err).contains("not supported by this API"),
+            "the trait default must never surface, got: {}",
+            reason(&err)
+        );
+        let err = deferred
+            .add_game_with_key("Race", r"C:\race.exe", None, Some("dialog-1"))
+            .expect_err("add_game_with_key before install must fail");
+        assert!(reason(&err).contains("still starting"));
+        assert!(
+            deferred
+                .update_game("nope", "Race", r"C:\race.exe", None)
+                .is_err(),
+            "update before install must fail"
+        );
+        assert!(
+            deferred.remove_game("nope").is_err(),
+            "remove before install must fail"
+        );
+        assert!(
+            reason(
+                &deferred
+                    .rejoin_wifi_open("RSH-1234")
+                    .expect_err("rejoin before install must fail")
+            )
+            .contains("still starting"),
+            "wifi rejoin before install must say starting"
+        );
+        assert!(
+            reason(
+                &deferred
+                    .capture_steering_left()
+                    .expect_err("capture before install must fail")
+            )
+            .contains("still starting"),
+            "steering capture before install must say starting"
+        );
+        assert!(
+            deferred.scan_rsh_networks().is_empty(),
+            "scan before install answers the starting value (empty)"
+        );
+    }
+
+    /// Bug 2 sibling (v2.0.12): after install a steering capture
+    /// reaches the live daemon — with no wheel data it fails with
+    /// the daemon's REAL reason (no live reading), never the trait
+    /// default ("steering capture is not supported by this API").
+    #[test]
+    fn deferred_api_forwards_capture_after_install() {
+        let dir = temp_dir("deferred-capture");
+        let state =
+            Arc::new(AppStateCore::open_with_null_sink(&dir).expect("open state with null sink"));
+        let live = Arc::new(DaemonApi::new(state));
+        let deferred = DeferredApi::new();
+        deferred.install(Arc::clone(&live));
+        let err = deferred
+            .capture_steering_left()
+            .expect_err("capture with no wheel data must fail");
+        let detail = err.detail.clone().unwrap_or_default();
+        assert!(
+            !detail.contains("not supported by this API"),
+            "the trait default must never surface, got: {detail}"
+        );
+        assert!(
+            !detail.is_empty(),
+            "the failure must carry the daemon's real reason, not an empty detail"
+        );
     }
 }

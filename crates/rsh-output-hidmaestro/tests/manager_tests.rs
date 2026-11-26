@@ -187,8 +187,16 @@ fn silent_sidecar_hello_times_out() {
     let mut cfg = config(&[("HM_STUB_SILENT", "1")]);
     cfg.spawn_timeout = Duration::from_millis(200);
     let mut m = SidecarManager::new(cfg);
-    let err = m.connect().unwrap_err();
-    assert!(matches!(err, HidMaestroError::HelloTimeout));
+    // P1-1 (v2.0.12 scan): the timeout carries the enriched
+    // diagnostic (bound + elapsed ms), not the bare unit variant.
+    let HidMaestroError::HelloTimeout(detail) = m.connect().unwrap_err() else {
+        panic!("expected HelloTimeout");
+    };
+    assert!(
+        detail.contains("did not answer hello within"),
+        "detail: {detail}"
+    );
+    assert!(detail.contains("after spawn"), "detail: {detail}");
     m.shutdown(); // kills the lingering silent stub
 }
 
@@ -451,7 +459,14 @@ fn slow_sidecar_reply_times_out() {
     let mut m = SidecarManager::new(cfg);
     m.connect().unwrap();
     let err = m.request(&Command::Ping).unwrap_err();
-    assert!(matches!(err, HidMaestroError::ReplyTimeout));
+    // HID path sweep (v2.0.12): the timeout carries the enriched
+    // diagnostic — the bound that was hit plus the ms since the
+    // last reply — so the daemon log can tell a hung sidecar from
+    // a crashed one (on Windows the PID + exit code ride along).
+    assert!(
+        matches!(&err, HidMaestroError::ReplyTimeout(message) if message.contains("50ms") && message.contains("since last reply")),
+        "expected an enriched ReplyTimeout, got {err:?}"
+    );
     assert!(!m.is_running());
 }
 

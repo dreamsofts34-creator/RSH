@@ -29,6 +29,12 @@
 #include <stddef.h>
 #include <string.h>
 
+// F-19 (polish round): address FIXED 0x48 hai (ADDR pin GND). ADDR HIGH
+// (0x49) wala board kabhi nahi dikhega — koi config knob nahi, koi
+// alternate address scan nahi. Wiring guide / PC builder bhi yahi mante
+// hain. 4-channel round-robin 20 ms cadence par har axis 80 ms mein
+// refresh hota hai (12.5 Hz/axis) — pedals ke liye theek hai; GET_CAPS
+// capsFlags bit0 ("slow axis") app ko batata hai.
 #define RSH_ADS1115_I2C_ADDR 0x48  // fixed (PC builder addr 0x48 set karta hai)
 #define RSH_ADS1115_REG_CONV   0x00
 #define RSH_ADS1115_REG_CONFIG 0x01

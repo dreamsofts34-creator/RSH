@@ -117,11 +117,18 @@ pub const SIDECAR_EXE_NAME: &str = "RshCoreHiDcr";
 /// hello whose `protocol` is newer than this.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Environment variable carrying the loopback token to the sidecar
-/// (C-TOK-1 — the token is NEVER on the command line; argv is
-/// world-readable via WMI / Process Explorer). Set by the manager
-/// just for the elevated spawn; read by the sidecar at startup.
-pub const SIDECAR_TOKEN_ENV: &str = "RSH_HM_SIDECAR_TOKEN";
+/// The loopback token is NOT carried in an environment variable
+/// (v2.0.12, H1 — PROVEN on the owner's PC): a non-elevated daemon
+/// launches the elevated sidecar via `runas`, and AIS builds a FRESH
+/// environment for the elevated child, dropping any runtime-set
+/// variable — so the sidecar logged `bad-args` and exited 2 before
+/// connecting. The manager now passes the one-time nonce on the
+/// command line (`--token <nonce>`, see [`manager`]); it is
+/// single-use random and briefly visible in the process list / WMI —
+/// accepted. It is never logged anywhere (presence only, never the
+/// value). There is deliberately no `SIDECAR_TOKEN_ENV` constant
+/// anymore — do not reintroduce an env transport.
+pub const SIDECAR_TOKEN_ARG: &str = "--token";
 
 /// Environment variable overriding the sidecar path (dev/tests only).
 pub const SIDECAR_PATH_ENV: &str = "RSH_HM_SIDECAR";

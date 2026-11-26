@@ -15,6 +15,18 @@ use serde::{Serialize, Serializer};
 
 /// Samples kept per p99 tracker.
 pub const P99_CAPACITY: usize = 256;
+
+/// Process-local millisecond clock for the p99 cache (PERF P1-3).
+fn p99_cache_now_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let ms = EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis();
+    // Process uptime in ms fits u64 for ~584M years; saturate
+    // rather than truncate the u128.
+    u64::try_from(ms).unwrap_or(u64::MAX)
+}
 /// Packets in the loss sliding window (D8).
 pub const LOSS_WINDOW: usize = 1000;
 
@@ -22,6 +34,13 @@ pub const LOSS_WINDOW: usize = 1000;
 ///
 /// [`Serialize`] emits the current p99 value (`null` while unmeasured),
 /// not the raw sample buffer.
+///
+/// The sort itself stays uncached here on purpose: `Cell` is not
+/// `Copy`, so a cache field would break this type's `Copy` (and
+/// `EngineMetrics`'s). The caching lives one level up, in
+/// [`EngineMetrics::cached_p99s`] (PERF P1-3) — the 200 Hz
+/// `ingest_frame` path uses that; this direct `p99()` is the
+/// slow-path / serde read.
 #[derive(Clone, Copy, Debug)]
 pub struct P99Tracker {
     /// Ring buffer of samples (µs).
@@ -222,6 +241,14 @@ pub struct EngineMetrics {
     pub seq_gap: u64,
     /// `txFail` counter passed through from the latest status packet.
     pub tx_fail: u64,
+    /// Cached p99 triple (PERF P1-3): (`computed_at_ms`, jitter, output
+    /// latency, e2e) — all `Copy`, so `EngineMetrics` stays `Copy`.
+    /// `0` = never computed. Skipped by serde (it is a cache, not a
+    /// measurement). Recomputed at most every 100 ms by
+    /// [`EngineMetrics::cached_p99s`]; a stale-by-≤100 ms p99 is fine
+    /// for the diagnostics that read it at ≤20 Hz.
+    #[serde(skip)]
+    cached_p99s: (u64, Option<u64>, Option<u64>, Option<u64>),
 }
 
 impl EngineMetrics {
@@ -235,6 +262,7 @@ impl EngineMetrics {
             packet_loss: LossWindow::new(),
             seq_gap: 0,
             tx_fail: 0,
+            cached_p99s: (0, None, None, None),
         }
     }
 
@@ -273,6 +301,27 @@ impl EngineMetrics {
     pub fn update_status_counters(&mut self, seq_gap: u64, tx_fail: u64) {
         self.seq_gap = seq_gap;
         self.tx_fail = tx_fail;
+    }
+
+    /// The three p99s, cached (PERF P1-3): the three 256-sample
+    /// sorts run at most once per 100 ms (10 Hz) instead of on every
+    /// 200 Hz `ingest_frame` tick (~14 µs/tick → ~0.1–0.2 µs/tick
+    /// amortized). Callers on the hot path use this; the plain
+    /// `*_p99()` accessors below stay exact for tests / slow paths.
+    #[must_use]
+    pub fn cached_p99s(&mut self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        let now_ms = p99_cache_now_ms();
+        let (at, jitter, output, e2e) = self.cached_p99s;
+        if at != 0 && now_ms.saturating_sub(at) < 100 {
+            return (jitter, output, e2e);
+        }
+        let fresh = (
+            self.inter_arrival_jitter_p99_us.p99(),
+            self.output_latency_p99_us.p99(),
+            self.e2e_latency_p99_us.p99(),
+        );
+        self.cached_p99s = (now_ms, fresh.0, fresh.1, fresh.2);
+        fresh
     }
 
     /// Inter-arrival jitter p99 (µs), [`None`] while unmeasured.

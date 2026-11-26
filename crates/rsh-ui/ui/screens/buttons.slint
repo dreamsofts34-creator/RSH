@@ -46,6 +46,16 @@ component ButtonTile inherits Rectangle {
             return reject;
         }
     }
+    // P1-4: visible 2px focus ring (Switch pattern).
+    if fs.has-focus : Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: 12px;
+        border-width: 2px;
+        border-color: Theme.accent-text;
+    }
     VerticalLayout {
         padding-top: 9px; padding-bottom: 9px; padding-left: 10px; padding-right: 10px;
         spacing: 2px;
@@ -196,27 +206,28 @@ component ActionChip inherits Rectangle {
 component ActionChipGrid inherits VerticalLayout {
     in property <string> current;
     callback picked(string);
-    spacing: 5px;
+    // P3-1: 4px spacing (was 5px) — the token grid is 4/8/12/16.
+    spacing: 4px;
     HorizontalLayout {
-        spacing: 5px;
+        spacing: 4px;
         ActionChip { horizontal-stretch: 1; label: "Gear 1"; active: "Gear 1" == current; clicked => { picked("Gear 1"); } }
         ActionChip { horizontal-stretch: 1; label: "Gear 2"; active: "Gear 2" == current; clicked => { picked("Gear 2"); } }
         ActionChip { horizontal-stretch: 1; label: "Gear 3"; active: "Gear 3" == current; clicked => { picked("Gear 3"); } }
     }
     HorizontalLayout {
-        spacing: 5px;
+        spacing: 4px;
         ActionChip { horizontal-stretch: 1; label: "Gear 4"; active: "Gear 4" == current; clicked => { picked("Gear 4"); } }
         ActionChip { horizontal-stretch: 1; label: "Gear 5"; active: "Gear 5" == current; clicked => { picked("Gear 5"); } }
         ActionChip { horizontal-stretch: 1; label: "Gear 6"; active: "Gear 6" == current; clicked => { picked("Gear 6"); } }
     }
     HorizontalLayout {
-        spacing: 5px;
+        spacing: 4px;
         ActionChip { horizontal-stretch: 1; label: "Shift up"; active: "Shift up" == current; clicked => { picked("Shift up"); } }
         ActionChip { horizontal-stretch: 1; label: "Shift down"; active: "Shift down" == current; clicked => { picked("Shift down"); } }
         ActionChip { horizontal-stretch: 1; label: "Horn"; active: "Horn" == current; clicked => { picked("Horn"); } }
     }
     HorizontalLayout {
-        spacing: 5px;
+        spacing: 4px;
         ActionChip { horizontal-stretch: 1; label: "Handbrake"; active: "Handbrake" == current; clicked => { picked("Handbrake"); } }
         ActionChip { horizontal-stretch: 1; label: "Not set"; active: "Not set" == current; clicked => { picked("Not set"); } }
         Rectangle { horizontal-stretch: 1; }
@@ -322,6 +333,8 @@ export component ButtonsPage inherits HorizontalLayout {
     // its BindingOp job (9) or ProfileOp save (8) runs; Cancel while
     // its ProfileOp discard (8) runs.
     in property <int> busy-kind: -1;
+    // P2-11: the "Unsaved changes" line, like Steering.
+    in property <bool> unsaved: false;
 
     callback tile-selected(int);
     callback knob-selected(int);
@@ -350,6 +363,8 @@ export component ButtonsPage inherits HorizontalLayout {
             padding-top: 16px; padding-bottom: 16px; padding-left: 20px;
             spacing: 12px;
             alignment: start;
+            // P2-11: "Unsaved changes" at the top, like Steering.
+            if unsaved : Text { text: "Unsaved changes"; font-size: Theme.fs-hint; color: Theme.warn; }
             // wheel buttons card
             // wheel buttons card
             Card {

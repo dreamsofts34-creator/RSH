@@ -648,28 +648,54 @@ impl AppApi for DaemonApi {
         // persisted the flag — a backend activation/connect failure
         // was invisible, and the toggle did not survive a restart
         // (`settings().output_enabled` is the persisted source the
-        // UI polls on the next `poll`). Now: a failure in the
-        // applied state is noted in the engine detail (which the
-        // diagnostics surface), the flag is persisted, and a persist
-        // failure is logged + noted and reverts the in-memory toggle
-        // so the engine and the polled flag agree.
+        // UI polls on the next `poll`). P1-1 (v2.0.12 scan): persist
+        // the APPLIED state, not the requested one — the core only
+        // reports the toggle ON once a backend actually connects,
+        // so persisting the request would re-arm the lie on the
+        // next poll (and `set_settings_patch` below would re-run
+        // the failed activation, since the in-memory flag and the
+        // persisted value disagree). A failure in the applied state
+        // is noted in the engine detail (which the diagnostics
+        // surface).
+        let before = self.state.settings().output_enabled;
         let applied = self.state.set_output_enabled(enabled);
         if applied.detail.contains("failed") {
             self.state
                 .note_engine_detail(format!("output enable failed: {}", applied.detail));
         }
+        let applied_enabled = applied.enabled.unwrap_or(enabled);
         let patch = AppSettingsPatch {
-            output_enabled: Some(enabled),
+            output_enabled: Some(applied_enabled),
             ..Default::default()
         };
-        if let Err(error) = self.state.set_settings_patch(patch) {
+        // CORE-P3-9 (polish round): one retry on persist failure —
+        // the disable path used to leave `output_enabled=true`
+        // persisted while memory said OFF, so the next launch
+        // re-enabled output from the stale setting.
+        let patch_result = self.state.set_settings_patch(patch).or_else(|_| {
+            self.state.set_settings_patch(AppSettingsPatch {
+                output_enabled: Some(applied_enabled),
+                ..Default::default()
+            })
+        });
+        if let Err(error) = patch_result {
             // R3-D-16: into the diagnostics log, not stderr — the
             // persisted setting is already noted there too, so the
             // failure is visible in the log file either way.
             self.state.note_engine_detail(format!(
                 "output setting could not be saved ({error}) — the toggle was reverted"
             ));
-            let _ = self.state.set_output_enabled(!enabled);
+            // Revert the in-memory toggle so the engine and the
+            // polled flag agree — but only when the revert is a
+            // disable. Re-enabling here would re-run an activation
+            // that just failed or was refused (and count another
+            // storm-guard strike); a refused enable already leaves
+            // the in-memory flag OFF, which is the honest state —
+            // the persisted value just stays stale until the next
+            // successful save heals it.
+            if before != applied_enabled && !before {
+                let _ = self.state.set_output_enabled(false);
+            }
         }
     }
 
@@ -735,14 +761,12 @@ impl AppApi for DaemonApi {
     }
 
     fn set_autostart(&self, enabled: bool) -> Result<bool, UserError> {
-        let mut settings = self.state.settings();
-        settings.autostart = enabled;
-        let saved = self
-            .state
-            .set_settings(settings)
-            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))?;
-        // Sync the Windows Run key / Linux .desktop entry right away
-        // so the toggle takes effect without a daemon restart.
+        // CORE-P3-2 (polish round): sync the Run key FIRST, then
+        // persist — the old order persisted the flag and then failed
+        // the sync, leaving Settings showing ON with no autostart.
+        // A persist failure after a successful sync rolls the key
+        // back to the old value (best-effort).
+        let before = self.state.settings().autostart;
         let exe = std::env::current_exe().map_err(|detail| {
             UserError::from_connection(
                 ConnectionError::Unknown,
@@ -751,7 +775,15 @@ impl AppApi for DaemonApi {
         })?;
         crate::tray_autostart::sync_autostart(enabled, &exe)
             .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))?;
-        Ok(saved.autostart)
+        let mut settings = self.state.settings();
+        settings.autostart = enabled;
+        match self.state.set_settings(settings) {
+            Ok(saved) => Ok(saved.autostart),
+            Err(detail) => {
+                let _ = crate::tray_autostart::sync_autostart(before, &exe);
+                Err(UserError::from_connection(ConnectionError::Unknown, detail))
+            }
+        }
     }
 
     fn firmware_version(&self) -> String {
@@ -1745,13 +1777,24 @@ mod tests {
         // polls `settings().output_enabled`, so a restart reverted
         // it and a persist failure was invisible. Now the flag is
         // persisted, and the polled value agrees with the toggle.
+        // P1-1 (v2.0.12 scan): the persisted value is the APPLIED
+        // state, not the request — on this Linux test box no real
+        // backend can connect (the NullSink's `try_connect` always
+        // fails), so the enable honestly fails and the persisted
+        // flag is OFF. The old assertion (enable persists `true`)
+        // only passed because the flag lied about a failed enable.
+        // The invariant is agreement: the polled value matches the
+        // toggle. The ON-persist half is covered in app-core
+        // (`recording_backend_actuation_is_real` asserts the
+        // successful enable reports `Some(true)`); the daemon layer
+        // cannot inject a connecting backend on Linux.
         let (api, _dir) = live_api_named("output-persist");
         api.set_output_enabled(true);
         assert!(
-            api.state.settings().output_enabled,
-            "the toggle must persist"
+            !api.state.settings().output_enabled,
+            "a failed enable must persist OFF, not the requested ON"
         );
-        assert!(api.output_enabled());
+        assert!(!api.output_enabled());
         api.set_output_enabled(false);
         assert!(
             !api.state.settings().output_enabled,

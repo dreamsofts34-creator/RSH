@@ -158,60 +158,77 @@ impl SerialDecoder {
     /// Feed bytes; returns every complete, valid frame decoded from
     /// the stream so far. Invalid frames are dropped and counted.
     pub fn feed(&mut self, data: &[u8]) -> Vec<SerialFrame> {
-        self.buf.extend_from_slice(data);
         let mut frames = Vec::new();
+        self.feed_into(data, &mut frames);
+        frames
+    }
+
+    /// Feed bytes into a caller-provided frame buffer (PERF P3-2,
+    /// polish round): the production reader loops reuse one `Vec`
+    /// instead of allocating a fresh one per `read()`. The parse
+    /// itself uses an offset cursor over `self.buf` and compacts the
+    /// buffer once at the end — the old code `drain()`ed (memmoved)
+    /// the remaining bytes after EVERY frame.
+    pub fn feed_into(&mut self, data: &[u8], frames: &mut Vec<SerialFrame>) {
+        self.buf.extend_from_slice(data);
+        let mut start = 0usize;
         loop {
-            // Scan for the magic.
-            let Some(start) = find_magic(&self.buf) else {
+            // Scan for the magic from the cursor.
+            let Some(rel) = find_magic(&self.buf[start..]) else {
                 // Keep at most the last 3 bytes — a magic split across feeds.
-                let keep = self.buf.len().min(3);
-                let dropped = self.buf.len() - keep;
+                let keep = self.buf.len().saturating_sub(start).min(3);
+                let dropped = self.buf.len() - start - keep;
                 self.dropped_bad_magic += dropped as u64;
-                self.buf.drain(..dropped);
+                start = self.buf.len() - keep;
                 break;
             };
-            if start > 0 {
-                self.dropped_bad_magic += start as u64;
-                self.buf.drain(..start);
+            if rel > 0 {
+                // Garbage before the magic is dropped and counted.
+                self.dropped_bad_magic += rel as u64;
+                start += rel;
             }
-            if self.buf.len() < SERIAL_HEADER_LEN {
+            let remaining = self.buf.len() - start;
+            if remaining < SERIAL_HEADER_LEN {
                 break; // header incomplete — wait for more bytes
             }
-            let Some(kind) = SerialKind::from_u8(self.buf[4]) else {
+            let Some(kind) = SerialKind::from_u8(self.buf[start + 4]) else {
                 self.dropped_bad_length += 1;
-                self.buf.drain(..1);
+                start += 1;
                 continue;
             };
-            let len = u16::from_le_bytes([self.buf[5], self.buf[6]]) as usize;
+            let len = u16::from_le_bytes([self.buf[start + 5], self.buf[start + 6]]) as usize;
             if len > MAX_SERIAL_PAYLOAD {
                 self.dropped_bad_length += 1;
-                self.buf.drain(..1);
+                start += 1;
                 continue;
             }
             let total = SERIAL_HEADER_LEN + len + 2;
-            if self.buf.len() < total {
+            if remaining < total {
                 // Guard against an unbounded buffer: a declared frame can
                 // never exceed MAX_SERIAL_FRAME_LEN.
                 if self.buf.len() > MAX_SERIAL_FRAME_LEN {
                     self.dropped_bad_length += 1;
-                    self.buf.drain(..1);
+                    start += 1;
                     continue;
                 }
                 break; // frame incomplete — wait for more bytes
             }
-            let frame_bytes = &self.buf[..total];
+            let frame_bytes = &self.buf[start..start + total];
             if !verify_crc16_trailer(frame_bytes) {
                 self.dropped_bad_crc += 1;
-                self.buf.drain(..1);
+                start += 1;
                 continue;
             }
             frames.push(SerialFrame {
                 kind,
                 payload: frame_bytes[SERIAL_HEADER_LEN..SERIAL_HEADER_LEN + len].to_vec(),
             });
-            self.buf.drain(..total);
+            start += total;
         }
-        frames
+        // One compaction per feed.
+        if start > 0 {
+            self.buf.drain(..start);
+        }
     }
 
     /// Total dropped frames/bytes across all reasons.

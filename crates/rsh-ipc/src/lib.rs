@@ -58,9 +58,8 @@ pub enum IpcError {
     /// The method is unknown on this server.
     UnknownMethod(String),
     /// The daemon API call itself failed (carries the `UserError`
-    /// code first — `"{code}: {message}"`, where `{message}` is the
-    /// displayable reason for `set_output_backend` and empty for the
-    /// methods that still map to the bare code; see
+    /// code first — `"{code}|{detail}"` via `detailed_api_error`,
+    /// or `"{code}: {message}"` for `set_output_backend`; see
     /// [`IpcClient::call_once`](crate::client::IpcClient::call_once)
     /// and `daemon_connect_error` in the UI for the parse).
     Api(String),
@@ -286,22 +285,31 @@ pub fn dispatch(
         "connection" => Ok(serde_json::to_value(api.connection())
             .map_err(|e| IpcError::Protocol(e.to_string()))?),
         "connect" => {
+            // CORE-P3-6 (polish round): an unknown transport string
+            // used to silently mean Wi-Fi — a typo connected over
+            // the wrong transport and failed later as "wheel not
+            // found" instead of erroring at the call.
             let transport = match params
                 .get("transport")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("wifi")
             {
                 "usb" => ApiTransport::Usb,
-                _ => ApiTransport::Wifi,
+                "wifi" => ApiTransport::Wifi,
+                other => {
+                    return Err(IpcError::Api(format!(
+                        "Protocol|unknown transport '{other}' (want usb or wifi)"
+                    )));
+                }
             };
             api.connect(transport)
                 .map(|info| serde_json::to_value(info).unwrap_or(serde_json::Value::Null))
-                .map_err(|e| IpcError::Api(e.code))
+                .map_err(|e| detailed_api_error(&e))
         }
         "disconnect" => api
             .disconnect()
             .map(|info| serde_json::to_value(info).unwrap_or(serde_json::Value::Null))
-            .map_err(|e| IpcError::Api(e.code)),
+            .map_err(|e| detailed_api_error(&e)),
         "wifi_status" => Ok(serde_json::to_value(api.wifi_status())
             .map_err(|e| IpcError::Protocol(e.to_string()))?),
         "snapshot" => {
@@ -324,10 +332,7 @@ pub fn dispatch(
         }
         "output_enabled" => Ok(serde_json::json!({"enabled": api.output_enabled()})),
         "set_output_enabled" => {
-            let enabled = params
-                .get("enabled")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let enabled = parse_bool_param(params, "enabled")?;
             api.set_output_enabled(enabled);
             Ok(serde_json::json!({"enabled": api.output_enabled()}))
         }
@@ -350,7 +355,7 @@ pub fn dispatch(
                 .map_err(|e| IpcError::Protocol(e.to_string()))?;
             api.set_tuning(&tuning)
                 .map(|stored| serde_json::to_value(stored).unwrap_or(serde_json::Value::Null))
-                .map_err(|e| IpcError::Api(e.code))
+                .map_err(|e| detailed_api_error(&e))
         }
         // SH1: shifter sensitivity is a board-config value, not a
         // `set_tuning` field — the read returns `{"sensitivity":
@@ -383,7 +388,7 @@ pub fn dispatch(
         "save_draft" => api
             .save_draft()
             .map(|saved| serde_json::json!({"saved": saved}))
-            .map_err(|e| IpcError::Api(e.code)),
+            .map_err(|e| detailed_api_error(&e)),
         "discard_draft" => Ok(serde_json::json!({"discarded": api.discard_draft()})),
         // v2.0.1 hotfix: Settings toggles/buttons (autostart,
         // firmware check, backend radio, backup) had no API before.
@@ -592,14 +597,28 @@ fn parse_binding_button(params: &serde_json::Value) -> Result<u8, IpcError> {
         })
 }
 
+/// Require a boolean param (CORE-P2-5, polish round): a missing
+/// or non-boolean param used to silently default to `false` — so a
+/// malformed `set_output_enabled` DISABLED output instead of
+/// erroring. Same stable `code|detail` shape as the other parsers.
+fn parse_bool_param(params: &serde_json::Value, name: &str) -> Result<bool, IpcError> {
+    params
+        .get(name)
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| IpcError::Api(format!("Protocol|{name} must be a boolean")))
+}
+
 /// Map a [`UserError`](rsh_api::UserError) to an IPC error that
 /// keeps the reason: [`IpcError::Api`] otherwise carries only the
 /// code, so a failed call would reach the UI as a bare "Unknown"
 /// with the real reason lost. The payload is `code|detail` (the
-/// detail never contains `|`); the UI splits it back out. The
-/// capture and binding methods use this, as do the shifter
-/// sensitivity methods — every other method keeps the existing
-/// code-only mapping.
+/// detail never contains `|`); the UI splits it back out. Every
+/// fallible dispatch arm uses this (P1-2, v2.0.12 scan — the
+/// seventeen code-only arms dropped `detail`, so e.g. a failed
+/// Connect reached the UI as bare `Unknown` instead of the
+/// daemon's reason); the only exceptions are the arms that build
+/// their own `code|detail`-shaped payload (`set_output_backend`,
+/// `"{code}: {reason}"`, and the `InvalidButton` literal).
 fn detailed_api_error(error: &rsh_api::UserError) -> IpcError {
     let mut body = error.code.clone();
     body.push('|');
@@ -716,30 +735,21 @@ fn dispatch_round3(
                 .get("module")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
-            let enabled = params
-                .get("enabled")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let enabled = parse_bool_param(params, "enabled")?;
             api.set_module_enabled(module, enabled)
                 .map(|new_state| serde_json::json!({"enabled": new_state}))
                 .map_err(|error| detailed_api_error(&error))
         }
         "auto_pause" => Ok(serde_json::json!({"paused": api.auto_pause()})),
         "set_auto_pause" => {
-            let paused = params
-                .get("paused")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let paused = parse_bool_param(params, "paused")?;
             api.set_auto_pause(paused)
                 .map(|new_state| serde_json::json!({"paused": new_state}))
                 .map_err(|error| detailed_api_error(&error))
         }
         "close_to_tray" => Ok(serde_json::json!({"close_to_tray": api.close_to_tray()})),
         "set_close_to_tray" => {
-            let enabled = params
-                .get("enabled")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let enabled = parse_bool_param(params, "enabled")?;
             api.set_close_to_tray(enabled)
                 .map(|new_state| serde_json::json!({"close_to_tray": new_state}))
                 .map_err(|error| detailed_api_error(&error))
@@ -814,19 +824,19 @@ fn dispatch_calibration_vjoy_diag(
         "calibration" => api
             .calibration()
             .map(|info| serde_json::to_value(info).unwrap_or(serde_json::Value::Null))
-            .map_err(|e| IpcError::Api(e.code)),
+            .map_err(|e| detailed_api_error(&e)),
         "vjoy_status" => api
             .vjoy_status()
             .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null))
-            .map_err(|e| IpcError::Api(e.code)),
+            .map_err(|e| detailed_api_error(&e)),
         "install_vjoy" => api
             .install_vjoy()
             .map(|message| serde_json::json!({"message": message}))
-            .map_err(|e| IpcError::Api(e.code)),
+            .map_err(|e| detailed_api_error(&e)),
         "diag_stats" => api
             .diag_stats()
             .map(|stats| serde_json::to_value(stats).unwrap_or(serde_json::Value::Null))
-            .map_err(|e| IpcError::Api(e.code)),
+            .map_err(|e| detailed_api_error(&e)),
         other => Err(IpcError::UnknownMethod(other.to_string())),
     }
 }
@@ -842,13 +852,10 @@ fn dispatch_settings(
     match request.method.as_str() {
         "autostart" => Ok(serde_json::json!({"autostart": api.autostart()})),
         "set_autostart" => {
-            let enabled = params
-                .get("enabled")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let enabled = parse_bool_param(params, "enabled")?;
             api.set_autostart(enabled)
                 .map(|new_state| serde_json::json!({"autostart": new_state}))
-                .map_err(|e| IpcError::Api(e.code))
+                .map_err(|e| detailed_api_error(&e))
         }
         "firmware_version" => Ok(serde_json::json!({"firmware_version": api.firmware_version()})),
         "output_backend" => Ok(serde_json::json!({"output_backend": api.output_backend()})),
@@ -878,7 +885,7 @@ fn dispatch_settings(
         "backup_now" => api
             .backup_now()
             .map(|message| serde_json::json!({"message": message}))
-            .map_err(|e| IpcError::Api(e.code)),
+            .map_err(|e| detailed_api_error(&e)),
         other => Err(IpcError::UnknownMethod(other.to_string())),
     }
 }
@@ -950,7 +957,7 @@ fn dispatch_profiles_games_learn(
                 .unwrap_or("");
             api.activate_profile(id)
                 .map(|name| serde_json::json!({"name": name}))
-                .map_err(|e| IpcError::Api(e.code))
+                .map_err(|e| detailed_api_error(&e))
         }
         "create_profile" => {
             let name = params
@@ -959,7 +966,7 @@ fn dispatch_profiles_games_learn(
                 .unwrap_or("");
             api.create_profile(name)
                 .map(|name| serde_json::json!({"name": name}))
-                .map_err(|e| IpcError::Api(e.code))
+                .map_err(|e| detailed_api_error(&e))
         }
         "duplicate_profile" => {
             let id = params
@@ -968,7 +975,7 @@ fn dispatch_profiles_games_learn(
                 .unwrap_or("");
             api.duplicate_profile(id)
                 .map(|name| serde_json::json!({"name": name}))
-                .map_err(|e| IpcError::Api(e.code))
+                .map_err(|e| detailed_api_error(&e))
         }
         "delete_profile" => {
             let id = params
@@ -977,7 +984,7 @@ fn dispatch_profiles_games_learn(
                 .unwrap_or("");
             api.delete_profile(id)
                 .map(|deleted| serde_json::json!({"deleted": deleted}))
-                .map_err(|e| IpcError::Api(e.code))
+                .map_err(|e| detailed_api_error(&e))
         }
         "list_games" => Ok(serde_json::to_value(api.list_games())
             .map_err(|e| IpcError::Protocol(e.to_string()))?),
@@ -988,7 +995,7 @@ fn dispatch_profiles_games_learn(
                 .unwrap_or("");
             api.launch_game(id)
                 .map(|game| serde_json::to_value(game).unwrap_or(serde_json::Value::Null))
-                .map_err(|e| IpcError::Api(e.code))
+                .map_err(|e| detailed_api_error(&e))
         }
         "stop_game" => {
             let id = params
@@ -997,7 +1004,7 @@ fn dispatch_profiles_games_learn(
                 .unwrap_or("");
             api.stop_game(id)
                 .map(|game| serde_json::to_value(game).unwrap_or(serde_json::Value::Null))
-                .map_err(|e| IpcError::Api(e.code))
+                .map_err(|e| detailed_api_error(&e))
         }
         "game_state" => {
             let id = params
@@ -1006,17 +1013,17 @@ fn dispatch_profiles_games_learn(
                 .unwrap_or("");
             api.game_state(id)
                 .map(|game| serde_json::to_value(game).unwrap_or(serde_json::Value::Null))
-                .map_err(|e| IpcError::Api(e.code))
+                .map_err(|e| detailed_api_error(&e))
         }
         "add_game" | "update_game" | "remove_game" => dispatch_game_write(api, request),
         "start_learn" => api
             .start_learn()
             .map(|learning| serde_json::json!({"learning": learning}))
-            .map_err(|e| IpcError::Api(e.code)),
+            .map_err(|e| detailed_api_error(&e)),
         "cancel_learn" => api
             .cancel_learn()
             .map(|learning| serde_json::json!({"learning": learning}))
-            .map_err(|e| IpcError::Api(e.code)),
+            .map_err(|e| detailed_api_error(&e)),
         "is_learning" => Ok(serde_json::json!({"learning": api.is_learning()})),
         "take_learned_button" => Ok(serde_json::json!({"button": api.take_learned_button()})),
         other => Err(IpcError::UnknownMethod(other.to_string())),

@@ -528,19 +528,26 @@ pub fn self_check_upgrade_preserve() -> (bool, String) {
     }
 }
 
-/// `installer-preserves-data`: the release workflow's generated NSIS
-/// script never touches the data dir (`%AppData%\RSH`) — it installs
-/// only under `$INSTDIR`, and uninstall deletes only `$INSTDIR` /
-/// `$SMPROGRAMS` paths. Also asserts the signed OTA image is bundled
-/// in the installer.
+/// `installer-preserves-data`: the COMMITTED NSIS script
+/// (`installer/rsh.nsi` — extracted from the release workflow in
+/// v2.0.13 P1-1; the workflow no longer generates it inline) never
+/// touches the data dir (`%AppData%\RSH`) — it installs only under
+/// `$INSTDIR`, and uninstall deletes only `$INSTDIR` / `$SMPROGRAMS`
+/// paths (+ the desktop shortcut it creates itself). Also asserts
+/// the signed OTA image is bundled in the installer, and that the
+/// release workflow still builds this committed script (fail closed
+/// if the workflow stops using it).
 #[must_use]
 pub fn self_check_installer_preserves_data() -> (bool, String) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .expect("repo root above tools/rsh-rig");
+    // Fail closed: the workflow must still build the committed
+    // script — the "Prepare NSIS script" step substitutes
+    // ${VERSION} into installer/rsh.nsi and makensis builds it.
     let workflow = root.join(".github/workflows/release.yml");
-    let text = match std::fs::read_to_string(&workflow) {
+    let workflow_text = match std::fs::read_to_string(&workflow) {
         Ok(text) => text,
         Err(error) => {
             return (
@@ -549,20 +556,36 @@ pub fn self_check_installer_preserves_data() -> (bool, String) {
             );
         }
     };
-    let marker = "Write NSIS script";
-    let Some(start) = text.find(marker) else {
-        return (false, "release.yml has no 'Write NSIS script' step".into());
+    if !workflow_text.contains("Prepare NSIS script") || !workflow_text.contains("rsh.nsi") {
+        return (
+            false,
+            "release.yml no longer builds the committed installer/rsh.nsi".into(),
+        );
+    }
+    let nsi_path = root.join("installer/rsh.nsi");
+    let nsis = match std::fs::read_to_string(&nsi_path) {
+        Ok(text) => text,
+        Err(error) => {
+            return (
+                false,
+                format!("cannot read {}: {error}", nsi_path.display()),
+            );
+        }
     };
-    let after = &text[start..];
-    let end = after.find("Build NSIS installer").unwrap_or(after.len());
-    let nsis = &after[..end];
+    let nsis = nsis.as_str();
     // 1. No data-dir reference in any ACTIVE installer command.
     // Comment lines (leading `;`) are ignored: the script documents
     // the guarantee in a comment ("never touches ... %APPDATA%\RSH"),
-    // which is not a data-dir access.
+    // which is not a data-dir access. `DetailPrint` lines are
+    // ignored too: they are message text, not filesystem operations
+    // (DS-69 tells the user to delete %APPDATA%\RSH manually — the
+    // installer itself never touches it).
     let active_lines: String = nsis
         .lines()
-        .filter(|line| !line.trim_start().starts_with(';'))
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with(';') && !trimmed.starts_with("DetailPrint")
+        })
         .collect::<Vec<_>>()
         .join("\n");
     for needle in [
@@ -609,7 +632,15 @@ pub fn self_check_installer_preserves_data() -> (bool, String) {
                 .trim_start_matches("Delete ")
                 .trim_start_matches("RMDir ")
                 .trim();
-            if !target.starts_with("\"$INSTDIR") && !target.starts_with("\"$SMPROGRAMS") {
+            // Allowed: install dir, Start Menu, and the ONE desktop
+            // shortcut the installer creates itself
+            // (`CreateShortcut "$DESKTOP\\RSH.lnk"` at install time)
+            // — removing it is cleanup of the installer's own file,
+            // not user data.
+            if !target.starts_with("\"$INSTDIR")
+                && !target.starts_with("\"$SMPROGRAMS")
+                && target != "\"$DESKTOP\\\\RSH.lnk\""
+            {
                 return (
                     false,
                     format!("uninstall deletes a non-install path: {line}"),
