@@ -11989,21 +11989,42 @@ fn wire_action_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
                     match result {
                         Ok(is_running) => {
                             ctx.refresh_games(w);
-                            let body = if is_running {
-                                format!("{game_name} launched.")
+                            if !is_running && !running {
+                                // v2.0.13: the daemon's settle check
+                                // normally turns this into an error,
+                                // but a game that dies between the
+                                // settle and this refresh would
+                                // otherwise land here — and "Game
+                                // stopped." after a Launch press reads
+                                // as a silent no-op. Say so plainly.
+                                let err = UserError {
+                                    code: "game_closed_immediately".to_string(),
+                                    title: "Couldn't launch game".to_string(),
+                                    what_happened: format!(
+                                        "{game_name} started but closed right away."
+                                    ),
+                                    what_to_do: "Try starting the game from File Explorer. If it closes there too, the game itself is failing to start.".to_string(),
+                                    detail: None,
+                                };
+                                ctx.notify_error(w, "Game", &err);
+                                ui_log!("RSH-UI launch-game closed immediately: {game_name}");
                             } else {
-                                format!("{game_name} stopped.")
-                            };
-                            ctx.notify(
-                                w,
-                                "Game",
-                                if is_running {
-                                    "Game launched"
+                                let body = if is_running {
+                                    format!("{game_name} launched.")
                                 } else {
-                                    "Game stopped"
-                                },
-                                &body,
-                            );
+                                    format!("{game_name} stopped.")
+                                };
+                                ctx.notify(
+                                    w,
+                                    "Game",
+                                    if is_running {
+                                        "Game launched"
+                                    } else {
+                                        "Game stopped"
+                                    },
+                                    &body,
+                                );
+                            }
                         }
                         Err(e) => {
                             // UI-2 (v2.0.12): a launch / stop failure
