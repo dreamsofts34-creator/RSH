@@ -120,11 +120,11 @@ Function .onInit
   ; without this guard a 32-bit or Win7/8 machine would install
   ; x64 binaries that fail to start with a cryptic missing-API error.
   ${IfNot} ${RunningX64}
-    MessageBox MB_ICONSTOP "RSH needs 64-bit Windows 10 or later. This PC is 32-bit Windows, so RSH cannot run here."
+    MessageBox MB_ICONSTOP "RSH needs 64-bit Windows 10 or later. This PC is 32-bit Windows, so RSH cannot run here." /SD IDOK
     Abort
   ${EndIf}
   ${IfNot} ${AtLeastWin10}
-    MessageBox MB_ICONSTOP "RSH needs Windows 10 or later. This PC runs an older Windows version, so RSH cannot run here."
+    MessageBox MB_ICONSTOP "RSH needs Windows 10 or later. This PC runs an older Windows version, so RSH cannot run here." /SD IDOK
     Abort
   ${EndIf}
   StrCpy $UpdateMode "0"
@@ -309,7 +309,7 @@ FunctionEnd
     ClearErrors
     File ${OPT} "${SRC}"
     ${If} ${Errors}
-      MessageBox /SD IDCANCEL MB_RETRYCANCEL|MB_ICONEXCLAMATION "Could not write $\"${SRC}$\" — it is still in use (another RSH process or antivirus may hold it). Click Retry after closing RSH, or Cancel to stop the install." IDRETRY RSH_File_retry_${N} IDCANCEL RSH_File_abort_${N}
+      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "Could not write $\"${SRC}$\" — it is still in use (another RSH process or antivirus may hold it). Click Retry after closing RSH, or Cancel to stop the install." /SD IDCANCEL IDRETRY RSH_File_retry_${N} IDCANCEL RSH_File_abort_${N}
       RSH_File_abort_${N}:
         Abort
       RSH_File_retry_${N}:
@@ -317,7 +317,7 @@ FunctionEnd
         ClearErrors
         File ${OPT} "${SRC}"
         ${If} ${Errors}
-          MessageBox MB_ICONSTOP "Could not write $\"${SRC}$\" even after retrying. Close RSH (or restart the PC if a process is stuck) and run the installer again."
+          MessageBox MB_ICONSTOP "Could not write $\"${SRC}$\" even after retrying. Close RSH (or restart the PC if a process is stuck) and run the installer again." /SD IDOK
           Abort
         ${EndIf}
     ${EndIf}
@@ -467,7 +467,7 @@ Function ConfigureVJoyDevice1
   Pop $R1  ; exit code
   Pop $R2  ; stdout (discard)
   ${If} $R1 != 0
-    MessageBox /SD IDOK MB_ICONEXCLAMATION "RSH installed, but vJoy device 1 could not be configured as a wheel for Windows.Gaming.Input games (vJoyConfig exit $R1). Wheel games (for example Forza Horizon 4) may not show a Wheel tab. Next step: open vJoyConf, set device 1 to 8 axes (X Y Z Rx Ry Rz Slider Dial), 128 buttons, 1 POV hat, all FFB effects — or run the RSH installer again."
+    MessageBox MB_ICONEXCLAMATION "RSH installed, but vJoy device 1 could not be configured as a wheel for Windows.Gaming.Input games (vJoyConfig exit $R1). Wheel games (for example Forza Horizon 4) may not show a Wheel tab. Next step: open vJoyConf, set device 1 to 8 axes (X Y Z Rx Ry Rz Slider Dial), 128 buttons, 1 POV hat, all FFB effects — or run the RSH installer again." /SD IDOK
     Return
   ${EndIf}
   ; Verify the descriptor landed: Device01 must exist with a
@@ -479,7 +479,7 @@ Function ConfigureVJoyDevice1
   SetRegView 32
   ${If} ${Errors}
   ${OrIf} $R3 == 0
-    MessageBox /SD IDOK MB_ICONEXCLAMATION "RSH installed, but the vJoy device-1 configuration could not be verified (no descriptor found for device 1). Wheel games (for example Forza Horizon 4) may not show a Wheel tab. Next step: open vJoyConf, set device 1 to 8 axes (X Y Z Rx Ry Rz Slider Dial), 128 buttons, 1 POV hat, all FFB effects — or run the RSH installer again."
+    MessageBox MB_ICONEXCLAMATION "RSH installed, but the vJoy device-1 configuration could not be verified (no descriptor found for device 1). Wheel games (for example Forza Horizon 4) may not show a Wheel tab. Next step: open vJoyConf, set device 1 to 8 axes (X Y Z Rx Ry Rz Slider Dial), 128 buttons, 1 POV hat, all FFB effects — or run the RSH installer again." /SD IDOK
   ${EndIf}
 FunctionEnd
 
@@ -593,7 +593,7 @@ Section "RSH"
   Pop $0
   Pop $1  ; DS-70: ExecToStack pushes exit code + stdout — discard both
   ${If} $0 != 0
-    MessageBox /SD IDOK MB_ICONEXCLAMATION "RSH installed, but the Windows Firewall rule could not be created (netsh exit $0). The wheel may not connect over Wi-Fi. Next step: Windows Security -> Firewall & network protection -> Allow an app through firewall -> add rsh-daemon.exe; or run the installer again as administrator."
+    MessageBox MB_ICONEXCLAMATION "RSH installed, but the Windows Firewall rule could not be created (netsh exit $0). The wheel may not connect over Wi-Fi. Next step: Windows Security -> Firewall & network protection -> Allow an app through firewall -> add rsh-daemon.exe; or run the installer again as administrator." /SD IDOK
   ${EndIf}
   ; FH4 fixes #1+#2 (v2.0.13): the RacingWheel mappings FIRST, then
   ; the device-1 envelope — vJoyConfig restarts the vJoy devices,
@@ -712,7 +712,7 @@ Section "Uninstall"
   ; running/locked) instead of reporting a partial uninstall
   ; as success.
   IfFileExists "$INSTDIR\rsh-daemon.exe" 0 warn_done
-  MessageBox /SD IDOK MB_ICONEXCLAMATION "RSH could not be fully removed: rsh-daemon.exe is still in use (the app may still be running). Close RSH and run the uninstaller again."
+  MessageBox MB_ICONEXCLAMATION "RSH could not be fully removed: rsh-daemon.exe is still in use (the app may still be running). Close RSH and run the uninstaller again." /SD IDOK
   warn_done:
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH"
   DeleteRegKey HKLM "Software\RSH"
