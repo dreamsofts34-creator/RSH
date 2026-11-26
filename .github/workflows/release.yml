@@ -746,10 +746,11 @@ jobs:
       - name: Headless launch smoke test (install + update + firewall + daemon check + uninstall)
         shell: pwsh
         run: |
-          # Bounded process runner (see the header comment): every
-          # wait in this step has a timeout and fails closed, naming
-          # the still-alive processes — a hang must be a fast,
-          # located failure, never a silent 13-minute stall again.
+          # NOTE: this run block must stay under 21,000 chars
+          # (GitHub max expression length — the workflow is
+          # rejected otherwise). Keep comments short.
+          # Every wait here is timeout-bounded and fails closed,
+          # naming the still-alive processes (no silent stalls).
           function Start-WaitOrFail($file, $arguments, $timeoutSec, $what) {
             Write-Host "Smoke test: starting $what ..."
             $p = Start-Process -FilePath $file -ArgumentList $arguments -PassThru
@@ -767,10 +768,8 @@ jobs:
           if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
           # NSIS silent install (/S); /D must be last, unquoted.
           Start-WaitOrFail $installer @("/S", "/D=$installDir") 180 "first silent install"
-          # v2.0.8 retest Bug 1 (H1): the sidecar reads + hashes
-          # HIDMaestro.Core.dll beside itself at startup, so the DLL
-          # must be installed beside the sidecar — fail closed here
-          # when it is missing (same pattern as the LICENSE check).
+          # v2.0.8 retest Bug 1 (H1): the sidecar hashes the DLL
+          # beside itself at startup — fail closed if it is missing.
           foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe", "RshCoreHiDcr.exe", "HIDMaestro.Core.dll", "firmware-signed.bin", "HIDMaestro-LICENSE.txt")) {
             if (-not (Test-Path (Join-Path $installDir $exe))) { Write-Error "Smoke test: installed $exe not found in $installDir after silent install."; exit 1 }
           }
@@ -778,13 +777,9 @@ jobs:
           $rule = netsh advfirewall firewall show rule name="RSH" | Out-String
           if ($rule -notmatch "RSH") { Write-Error "Smoke test: firewall rule 'RSH' not found after install (netsh show rule)."; exit 1 }
           Write-Host "Firewall rule 'RSH' present after install."
-          # P2-A: the v2.0.11 P0/P4 installer work was never verified
-          # by the smoke test — assert the WER LocalDumps keys (incl.
-          # the sidecar key) exist after install. The WER keys live
-          # in the native 64-bit view (the installer writes them with
-          # SetRegView 64), so read them from the Registry64 view.
-          # (The "RSH Daemon" task assertions were removed in v2.0.13:
-          # the task is gone; P2-8 added shortcut + ARP assertions.)
+          # P2-A: assert the WER LocalDumps keys (incl. sidecar)
+          # exist after install — native 64-bit view (installer
+          # writes them with SetRegView 64), so read Registry64.
           $reg64 = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
           $dumpsBase = "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps"
           $expectedDumpFolder = Join-Path $env:ProgramData "RSH\dumps"
@@ -795,16 +790,11 @@ jobs:
             if ($werKey.GetValue("DumpType") -ne 1 -or $werKey.GetValue("DumpCount") -ne 5) { Write-Error "Smoke test: WER DumpType/DumpCount for $exe is '$($werKey.GetValue("DumpType"))'/'$($werKey.GetValue("DumpCount"))', expected 1/5."; exit 1 }
           }
           Write-Host "WER LocalDumps keys present for daemon, UI and sidecar (DumpFolder $expectedDumpFolder, DumpType 1, DumpCount 5)."
-          # P2-8 (v2.0.13 polish): the smoke test now proves the
-          # user-facing install surface — Start Menu shortcut +
-          # ARP entry (publisher, icon, location, quiet uninstall,
-          # NoModify/NoRepair, EstimatedSize) — not just binaries.
-          # The "RSH Daemon" scheduled task is GONE in v2.0.13
-          # (autostart is the daemon-owned Run key); the old task
-          # assertions were removed with it. The Run-key assertion
-          # lives after the update-path daemon restart below: the
-          # daemon syncs the key at startup, and only a running
-          # daemon proves it.
+          # P2-8 (v2.0.13 polish): prove the user-facing install
+          # surface too — Start Menu shortcut + ARP entry — not
+          # just binaries. (The "RSH Daemon" task is GONE in
+          # v2.0.13; the Run-key assertion lives after the
+          # update-path daemon restart below.)
           $startMenuShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\RSH\RSH.lnk"
           if (-not (Test-Path $startMenuShortcut)) {
             $altShortcut = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\RSH\RSH.lnk"
@@ -824,8 +814,7 @@ jobs:
           if ($unKey.GetValue("NoModify") -ne 1 -or $unKey.GetValue("NoRepair") -ne 1) { Write-Error "Smoke test: ARP NoModify/NoRepair is '$($unKey.GetValue("NoModify"))'/'$($unKey.GetValue("NoRepair"))', expected 1/1."; exit 1 }
           if (-not $unKey.GetValue("EstimatedSize") -or $unKey.GetValue("EstimatedSize") -le 0) { Write-Error "Smoke test: ARP EstimatedSize is '$($unKey.GetValue("EstimatedSize"))', expected a positive KB value."; exit 1 }
           # Audit (v2.0.13, C P2-2): VersionMajor/Minor were written
-          # but never asserted — pin them to the tag's first two
-          # components so the installer's WordFind parse is proven.
+          # but never asserted — pin them to the tag's components.
           $major = [int]($version.Split('.')[0]); $minor = [int]($version.Split('.')[1])
           if ($unKey.GetValue("VersionMajor") -ne $major -or $unKey.GetValue("VersionMinor") -ne $minor) { Write-Error "Smoke test: ARP VersionMajor/VersionMinor is '$($unKey.GetValue("VersionMajor"))'/'$($unKey.GetValue("VersionMinor"))', expected $major/$minor."; exit 1 }
           Write-Host "ARP entry verified (DisplayName/DisplayVersion/Publisher/DisplayIcon/InstallLocation/QuietUninstallString/NoModify/NoRepair/EstimatedSize/VersionMajor/VersionMinor)."
@@ -834,21 +823,16 @@ jobs:
           Start-WaitOrFail $daemon @("--check", "--no-tray", "--no-connect", "--data-dir", $dataDir) 60 "daemon --check (IPC must answer)"
           Write-Host "Smoke test PASS: daemon --check exit 0 (IPC answers)."
           # --- Update path: install a second time over the first --------
-          # Simulates the user running the new installer on a PC that
-          # already has RSH: user data must survive, the registry
-          # version must be the new one, and the installer must
-          # restart the daemon after the update (smart installer).
+          # User data must survive, the registry version must be the
+          # new one, and the installer must restart the daemon.
           $version = "${{ steps.tag.outputs.version }}"
           $realDataDir = Join-Path $env:APPDATA "RSH"
           New-Item -ItemType Directory -Force -Path $realDataDir | Out-Null
           Set-Content -Path (Join-Path $realDataDir "smoke-marker.txt") -Value "user data must survive an update" -Encoding ASCII
-          # Audit (v2.0.13): elevation-log snapshot + daemon pid,
-          # taken BEFORE the second install. The FIRST install
-          # already started a daemon (P2-4) that wrote its own
-          # "daemon: elevation: ..." line into this same daily log,
-          # so the poll below must only match lines appended AFTER
-          # the update restart (B P2) — and the restart proof must
-          # compare pids, not just existence (B P3).
+          # Audit (v2.0.13): snapshot BEFORE the second install —
+          # the first install's daemon already wrote its own
+          # elevation line into this daily log (B P2), and the
+          # restart proof must compare pids (B P3).
           $elevLog = Join-Path $realDataDir "logs\rsh-$(Get-Date -Format yyyyMMdd).log"
           $elevLogLinesBefore = if (Test-Path $elevLog) { @(Get-Content $elevLog -ErrorAction SilentlyContinue).Count } else { 0 }
           $daemonPidBefore = (Get-Process rsh-daemon -ErrorAction SilentlyContinue | Select-Object -First 1).Id
@@ -866,21 +850,17 @@ jobs:
           Start-Sleep -Seconds 3
           $daemonProc = Get-Process rsh-daemon -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $daemonProc) { Write-Error "Smoke test: daemon was NOT restarted by the update install (no rsh-daemon process)."; exit 1 }
-          # Audit (v2.0.13, B P3): a survivor is not a restart — the
-          # pid must have changed across the update install.
-          # ($daemonPidBefore is $null when no daemon ran before;
-          # then the existence check above is the whole proof.)
+          # Audit (v2.0.13, B P3): a survivor is not a restart —
+          # the pid must have changed. ($daemonPidBefore is $null
+          # when no daemon ran before.)
           if ($daemonPidBefore -and $daemonProc.Id -eq $daemonPidBefore) { Write-Error "Smoke test: daemon pid $($daemonProc.Id) is unchanged across the update install — the installer did not restart it (a survivor, not a restart)."; exit 1 }
           Write-Host "Daemon restarted by the update install (pid $($daemonProc.Id), was $daemonPidBefore)."
           # P2-8: the daemon syncs the Run key at startup (default
           # autostart on) — poll for it, since the sync runs on a
           # spawned task and may lag the process appearing.
-          # Audit (v2.0.13, B P1): the stored value is QUOTED
-          # (`"C:\...\rsh-daemon.exe"` — autostart_command wraps
-          # the path in quotes), so the pattern must allow the
-          # trailing quote: `*rsh-daemon.exe` (no trailing `*`)
-          # can never match and the poll would burn all 15 s
-          # then fail the run.
+          # Audit (v2.0.13, B P1): the stored Run value is QUOTED
+          # ("C:\...\rsh-daemon.exe"), so the pattern needs the
+          # trailing *: *rsh-daemon.exe can never match.
           $runVal = $null
           for ($i = 0; $i -lt 15; $i++) {
             $runKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Software\Microsoft\Windows\CurrentVersion\Run")
@@ -891,31 +871,16 @@ jobs:
           if (-not $runVal -or $runVal -notlike "*rsh-daemon.exe*") { Write-Error "Smoke test: HKCU Run\RSH is '$runVal' 15 s after the update restart, expected the installed rsh-daemon.exe."; exit 1 }
           Write-Host "HKCU Run\RSH points at the installed daemon ($runVal)."
           # P2-A: the update-path restart must be NON-elevated (P4) —
-          # the installer relaunches the daemon via explorer.exe, and
           # an elevated restart would suppress the sidecar's UAC
-          # prompt (the v2.0.10 failure). The restarted daemon logs
-          # "daemon: elevation: ..." at startup to
-          # %APPDATA%\RSH\logs\rsh-YYYYMMDD.log — poll for the
-          # elevation line. The HARD assertion (daemon must be
-          # non-elevated) applies ONLY where this session can exhibit
-          # a non-elevated process: the restart goes through the
-          # explorer shell, and a headless CI session may have no
-          # medium-integrity shell at all (no explorer.exe, or an
-          # elevated shell when UAC is off) — in that case NO launch
-          # mechanism can produce a non-elevated daemon, so failing
-          # here would block every release on an environment property,
-          # not a product defect (release run 45586820051 failed
-          # exactly this way: daemon elevated, no medium shell).
-          # Where a medium shell exists the assertion stays hard.
-          # (Log placement, audit v2.0.13 B P2: the comment that used
-          # to stand here claimed %APPDATA%\RSH\logs is first written
-          # by the update-restarted daemon — false since P2-4 made
-          # the FIRST install start a daemon too, which logs its own
-          # elevation line into this same daily file. $elevLog and
-          # $elevLogLinesBefore were snapshotted BEFORE the second
-          # install above; only lines appended after the restart
-          # count here, so a stale first-install line can never
-          # satisfy this poll.)
+          # prompt (v2.0.10 failure). The HARD assertion applies
+          # ONLY where a non-elevated explorer shell exists: a
+          # headless session may have none, and then NO launch
+          # mechanism can produce a non-elevated daemon (run
+          # 45586820051 failed exactly this way) — failing here
+          # would block every release on an environment property.
+          # (Audit v2.0.13, B P2: $elevLog/$elevLogLinesBefore were
+          # snapshotted before the second install — only lines
+          # appended after the restart count here.)
           $elevState = $null
           for ($i = 0; $i -lt 60; $i++) {
             if (Test-Path $elevLog) {
@@ -972,18 +937,12 @@ jobs:
             }
             Write-Host "Smoke test: WARNING — update-restarted daemon elevation is '$elevState', but no non-elevated explorer shell exists in this session (shell elevated or absent), so a non-elevated restart is unachievable here; recording only (parent: $parentName). P4 is validated on a real desktop, not this runner."
           }
-          # R3-19: enforcing startup measurement — launch the
-          # installed UI and poll for its main window with a 60 s
-          # bound. The startup SLO (launch-to-window) was unmeasured
-          # everywhere: the daemon --check above only measures the
-          # daemon side, and the perf-gate UI probe is record-only.
-          # First run shows the setup wizard — any main window
-          # counts. The UI is killed right after the probe so the
-          # uninstall below is not blocked by a running UI. If this
-          # fails on the runner for an environment reason (no
-          # desktop session), it fails LOUDLY by design — convert
-          # to record-only only with coordinator approval after
-          # seeing the failure mode, never silently.
+          # R3-19: launch the installed UI and poll for its main
+          # window (60 s bound) — the startup SLO was unmeasured
+          # everywhere. First run shows the setup wizard; any main
+          # window counts. Kill the UI right after so the uninstall
+          # below is not blocked. Fails LOUDLY by design — convert
+          # to record-only only with coordinator approval, never silently.
           $ui = Join-Path $installDir "rsh-ui.exe"
           $uiStart = Get-Date
           $uiProc = Start-Process -FilePath $ui -PassThru
@@ -997,11 +956,8 @@ jobs:
           if ($null -eq $windowMs) { Write-Error "Smoke test: rsh-ui.exe showed no main window within 60 s (startup probe, R3-19)."; taskkill /F /IM rsh-ui.exe | Out-Null; exit 1 }
           Write-Host "Smoke test: rsh-ui main window appeared after $windowMs ms (bound 60000 ms, R3-19)."
           # Audit (v2.0.13, B P3): the UI respawns a dead daemon
-          # (DS-68), so the UI must be FULLY gone before the daemon
-          # is killed — and the daemon fully gone before --check
-          # runs, or --check can hit the AlreadyRunning branch on a
-          # dying pipe. Poll (bounded, fail closed), never a fixed
-          # sleep after a taskkill.
+          # (DS-68) — poll (bounded) until UI / daemon are gone
+          # before --check, never a fixed sleep after a taskkill.
           taskkill /F /IM rsh-ui.exe | Out-Null
           for ($i = 0; $i -lt 30; $i++) {
             if (-not (Get-Process rsh-ui -ErrorAction SilentlyContinue)) { break }
@@ -1016,22 +972,19 @@ jobs:
           if (Get-Process rsh-daemon -ErrorAction SilentlyContinue) { Write-Error "Smoke test: rsh-daemon.exe still running 30 s after taskkill."; exit 1 }
           Start-WaitOrFail $daemon @("--check", "--no-tray", "--no-connect", "--data-dir", $dataDir) 60 "daemon --check after the update install"
           Write-Host "Smoke test PASS: update path — data kept, version $version, daemon restarted, --check exit 0."
-          # The sidecar is a separate process the uninstaller also
-          # kills — stop it here too so it cannot hold its exe open.
+          # Stop the sidecar too so it cannot hold its exe open.
           taskkill /F /IM RshCoreHiDcr.exe | Out-Null
           $uninstaller = Join-Path $installDir "uninstall.exe"
           if (-not (Test-Path $uninstaller)) { Write-Error "Smoke test: uninstaller not found at $uninstaller."; exit 1 }
           Start-WaitOrFail $uninstaller @("/S") 120 "silent uninstall"
-          # NSIS uninstallers copy themselves to %TEMP% and the launcher
-          # exits in ~60 ms — the real work happens in the copy, so
-          # NOTHING may be checked right after the launcher exits:
-          # run 45126016834 failed the firewall check 200 ms after the
-          # launcher exited, before the copy had deleted the rule
-          # (runs 45110475449 + 45117939264 failed the same way on the
-          # install dir). Poll until the install dir is gone (bounded,
-          # fail closed) FIRST — the rule is deleted before the files
-          # in the uninstall section, so dir-gone means the copy got
-          # past the rule step too — and only then check the rule.
+          # NSIS uninstallers copy themselves to %TEMP% and the
+          # launcher exits in ~60 ms — the real work happens in the
+          # copy, so NOTHING may be checked right after it exits
+          # (run 45126016834 failed the firewall check 200 ms after
+          # the launcher exited). Poll until the install dir is gone
+          # (bounded, fail closed) FIRST — the rule is deleted
+          # before the files, so dir-gone means the copy got past
+          # the rule step too — and only then check the rule.
           $gone = $false
           for ($i = 0; $i -lt 120; $i++) {
             Start-Sleep -Seconds 1
@@ -1041,31 +994,23 @@ jobs:
           $ruleAfter = netsh advfirewall firewall show rule name="RSH" | Out-String
           if ($ruleAfter -match "Rule Name:\s*RSH") { Write-Error "Smoke test: firewall rule 'RSH' still present after uninstall."; exit 1 }
           Write-Host "Smoke test PASS: uninstall removed the firewall rule and the install dir."
-          # P2-A (uninstall side): the WER keys must be gone too —
-          # the uninstaller removes them ($reg64 / $dumpsBase were
-          # opened after the first install above, in this same step).
-          # (No scheduled-task check anymore: the task was removed
-          # in v2.0.13; the uninstaller still removes a legacy task
-          # from older installs.)
+          # P2-A (uninstall side): the WER keys must be gone too.
+          # (No scheduled-task check: the task was removed in
+          # v2.0.13; the uninstaller still removes a legacy one.)
           foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe", "RshCoreHiDcr.exe")) {
             if ($reg64.OpenSubKey("$dumpsBase\$exe")) { Write-Error "Smoke test: WER LocalDumps key for $exe still present after uninstall."; exit 1 }
           }
           if (Get-ScheduledTask -TaskName "RSH Daemon" -ErrorAction SilentlyContinue) { Write-Error "Smoke test: legacy scheduled task 'RSH Daemon' still registered after uninstall (the uninstaller must remove it)."; exit 1 }
           Write-Host "Smoke test PASS: uninstall removed the WER keys (and no legacy scheduled task remains)."
-          # The data dir may never exist on Windows (named-pipe IPC
-          # leaves no socket file, single-instance is a mutex, and
-          # the startup logger writes to the default data dir, not
-          # this --data-dir) — only remove it when it exists.
+          # The data dir may never exist on Windows — only remove
+          # it when it exists.
           if (Test-Path $dataDir) { Remove-Item $dataDir -Recurse -Force }
           if (Test-Path (Join-Path $realDataDir "smoke-marker.txt")) { Remove-Item (Join-Path $realDataDir "smoke-marker.txt") -Force }
-          # Native commands above (the uninstaller, and `netsh show
-          # rule` when no rule matches — the EXPECTED outcome after
-          # uninstall) can leave $LASTEXITCODE non-zero even though
-          # every check above passed explicitly; the runner
-          # propagates a non-zero $LASTEXITCODE as the step's exit
-          # code, which failed this step in runs 43881476168 and
-          # 43884546437 with no error text. All outcomes are already
-          # verified above, so clear it before exiting.
+          # Native commands above can leave $LASTEXITCODE non-zero
+          # even though every check passed (the runner propagates
+          # it as the step's exit code — runs 43881476168 and
+          # 43884546437 failed this way with no error text), so
+          # clear it before exiting.
           $LASTEXITCODE = 0
 
       - name: vJoy DLL hash (record only — never invented)
