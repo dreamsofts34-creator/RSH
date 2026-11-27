@@ -50,9 +50,11 @@ pub use backend::{HidMaestroConfig, HidMaestroOutput, HidMaestroStateKind, HidMa
 pub use error::HidMaestroError;
 pub use manager::{SidecarConfig, SidecarManager};
 pub use mapping::{
-    CUSTOM_RAW_REPORT_SIZE, GamepadFrame, HidMaestroCapabilities, build_gamepad_frame,
-    build_raw_report, check_button_number, neutral_gamepad_frame, neutral_raw_report,
-    validate_capabilities,
+    CUSTOM_RAW_REPORT_SIZE, G29_RAW_REPORT_SIZE, G29PedalAxis, G29PedalMap, GamepadFrame,
+    HidMaestroCapabilities, build_g29_raw_report, build_gamepad_frame, build_raw_report,
+    check_button_number, g29_steering_u16, g29_wheel, is_g29_button_pressed,
+    neutral_g29_raw_report, neutral_gamepad_frame, neutral_raw_report, read_g29_steering,
+    validate_capabilities, validate_capabilities_for_profile,
 };
 pub use protocol::{
     AxesJson, CapabilitiesJson, Command, Reply, bytes_to_hex, encode_command, parse_reply,
@@ -74,6 +76,34 @@ pub const PINNED_LICENSE: &str = "MIT";
 /// The custom no-brand wheel profile id (built at runtime in the sidecar
 /// with `HMProfileBuilder` + `HidDescriptorBuilder`).
 pub const PROFILE_ID: &str = "rsh-wheel-custom";
+/// The `HIDMaestro` built-in `logitech-g29` catalog profile id.
+///
+/// G29 spoof mode (v2.0.16): when `g29_spoof_mode` is on, the sidecar
+/// loads this catalog profile with `HMContext::GetProfile` (after
+/// `LoadDefaultProfiles` — verified against the real v2.1.0 DLL:
+/// `GetProfile` before the load throws `NullReferenceException`) and
+/// creates the controller from it, so Windows / games see VID `0x046D`
+/// / PID `0xC24F` with the G29 descriptor. This is the ONLY catalog
+/// profile ever created — every other catalog id is still refused.
+///
+/// RISK DISCLOSURE (research 2026-11-27): presenting Logitech's
+/// VID/PID violates USB-IF policy as written (no enforcement found
+/// for private hobby use); no Forza Terms of Service text on spoofing was found
+/// (risk low, not zero); the user's pid.codes `0x1209`/`0x5253` claim
+/// is UNAFFECTED (simply unused while `G29` is active). Even a REAL `G29`
+/// needs a custom control scheme in FH4 (Forza Known Issues) — this
+/// mode promises no auto-recognition.
+pub const G29_PROFILE_ID: &str = "logitech-g29";
+/// Raw-report size (bytes) for a profile id: 15 for the custom wheel,
+/// 12 for the G29. `None` for an unknown id (never requested).
+#[must_use]
+pub const fn raw_report_size_for_profile(profile_id: &str) -> Option<usize> {
+    match profile_id.as_bytes() {
+        b"rsh-wheel-custom" => Some(crate::mapping::CUSTOM_RAW_REPORT_SIZE),
+        b"logitech-g29" => Some(crate::mapping::G29_RAW_REPORT_SIZE),
+        _ => None,
+    }
+}
 /// Identity key for the created controller (same device back on restart).
 pub const IDENTITY_KEY: &str = "rsh-wheel";
 /// Profile vendor string (no brand identity).

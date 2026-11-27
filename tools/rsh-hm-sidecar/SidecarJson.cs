@@ -181,6 +181,13 @@ internal sealed record SidecarReply
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public long? SubmitCount { get; init; }
 
+    // G29 spoof (v2.0.16): output/FFB packets received on the G29
+    // controller and discarded (no motor) — a counter only, never
+    // payload data. Null when no G29 controller was ever created.
+    [JsonPropertyName("output_received_count")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public long? OutputReceivedCount { get; init; }
+
     // Dispose / exit.
     [JsonPropertyName("disposed")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

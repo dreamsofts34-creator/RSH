@@ -21,10 +21,10 @@ use rsh_output::{IJoystickOutput, ProcessedState};
 use crate::error::HidMaestroError;
 use crate::manager::{CreateInfo, HelloInfo, SidecarConfig, SidecarManager};
 use crate::mapping::{
-    CUSTOM_RAW_REPORT_SIZE, HidMaestroCapabilities, build_gamepad_frame, build_raw_report,
-    validate_capabilities,
+    CUSTOM_RAW_REPORT_SIZE, G29_RAW_REPORT_SIZE, G29PedalMap, HidMaestroCapabilities,
+    build_g29_raw_report, build_gamepad_frame, build_raw_report, validate_capabilities_for_profile,
 };
-use crate::{IDENTITY_KEY, PINNED_VERSION, PROFILE_ID};
+use crate::{G29_PROFILE_ID, IDENTITY_KEY, PINNED_VERSION, PROFILE_ID};
 
 /// Copy shown on the Output page while this backend is active.
 ///
@@ -44,6 +44,14 @@ pub struct HidMaestroConfig {
     /// encoder pulses' wire slot; the `SubmitState` path drops buttons
     /// 26–32). The Output page shows which path is active.
     pub use_raw_report: bool,
+    /// `G29` spoof mode (v2.0.16): when true the backend creates the
+    /// `HIDMaestro` built-in `logitech-g29` catalog profile (VID
+    /// `0x046D` / PID `0xC24F`) instead of `rsh-wheel-custom`, and the
+    /// raw-report path is FORCED (the `SubmitState` frame layout does
+    /// not match the G29 profile). Default `false`. Set from the
+    /// persisted `g29_spoof_mode` setting by the app-core factory;
+    /// toggled live via [`IJoystickOutput::set_g29_spoof_mode`].
+    pub g29_spoof: bool,
 }
 
 impl Default for HidMaestroConfig {
@@ -51,6 +59,7 @@ impl Default for HidMaestroConfig {
         Self {
             sidecar: SidecarConfig::default(),
             use_raw_report: true,
+            g29_spoof: false,
         }
     }
 }
@@ -62,7 +71,15 @@ impl HidMaestroConfig {
         Self {
             sidecar: SidecarConfig::with_path(path),
             use_raw_report: true,
+            g29_spoof: false,
         }
+    }
+
+    /// Configuration with G29 spoof mode on/off (tests, factories).
+    #[must_use]
+    pub fn with_g29_spoof(mut self, enabled: bool) -> Self {
+        self.g29_spoof = enabled;
+        self
     }
 }
 
@@ -157,6 +174,13 @@ pub struct HidMaestroOutput {
     status: HidMaestroStatus,
     last_error: Option<HidMaestroError>,
     raw_report: [u8; CUSTOM_RAW_REPORT_SIZE],
+    /// G29 spoof mode (mirrors `config.g29_spoof`; toggled live via
+    /// `set_g29_spoof_mode`). When true the active profile is
+    /// `logitech-g29` and every submit is a 12-byte raw report.
+    g29_spoof: bool,
+    /// 12-byte G29 raw report buffer (separate from the 15-byte
+    /// custom buffer — the sizes must never be confused).
+    raw_report_g29: [u8; G29_RAW_REPORT_SIZE],
 }
 
 impl HidMaestroOutput {
@@ -173,6 +197,7 @@ impl HidMaestroOutput {
     #[must_use]
     pub fn with_config(config: HidMaestroConfig) -> Self {
         let manager = SidecarManager::new(config.sidecar.clone());
+        let g29_spoof = config.g29_spoof;
         Self {
             config,
             manager,
@@ -182,6 +207,25 @@ impl HidMaestroOutput {
             status: HidMaestroStatus::idle(),
             last_error: None,
             raw_report: [0u8; CUSTOM_RAW_REPORT_SIZE],
+            g29_spoof,
+            raw_report_g29: [0u8; G29_RAW_REPORT_SIZE],
+        }
+    }
+
+    /// True when G29 spoof mode is on (active profile `logitech-g29`).
+    #[must_use]
+    pub const fn g29_spoof(&self) -> bool {
+        self.g29_spoof
+    }
+
+    /// Profile id this backend will create on connect
+    /// (`rsh-wheel-custom`, or `logitech-g29` when spoofing).
+    #[must_use]
+    pub const fn active_profile_id(&self) -> &'static str {
+        if self.g29_spoof {
+            G29_PROFILE_ID
+        } else {
+            PROFILE_ID
         }
     }
 
@@ -273,15 +317,20 @@ impl HidMaestroOutput {
         // HID P2-1 (polish round): production `connect` never called
         // `describe-profile` — the only callers were the stub sidecar
         // and tests. Verify the descriptor/size before the first
-        // submit so a packing mismatch fails here, not in-game.
-        self.manager.describe_profile()?;
+        // submit so a packing mismatch fails here, not in-game. The
+        // profile described is the one this backend will create
+        // (custom, or G29 when spoofing — the G29 check also pins
+        // the descriptor hex to the catalog profile's 123 bytes).
+        let profile_id = self.active_profile_id();
+        self.manager.describe_profile(profile_id)?;
         self.manager.install_driver()?;
-        let created: CreateInfo = self.manager.create()?;
+        let created: CreateInfo = self.manager.create(profile_id)?;
         self.capabilities = created.capabilities;
         self.caps_known = true;
 
         if let Some(plan) = plan {
-            let errors = validate_capabilities(plan, &self.capabilities);
+            let errors =
+                validate_capabilities_for_profile(plan, &self.capabilities, self.g29_spoof);
             if !errors.is_empty() {
                 // Relinquish the device: a plan the device cannot serve
                 // must not leave a live controller behind.
@@ -305,13 +354,18 @@ impl HidMaestroOutput {
             kind: HidMaestroStateKind::Ready,
             message: format!(
                 "HIDMaestro ready — {} (driver {}, transport {}, {}).",
-                PROFILE_ID,
+                profile_id,
                 created.driver_version.as_deref().unwrap_or("?"),
                 created
                     .transport_index
                     .map_or("?".to_string(), |i| i.to_string()),
                 // M3: the Output page shows which submit path is live.
-                if self.config.use_raw_report {
+                // G29 forces the raw path (the SubmitState layout
+                // does not match the G29 profile) regardless of the
+                // `use_raw_report` setting.
+                if self.g29_spoof {
+                    "raw-report submit (G29, buttons 1–25, handbrake→L2)"
+                } else if self.config.use_raw_report {
                     "raw-report submit (buttons 1–32)"
                 } else {
                     "SubmitState submit (buttons 1–25)"
@@ -384,8 +438,10 @@ impl HidMaestroOutput {
         // L2: Rust USES the sidecar's `neutral` command (with the raw
         // flag matching the active submit path) instead of
         // re-submitting a neutral frame — the sidecar owns the neutral
-        // frame for its own submit path.
-        self.manager.neutral(self.config.use_raw_report)
+        // frame for its own submit path. G29 always uses the raw
+        // neutral (12-byte G29 report), whatever `use_raw_report` is.
+        self.manager
+            .neutral(self.config.use_raw_report || self.g29_spoof)
     }
 
     /// First neutral after `create` (P2-2): the longer
@@ -433,6 +489,42 @@ impl IJoystickOutput for HidMaestroOutput {
         HidMaestroOutput::reset_fallback(self);
     }
 
+    /// G29 spoof mode (v2.0.16): enabling / disabling disposes and
+    /// recreates the controller with the right profile — the backend
+    /// restart semantics, reusing the existing connect path
+    /// (`disconnect` + `connect_with_plan(None)`), NOT a second
+    /// restart mechanism. A disconnected backend just records the
+    /// flag (the next connect creates the right profile); a
+    /// connected backend is neutralled with the OLD profile first,
+    /// then recreated with the new one. A failed recreate leaves the
+    /// backend disconnected with the failure in `status` /
+    /// `last_error` (the daemon rolls the persisted flag back on
+    /// that outcome) — the flag itself still records the requested
+    /// mode, so a later re-enable retries with the right profile.
+    /// NOTE: the recreate is synchronous and can take as long as a
+    /// backend switch (sidecar spawn + UAC dwell) — callers must
+    /// run it outside the backend slot lock (see
+    /// `AppStateCore::set_g29_spoof_mode`), never on the 200 Hz tick.
+    fn set_g29_spoof_mode(&mut self, enabled: bool) {
+        if enabled == self.g29_spoof {
+            return;
+        }
+        let was_connected = self.connected;
+        if was_connected {
+            // Neutral + dispose under the OLD profile first.
+            self.disconnect();
+        }
+        self.g29_spoof = enabled;
+        self.config.g29_spoof = enabled;
+        if was_connected && let Err(err) = self.connect_with_plan(None) {
+            // `connect_with_plan` already recorded the failure in
+            // `status` / `last_error` via `fail()`; nothing more to
+            // do here — the daemon sees a disconnected backend and
+            // rolls the persisted flag back.
+            let _ = err;
+        }
+    }
+
     fn is_connected(&self) -> bool {
         self.connected
     }
@@ -474,7 +566,21 @@ impl IJoystickOutput for HidMaestroOutput {
         // async — enqueue only, no round-trip wait. A refused
         // submit surfaces on the next tick via the drained reply;
         // a dead sidecar is caught by `ensure_alive` above.
-        let result = if self.config.use_raw_report {
+        // G29 FORCES the raw-report path: the 12-byte G29 report is
+        // the only submit shape for that profile — the SubmitState
+        // frame layout does not match it (and the sidecar refuses a
+        // `submit` while a G29 controller is active, defence in
+        // depth). `use_raw_report: false` is ignored under G29.
+        let result = if self.g29_spoof {
+            build_g29_raw_report(
+                state,
+                &self.current_caps(),
+                G29PedalMap::PROFILE,
+                &mut self.raw_report_g29,
+            );
+            let report = self.raw_report_g29;
+            self.manager.submit_raw_async(&report)
+        } else if self.config.use_raw_report {
             build_raw_report(state, &self.current_caps(), &mut self.raw_report);
             let report = self.raw_report;
             self.manager.submit_raw_async(&report)

@@ -111,6 +111,10 @@ struct LiveCache {
     /// `steam_fh4_mode`, default OFF. Refreshed by the slow
     /// poller like `autostart` above.
     steam_fh4_mode: Mutex<Option<bool>>,
+    /// Last G29 spoof mode flag: the daemon's `g29_spoof_mode`,
+    /// default OFF. Refreshed by the slow poller like
+    /// `steam_fh4_mode` above.
+    g29_spoof_mode: Mutex<Option<bool>>,
     /// Module on/off by index: 0 handbrake, 1 shifter, 2 horn, 3 led
     /// (the same order [`module_index`] and the UI's `module_states`
     /// use).
@@ -165,6 +169,7 @@ impl Default for LiveCache {
             autostart: Mutex::new(None),
             backend: Mutex::new(None),
             steam_fh4_mode: Mutex::new(None),
+            g29_spoof_mode: Mutex::new(None),
             modules: Mutex::new([None; 4]),
             tunings: Mutex::new(HashMap::new()),
             draft: Mutex::new(None),
@@ -396,6 +401,8 @@ pub struct LiveSeed {
     pub autostart: bool,
     /// Steam FH4 wheel mode flag (A2).
     pub steam_fh4_mode: bool,
+    /// G29 spoof mode flag.
+    pub g29_spoof_mode: bool,
     /// The session `connect` verdict (the wizard's Connect step
     /// follows it; a failure notifies instead of blocking).
     pub connect: Result<ConnectionInfo, UserError>,
@@ -417,6 +424,7 @@ impl LiveSeed {
             backend: api.output_backend(),
             autostart: api.autostart(),
             steam_fh4_mode: api.steam_fh4_mode(),
+            g29_spoof_mode: api.g29_spoof_mode(),
             connect,
             wifi: api.wifi_status(),
         }
@@ -754,6 +762,9 @@ impl IpcApi {
             *slot = None;
         }
         if let Ok(mut slot) = self.cache.steam_fh4_mode.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.g29_spoof_mode.lock() {
             *slot = None;
         }
         if let Ok(mut slot) = self.cache.modules.lock() {
@@ -1186,6 +1197,20 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
                 }
             }
         }
+        // G29 spoof mode: same shape as `steam_fh4_mode` above —
+        // not part of `SlowPollState`, read directly, best-effort.
+        // An old daemon without the method just keeps the last
+        // value (OFF while cold).
+        if let Ok(value) = client.call("g29_spoof_mode", serde_json::json!({})).await {
+            if let Some(enabled) = value
+                .get("g29_spoof_mode")
+                .and_then(serde_json::Value::as_bool)
+            {
+                if let Ok(mut slot) = cache.g29_spoof_mode.lock() {
+                    *slot = Some(enabled);
+                }
+            }
+        }
         cache.slow_filled.store(true, Ordering::Relaxed);
         bump_generation_if_changed(cache, epoch);
         return;
@@ -1285,6 +1310,9 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
     });
     fetch!("steam_fh4_mode", steam_fh4_mode, |v| {
         v.get("steam_fh4_mode").and_then(serde_json::Value::as_bool)
+    });
+    fetch!("g29_spoof_mode", g29_spoof_mode, |v| {
+        v.get("g29_spoof_mode").and_then(serde_json::Value::as_bool)
     });
     // `list_bindings` / `knob_actions` nest their payloads under a
     // key, like their trait methods already parse them.
@@ -1430,6 +1458,7 @@ fn slow_content_hash(cache: &LiveCache) -> u64 {
     slot!(auto_pause);
     slot!(close_to_tray);
     slot!(steam_fh4_mode);
+    slot!(g29_spoof_mode);
     slot!(bindings);
     slot!(knobs);
     slot!(modules);
@@ -1912,6 +1941,54 @@ impl AppApi for IpcApi {
         match got {
             Ok(stored) => {
                 if let Ok(mut slot) = self.cache.steam_fh4_mode.lock() {
+                    *slot = Some(stored);
+                }
+                Ok(stored)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
+    }
+
+    /// Cached G29 spoof mode: the slow poller refreshes it ~1 Hz
+    /// (direct `g29_spoof_mode` call in `refresh_slow` — it is not
+    /// part of `SlowPollState`), so this never touches the socket.
+    /// No cache yet means OFF (the default, and the pre-poller
+    /// fallback).
+    fn g29_spoof_mode(&self) -> bool {
+        self.cache
+            .g29_spoof_mode
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .unwrap_or(false)
+    }
+
+    /// Set G29 spoof mode: the `set_g29_spoof_mode` IPC call,
+    /// following the `set_steam_fh4_mode` pattern — same
+    /// `{"enabled": bool}` params, same
+    /// `{"g29_spoof_mode": bool}` reply, same cache update on
+    /// success. Failures keep the daemon's typed reason via
+    /// [`Self::api_error`] (`detailed_api_error` `code|reason`,
+    /// e.g. `g29_spoof_hid_only` on `vJoy`) instead of collapsing
+    /// to the generic link failure.
+    fn set_g29_spoof_mode(&self, enabled: bool) -> Result<bool, UserError> {
+        let got: Result<bool, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async(
+                    "set_g29_spoof_mode",
+                    serde_json::json!({"enabled": enabled}),
+                )
+                .await?;
+            value
+                .get("g29_spoof_mode")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| {
+                    IpcError::Protocol("set_g29_spoof_mode has no g29_spoof_mode".to_string())
+                })
+        });
+        match got {
+            Ok(stored) => {
+                if let Ok(mut slot) = self.cache.g29_spoof_mode.lock() {
                     *slot = Some(stored);
                 }
                 Ok(stored)

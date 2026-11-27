@@ -28,6 +28,9 @@ struct StubApi {
     /// In-memory Steam FH4 wheel mode (default off, like the real
     /// daemon — no registry writes in the stub).
     steam_fh4: Mutex<bool>,
+    /// In-memory G29 spoof mode (default off, like the real daemon —
+    /// no backend recreate in the stub).
+    g29_spoof: Mutex<bool>,
 }
 
 impl StubApi {
@@ -127,6 +130,19 @@ impl AppApi for StubApi {
     fn set_steam_fh4_mode(&self, enabled: bool) -> Result<bool, UserError> {
         *self
             .steam_fh4
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = enabled;
+        Ok(enabled)
+    }
+    fn g29_spoof_mode(&self) -> bool {
+        *self
+            .g29_spoof
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn set_g29_spoof_mode(&self, enabled: bool) -> Result<bool, UserError> {
+        *self
+            .g29_spoof
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = enabled;
         Ok(enabled)
@@ -353,6 +369,50 @@ async fn assert_steam_fh4_round_trip(client: &IpcClient) {
     );
 }
 
+/// v2.0.16: G29 spoof mode round-trip over the same socket —
+/// read (default off) → write on → read → write off → read.
+async fn assert_g29_spoof_round_trip(client: &IpcClient) {
+    let got = client
+        .call("g29_spoof_mode", serde_json::json!({}))
+        .await
+        .expect("g29_spoof_mode");
+    assert_eq!(
+        got.get("g29_spoof_mode")
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "default must be off"
+    );
+    let applied = client
+        .call("set_g29_spoof_mode", serde_json::json!({"enabled": true}))
+        .await
+        .expect("set_g29_spoof_mode on");
+    assert_eq!(
+        applied
+            .get("g29_spoof_mode")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    let got = client
+        .call("g29_spoof_mode", serde_json::json!({}))
+        .await
+        .expect("g29_spoof_mode after write");
+    assert_eq!(
+        got.get("g29_spoof_mode")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    let applied = client
+        .call("set_g29_spoof_mode", serde_json::json!({"enabled": false}))
+        .await
+        .expect("set_g29_spoof_mode off");
+    assert_eq!(
+        applied
+            .get("g29_spoof_mode")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+}
+
 /// v2.0.11: Wi-Fi scan + rejoin round-trip over the same socket —
 /// these three methods had no dispatch arm, so every call failed
 /// with `UnknownMethod` even though the UI sends them (the
@@ -414,6 +474,7 @@ async fn ipc_round_trip_ping_version_connection_and_event() {
         dirty: Mutex::new(BTreeSet::new()),
         sensitivity: Mutex::new(Some(50)),
         steam_fh4: Mutex::new(false),
+        g29_spoof: Mutex::new(false),
     });
     let (event_tx, _rx) = broadcast::channel(64);
     let server = Arc::new(IpcServer::new(Arc::clone(&api), event_tx.clone()));
@@ -506,6 +567,9 @@ async fn ipc_round_trip_ping_version_connection_and_event() {
 
     // v2.0.15 Steam FH4 wheel mode round-trip over the same socket.
     assert_steam_fh4_round_trip(&client).await;
+
+    // v2.0.16 G29 spoof mode round-trip over the same socket.
+    assert_g29_spoof_round_trip(&client).await;
 
     serve.abort();
     let _ = std::fs::remove_dir_all(&dir);

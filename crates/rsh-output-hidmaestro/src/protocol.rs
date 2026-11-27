@@ -66,9 +66,18 @@ pub enum Command {
     /// Diagnostics. Reply carries SDK/driver versions, admin flag,
     /// DLL-hash verdict, transport index and profile id.
     Version,
-    /// Build the custom profile (no driver needed) and report the
+    /// Build the named profile (no driver needed) and report the
     /// descriptor + derived input-report size. Linux-runnable.
-    DescribeProfile,
+    /// `profile: None` describes the active (or default custom)
+    /// profile, as before; `Some("logitech-g29")` describes the G29
+    /// catalog profile (123-byte descriptor, 12-byte report). The
+    /// field is omitted on the wire when `None`, so old sidecars
+    /// still parse the command.
+    DescribeProfile {
+        /// Profile id to describe, or `None` for the active/default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+    },
     /// Install the driver when missing (admin). Fast path: already
     /// installed → `AlreadyCurrent`, no install call.
     InstallDriver,
@@ -485,6 +494,23 @@ mod tests {
         assert_eq!(
             encode_command(&Command::InstallDriver).unwrap(),
             r#"{"cmd":"install-driver"}"#
+        );
+    }
+
+    #[test]
+    fn encode_describe_profile_profile_field() {
+        // G29: the profile travels on the command; None omits it, so
+        // an old sidecar still parses the command.
+        assert_eq!(
+            encode_command(&Command::DescribeProfile { profile: None }).unwrap(),
+            r#"{"cmd":"describe-profile"}"#
+        );
+        assert_eq!(
+            encode_command(&Command::DescribeProfile {
+                profile: Some("logitech-g29".to_string()),
+            })
+            .unwrap(),
+            r#"{"cmd":"describe-profile","profile":"logitech-g29"}"#
         );
     }
 

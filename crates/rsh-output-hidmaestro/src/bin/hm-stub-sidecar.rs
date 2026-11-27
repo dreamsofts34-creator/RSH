@@ -23,6 +23,13 @@
 //! | `HM_STUB_SLOW_MS=N` | Sleep N ms before every reply. |
 //! | `HM_STUB_CAPS_JSON={...}` | Capabilities object in `create` replies. |
 //!
+//! G29 spoof mode (v2.0.16): `create` accepts `logitech-g29` as well
+//! as `rsh-wheel-custom` (any other profile is `profile-refused`);
+//! `describe-profile` with `{"profile":"logitech-g29"}` reports the
+//! 123-byte G29 descriptor and a 12-byte report; `submit-raw` then
+//! expects 24 hex chars, and `submit` (`SubmitState`) is refused while
+//! a G29 controller is active — mirroring the real sidecar.
+//!
 //! The stub is test tooling, not shipped: it is a binary target of the
 //! `rsh-output-hidmaestro` package so integration tests can find it via
 //! `env!("CARGO_BIN_EXE_hm-stub-sidecar")`.
@@ -38,6 +45,11 @@ use rsh_output_hidmaestro::{PINNED_DLL_SHA256, PINNED_VERSION};
 /// DLL in G2) — the stub reports it in `describe-profile` so tests can
 /// assert the Rust side's 15-byte expectation against real bytes.
 const DESCRIPTOR_HEX: &str = "05010904A10105010930150026FFFF95017510810205010931150026FFFF95017510810205010932150026FFFF95017510810205010933150026FFFF95017510810205010936150026FFFF9501751081020509190129201500250195207501810205010939150025033500460E0166140075089501814245006500C0";
+
+/// The real G29 catalog-profile descriptor (123 B, from the v2.1.0 DLL
+/// resource — same bytes as `G29_DESCRIPTOR_HEX` in `mapping.rs`;
+/// lowercase here, the Rust side compares case-insensitively).
+const G29_DESCRIPTOR_HEX: &str = "05010904a1010939150025073500463b0165147504950181420509190129196500250145017501951981027501950381030501093027ffff000047ffff000075109501810209320935093126ff0046ff007508950381020600ff0901950281020600ff0901950181020600ff090226ff0046ff00951075089102c0";
 
 fn env_flag(name: &str) -> bool {
     env::var(name).is_ok_and(|v| v != "0" && !v.is_empty())
@@ -63,6 +75,19 @@ fn caps_json() -> serde_json::Value {
         "buttons": 32,
         "has_hat": true,
         "input_report_size": 15,
+        "submit_state_max_button": 25,
+        "submit_state_button_mask": 33_554_431
+    })
+}
+
+/// Capabilities the real sidecar reports for a created G29
+/// controller: 4 axes (X/Z/Rz/Y), 25 buttons, hat, 12-byte report.
+fn g29_caps_json() -> serde_json::Value {
+    serde_json::json!({
+        "axes": 4,
+        "buttons": 25,
+        "has_hat": true,
+        "input_report_size": 12,
         "submit_state_max_button": 25,
         "submit_state_button_mask": 33_554_431
     })
@@ -127,6 +152,9 @@ fn main() -> ExitCode {
 
     let stdin = std::io::stdin();
     let mut created = false;
+    // Profile id of the created controller (`rsh-wheel-custom` or
+    // `logitech-g29`); the expected raw-report size follows it.
+    let mut created_profile = String::new();
     let mut submits: usize = 0;
     let mut commands: usize = 0;
     for line in stdin.lock().lines() {
@@ -156,27 +184,62 @@ fn main() -> ExitCode {
                         "dll_sha256": PINNED_DLL_SHA256,
                         "dll_sha256_ok": dll_ok,
                         "transport": "stdio",
-                        "profile": if created { serde_json::Value::String("rsh-wheel-custom".to_string()) } else { serde_json::Value::Null },
+                        "profile": if created { serde_json::Value::String(created_profile.clone()) } else { serde_json::Value::Null },
                         "transport_index": if created { serde_json::Value::from(0) } else { serde_json::Value::Null }
                     }),
                     &mut out,
                 );
             }
             "describe-profile" => {
-                emit(
-                    &serde_json::json!({
-                        "ok": true,
-                        "profile": "rsh-wheel-custom",
-                        "vid": 0x1209,
-                        "pid_value": 0x5253,
-                        "vid_pid_provisional": true,
-                        "descriptor_len": 124,
-                        "descriptor_hex": DESCRIPTOR_HEX,
-                        "input_report_size": 15,
-                        "input_report_size_legacy_assumption": 26
-                    }),
-                    &mut out,
-                );
+                // G29 (v2.0.16): an explicit `profile` asks for that
+                // profile's descriptor; otherwise the active (or
+                // default custom) profile is described, like the real
+                // sidecar. An unknown profile is refused.
+                let asked = parsed.get("profile").and_then(|p| p.as_str());
+                match asked {
+                    Some("logitech-g29") => {
+                        emit(
+                            &serde_json::json!({
+                                "ok": true,
+                                "profile": "logitech-g29",
+                                "vid": 0x046D,
+                                "pid_value": 0xC24F,
+                                "vid_pid_provisional": false,
+                                "descriptor_len": 123,
+                                "descriptor_hex": G29_DESCRIPTOR_HEX,
+                                "input_report_size": 12,
+                                "input_report_size_legacy_assumption": 26,
+                                "button_count": 25,
+                                "axis_count": 4,
+                                "has_hat": true,
+                                "backend": "hidmaestro"
+                            }),
+                            &mut out,
+                        );
+                    }
+                    Some("rsh-wheel-custom") | None => {
+                        emit(
+                            &serde_json::json!({
+                                "ok": true,
+                                "profile": "rsh-wheel-custom",
+                                "vid": 0x1209,
+                                "pid_value": 0x5253,
+                                "vid_pid_provisional": true,
+                                "descriptor_len": 124,
+                                "descriptor_hex": DESCRIPTOR_HEX,
+                                "input_report_size": 15,
+                                "input_report_size_legacy_assumption": 26
+                            }),
+                            &mut out,
+                        );
+                    }
+                    Some(other) => {
+                        emit(
+                            &serde_json::json!({"ok": false, "code": "profile-refused", "error": format!("stub refused describe-profile for '{other}'")}),
+                            &mut out,
+                        );
+                    }
+                }
             }
             "install-driver" => {
                 if env_flag("HM_STUB_WAS_INSTALLED") || driver_installed {
@@ -208,15 +271,39 @@ fn main() -> ExitCode {
                         &mut out,
                     );
                 } else {
-                    created = true;
-                    emit(
-                        &serde_json::json!({
-                            "ok": true, "created": true, "profile": "rsh-wheel-custom",
-                            "transport_index": 0, "driver": PINNED_VERSION,
-                            "capabilities": caps_json()
-                        }),
-                        &mut out,
-                    );
+                    // G29 (v2.0.16): only the two allowed profiles;
+                    // anything else is refused like the real sidecar.
+                    // A `submit` on a G29 controller is refused by
+                    // the real sidecar too (raw path only) — mirrored
+                    // in the `submit` arm below.
+                    let profile = parsed
+                        .get("profile")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("rsh-wheel-custom");
+                    if profile != "rsh-wheel-custom" && profile != "logitech-g29" {
+                        emit(
+                            &serde_json::json!({"ok": false, "code": "profile-refused", "error": format!("stub refused profile '{profile}'")}),
+                            &mut out,
+                        );
+                    } else {
+                        created = true;
+                        created_profile = profile.to_string();
+                        let caps = if profile == "logitech-g29" {
+                            g29_caps_json()
+                        } else {
+                            caps_json()
+                        };
+                        let size = if profile == "logitech-g29" { 12 } else { 15 };
+                        emit(
+                            &serde_json::json!({
+                                "ok": true, "created": true, "profile": profile,
+                                "transport_index": 0, "driver": PINNED_VERSION,
+                                "input_report_size": size,
+                                "capabilities": caps
+                            }),
+                            &mut out,
+                        );
+                    }
                 }
             }
             "submit" => {
@@ -224,7 +311,15 @@ fn main() -> ExitCode {
                 if submits > crash_after_submits {
                     std::process::exit(1);
                 }
-                if created {
+                if created_profile == "logitech-g29" {
+                    // The real sidecar refuses `submit` (SubmitState)
+                    // while a G29 controller is active — the frame
+                    // layout does not match the G29 profile.
+                    emit(
+                        &serde_json::json!({"ok": false, "code": "bad-command", "error": "submit (SubmitState) is not supported for the logitech-g29 profile — use submit-raw"}),
+                        &mut out,
+                    );
+                } else if created {
                     emit(
                         &serde_json::json!({"ok": true, "submit_us": latency_us, "on_submit_latency_us": 9}),
                         &mut out,
@@ -249,9 +344,17 @@ fn main() -> ExitCode {
                         &mut out,
                     );
                 } else if let Some(hex) = parsed.get("bytes").and_then(|r| r.as_str()) {
-                    if hex.len() != 30 {
+                    // Expected size follows the created profile:
+                    // 15 bytes (30 hex) custom, 12 bytes (24 hex) G29.
+                    let expected_hex = if created_profile == "logitech-g29" {
+                        24
+                    } else {
+                        30
+                    };
+                    let expected_bytes = expected_hex / 2;
+                    if hex.len() != expected_hex {
                         emit(
-                            &serde_json::json!({"ok": false, "code": "bad-report-size", "error": format!("expected 15-byte report (30 hex chars), got {} chars", hex.len())}),
+                            &serde_json::json!({"ok": false, "code": "bad-report-size", "error": format!("expected {expected_bytes}-byte report ({expected_hex} hex chars), got {} chars", hex.len())}),
                             &mut out,
                         );
                     } else if created {
@@ -293,6 +396,7 @@ fn main() -> ExitCode {
             }
             "dispose" => {
                 created = false;
+                created_profile.clear();
                 emit(&serde_json::json!({"ok": true, "disposed": true}), &mut out);
             }
             "exit" => {

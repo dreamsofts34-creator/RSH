@@ -78,6 +78,108 @@ pub const CUSTOM_RAW_REPORT_SIZE: usize = 15;
 /// show a stuck hat direction, the neutral value is the first suspect.
 pub const HAT_NEUTRAL_RAW: u8 = 0x08;
 
+// ---------------------------------------------------------------------------
+// Logitech G29 spoof profile (`logitech-g29`, HIDMaestro catalog).
+//
+// RISK DISCLOSURE (research 2026-11-27, verified against the real
+// v2.1.0 DLL's embedded profile JSON): presenting Logitech's VID/PID
+// violates USB-IF policy as written (no enforcement found for private
+// hobby use); no Forza ToS text on spoofing was found (risk low, not
+// zero); the user's pid.codes `0x1209`/`0x5253` claim is UNAFFECTED
+// (simply unused while G29 is active). Even a REAL G29 needs a custom
+// control scheme in FH4 (Forza Known Issues) — do not promise
+// auto-recognition anywhere. FH4 end-to-end is UNPROVEN: no report
+// of HIDMaestro-as-G29 in any game was found; the realistic goal is
+// usable steering/pedals via FH4's custom wheel profile.
+//
+// The 123-byte descriptor (no Report ID) is byte-for-byte the
+// catalog profile's, verified from the DLL resource AND the research
+// report (they match). The sidecar loads the catalog profile via the
+// SDK (`GetProfile`) and validates these bytes — the descriptor is
+// NEVER hand-rolled here. Input report is 12 bytes:
+// hat (4 bits) + buttons 1–25 (25 bits) + 3 pad bits, then X steering
+// u16 LE (0–65535, centre 32768), Z / Rz / Y pedals u8, then vendor
+// 0xFF00 input (2 bytes) + vendor input (1 byte), both neutral 0.
+// The 16-byte 0xFF00 Output report (FFB channel) is kept in the
+// profile; the sidecar subscribes to `OutputReceived` and DISCARDS
+// the writes (no motor) — see `tools/rsh-hm-sidecar/Program.cs`.
+
+/// Raw-report size of the G29 profile: 4 bytes hat+buttons + 2 bytes
+/// X + 3 bytes pedals + 3 bytes vendor input = 12 bytes.
+pub const G29_RAW_REPORT_SIZE: usize = 12;
+/// G29 VID (Logitech).
+pub const G29_VID: u16 = 0x046D;
+/// G29 PID (PC mode, `0xC24F` — NOT the PS4-mode `0xC260`, whose
+/// 160-byte descriptor must never be paired with this PID).
+pub const G29_PID: u16 = 0xC24F;
+/// G29 button count (25).
+pub const G29_BUTTON_COUNT: i32 = 25;
+/// The catalog profile's 123-byte descriptor, lowercase hex. The
+/// sidecar validates the loaded profile's descriptor bytes against
+/// this exact string; the manager validates the `describe-profile`
+/// reply the same way.
+pub const G29_DESCRIPTOR_HEX: &str = "05010904a1010939150025073500463b0165147504950181420509190129196500250145017501951981027501950381030501093027ffff000047ffff000075109501810209320935093126ff0046ff007508950381020600ff0901950281020600ff0901950181020600ff090226ff0046ff00951075089102c0";
+/// G29 handbrake mapping: the G29 has no handbrake axis, so the
+/// handbrake is a BUTTON — button 8 (L2) — pressed when the handbrake
+/// value exceeds [`G29_HANDBRAKE_THRESHOLD`]. WHY L2: the face
+/// buttons (1–4) are menu buttons, R1/L1 (5–6) are the shift paddles,
+/// and buttons 13–19 are the H-pattern gears + reverse — L2 is the
+/// least-loaded trigger-style button, and a handbrake IS a trigger
+/// pull in shape. If the PC test shows a conflict, change this one
+/// constant (and the tests) — the mapping is a single documented
+/// choice, not a rewrite.
+pub const G29_HANDBRAKE_BUTTON: u8 = 8;
+/// Handbrake value above which the G29 handbrake button is pressed.
+pub const G29_HANDBRAKE_THRESHOLD: f32 = 0.5;
+
+/// One of the G29's three 8-bit pedal axes (descriptor order Z, Rz, Y).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum G29PedalAxis {
+    /// Descriptor byte 6.
+    Z,
+    /// Descriptor byte 7.
+    Rz,
+    /// Descriptor byte 8.
+    Y,
+}
+
+/// Which G29 pedal axis carries each RSH pedal.
+///
+/// PEDAL-ROLE CONFLICT (unresolved, research §1): the `HIDMaestro`
+/// profile layout says Z = accelerator, Rz = brake, Y = clutch;
+/// `PCGamingWiki` says Y = accelerator (with Rz = brake). The
+/// descriptor order (X, Z, Rz, Y) is agreed; the roles are NOT.
+/// The assignment is therefore a swappable constant, not hardcoded
+/// logic: the PC test (`joy.cpl` — move each pedal, watch which axis
+/// moves) decides, and swapping is a one-constant change
+/// ([`G29PedalMap::PROFILE`] ↔ [`G29PedalMap::ACCEL_CLUTCH_SWAPPED`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct G29PedalMap {
+    /// Accelerator axis.
+    pub accelerator: G29PedalAxis,
+    /// Brake axis.
+    pub brake: G29PedalAxis,
+    /// Clutch axis.
+    pub clutch: G29PedalAxis,
+}
+
+impl G29PedalMap {
+    /// The `HIDMaestro` profile layout: Z = accelerator, Rz = brake,
+    /// Y = clutch. Default until the PC test proves otherwise.
+    pub const PROFILE: Self = Self {
+        accelerator: G29PedalAxis::Z,
+        brake: G29PedalAxis::Rz,
+        clutch: G29PedalAxis::Y,
+    };
+    /// Alternate layout for the `PCGamingWiki` reading (Y =
+    /// accelerator, Z = clutch; brake stays Rz in both sources).
+    pub const ACCEL_CLUTCH_SWAPPED: Self = Self {
+        accelerator: G29PedalAxis::Y,
+        brake: G29PedalAxis::Rz,
+        clutch: G29PedalAxis::Z,
+    };
+}
+
 /// A device's capabilities, read from the created profile (connect
 /// time). Mirrors the C# `HidMaestroCapabilities`.
 // Six boolean flags are the honest shape of a capability set (the
@@ -114,6 +216,26 @@ impl HidMaestroCapabilities {
             has_axis_rx: true,
             has_axis_slider: true,
             button_count: 32,
+            has_hat: true,
+        }
+    }
+
+    /// Capabilities of the `logitech-g29` catalog profile: X steering
+    /// (16-bit), 3 pedals (8-bit each), 25 buttons, hat — NO Rx, NO
+    /// Slider. The `has_axis_*` slots are ROLE slots here, not the
+    /// custom profile's axis names: `has_axis_y` = accelerator
+    /// present, `has_axis_z` = brake present, `has_axis_rx` = clutch
+    /// present, `has_axis_slider` = false (the G29 has no Slider —
+    /// the handbrake is button-mapped, see [`G29_HANDBRAKE_BUTTON`]).
+    #[must_use]
+    pub const fn g29_wheel() -> Self {
+        Self {
+            has_axis_x: true,
+            has_axis_y: true,
+            has_axis_z: true,
+            has_axis_rx: true,
+            has_axis_slider: false,
+            button_count: G29_BUTTON_COUNT,
             has_hat: true,
         }
     }
@@ -187,6 +309,13 @@ const fn block_mask(button_count: i32, first_button: i32) -> u32 {
     }
 }
 
+/// Capabilities of the `logitech-g29` catalog profile (free-function
+/// form of [`HidMaestroCapabilities::g29_wheel`]).
+#[must_use]
+pub const fn g29_wheel() -> HidMaestroCapabilities {
+    HidMaestroCapabilities::g29_wheel()
+}
+
 /// Validate a device's capabilities against the configured modules
 /// (D11, C# `HidMaestroOutput.ValidateCapabilities`).
 ///
@@ -195,8 +324,29 @@ const fn block_mask(button_count: i32, first_button: i32) -> u32 {
 /// imposes no extra requirement (its `Rx` value is always written;
 /// the SDK ignores it when the axis is absent — vJoy `wClutch` parity).
 /// Returns the list of problems; empty means valid.
+///
+/// This is the custom-profile form — see
+/// [`validate_capabilities_for_profile`] for the G29 form, where the
+/// handbrake does NOT require a Slider axis (it is button-mapped).
 #[must_use]
 pub fn validate_capabilities(plan: &PipelinePlan, caps: &HidMaestroCapabilities) -> Vec<String> {
+    validate_capabilities_for_profile(plan, caps, false)
+}
+
+/// Profile-aware form of [`validate_capabilities`].
+///
+/// `is_g29` true means the device is the `logitech-g29` profile:
+/// the handbrake module then imposes NO Slider requirement — under
+/// G29 the handbrake is a button ([`G29_HANDBRAKE_BUTTON`], pressed
+/// past [`G29_HANDBRAKE_THRESHOLD`]), so a G29 device with the
+/// handbrake module on is valid despite having no Slider axis. Every
+/// other requirement is identical to the custom profile.
+#[must_use]
+pub fn validate_capabilities_for_profile(
+    plan: &PipelinePlan,
+    caps: &HidMaestroCapabilities,
+    is_g29: bool,
+) -> Vec<String> {
     let mut errors = Vec::new();
     if !(0..=128).contains(&caps.button_count) {
         errors.push(format!(
@@ -214,7 +364,11 @@ pub fn validate_capabilities(plan: &PipelinePlan, caps: &HidMaestroCapabilities)
     if plan.brake.enabled && !caps.has_axis_z {
         errors.push("Brake module is on but the HIDMaestro profile has no Z axis.".to_string());
     }
-    if plan.handbrake.enabled && !caps.has_axis_slider {
+    // G29: the handbrake is button-mapped (L2), never a Slider axis —
+    // requiring one here would make every G29 connect fail validation
+    // with the handbrake module on. Documented, not silently skipped:
+    // the button mapping lives in `build_g29_raw_report`.
+    if plan.handbrake.enabled && !caps.has_axis_slider && !is_g29 {
         errors.push(
             "Handbrake module is on but the HIDMaestro profile has no Slider axis.".to_string(),
         );
@@ -264,6 +418,61 @@ pub fn axis_to_u16(axis_value: i32) -> u16 {
     #[allow(clippy::cast_sign_loss)]
     {
         v as u16
+    }
+}
+
+/// G29 steering `-1..=1` → full-range u16 `0..=65535` (the G29 X axis
+/// is 16-bit, 0–65535 — NOT the custom profile's 0–32767 range).
+/// Endpoints exact: full left `0`, centre `32768`, full right `65535`.
+/// Non-finite input maps to centre.
+#[must_use]
+pub fn g29_steering_u16(value: f32) -> u16 {
+    if !value.is_finite() {
+        return 32768;
+    }
+    let v = value.clamp(-1.0, 1.0);
+    // `(v + 1) * 32767.5`: -1 → 0, 0 → 32767.5 → 32768 (round half
+    // away from zero), +1 → 65535.0. The cast is exact: the value is
+    // 0..=65535 after rounding.
+    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_sign_loss)]
+    {
+        ((v + 1.0) * 32767.5).round() as u16
+    }
+}
+
+/// G29 pedal `0..=1` → u8 `0..=255` (the G29 pedals are 8-bit).
+/// Endpoints exact: released `0`, fully pressed `255`.
+/// Non-finite input maps to released.
+#[must_use]
+pub fn g29_pedal_u8(value: f32) -> u8 {
+    if !value.is_finite() {
+        return 0;
+    }
+    let v = value.clamp(0.0, 1.0);
+    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_sign_loss)]
+    {
+        (v * 255.0).round() as u8
+    }
+}
+
+/// One G29 pedal byte: the scaled value when the pedal's role axis
+/// is present on the profile, released (0) when it is absent — never
+/// stale. Presence is read off the caps' role slots (see
+/// [`HidMaestroCapabilities::g29_wheel`]): accelerator ↔ Y slot,
+/// brake ↔ Z slot, clutch ↔ Rx slot.
+fn g29_pedal_byte(value: f32, present: bool) -> u8 {
+    if present { g29_pedal_u8(value) } else { 0 }
+}
+
+/// Index of a [`G29PedalAxis`] in descriptor order (Z = byte 6,
+/// Rz = byte 7, Y = byte 8).
+const fn g29_pedal_index(axis: G29PedalAxis) -> usize {
+    match axis {
+        G29PedalAxis::Z => 0,
+        G29PedalAxis::Rz => 1,
+        G29PedalAxis::Y => 2,
     }
 }
 
@@ -401,6 +610,82 @@ pub fn build_raw_report(
 /// Neutral 15-byte raw report (watchdog / shutdown).
 pub fn neutral_raw_report(caps: &HidMaestroCapabilities, out: &mut [u8; CUSTOM_RAW_REPORT_SIZE]) {
     build_raw_report(&OutputState::neutral(), caps, out);
+}
+
+/// Build the G29 profile's 12-byte raw HID input report
+/// (`SubmitRawReport` path — the ONLY submit path for G29; the
+/// `SubmitState` frame layout does not match this profile and must
+/// never be used for it, enforced on both sides). Layout, in
+/// descriptor order:
+/// Bytes 0–3: hat (low 4 bits, always [`HAT_NEUTRAL_RAW`] — RSH has
+/// no hat input) + buttons 1–25 (bits 4–28, bit 0 of the field =
+/// button 1) + 3 pad bits. Bytes 4–5: X steering u16 LE (0–65535,
+/// centre 32768). Bytes 6–8: Z, Rz, Y pedals u8 (roles per `map` —
+/// see [`G29PedalMap`]). Bytes 9–10: vendor 0xFF00 input (2 bytes,
+/// neutral 0). Byte 11: vendor input (1 byte, neutral 0).
+///
+/// Handbrake: no axis — mapped to button [`G29_HANDBRAKE_BUTTON`]
+/// (L2) when `state.handbrake` exceeds [`G29_HANDBRAKE_THRESHOLD`].
+///
+/// Buttons 26–32, `buttons_ex` (33–64) and encoder pulses (65–72)
+/// have no wire slot on the 25-button G29 profile and are dropped —
+/// documented, not silently folded anywhere. Buttons are masked by
+/// the device's button count (25 on a G29).
+pub fn build_g29_raw_report(
+    state: &OutputState,
+    caps: &HidMaestroCapabilities,
+    map: G29PedalMap,
+    out: &mut [u8; G29_RAW_REPORT_SIZE],
+) {
+    out.fill(0);
+    // Buttons 1–25 packed into bits 4–28 of the first u32, hat
+    // neutral in the low nibble. `SUBMIT_STATE_BUTTON_MASK` is the
+    // 25-bit mask (buttons 1–25) — reused here, same width.
+    let mut word: u32 = u32::from(HAT_NEUTRAL_RAW);
+    word |= (state.buttons & SUBMIT_STATE_BUTTON_MASK & caps.button_mask()) << 4;
+    if state.handbrake > G29_HANDBRAKE_THRESHOLD {
+        word |= 1u32 << (4 + u32::from(G29_HANDBRAKE_BUTTON) - 1);
+    }
+    out[0..4].copy_from_slice(&word.to_le_bytes());
+    let x = if caps.has_axis_x {
+        g29_steering_u16(state.steering)
+    } else {
+        32768
+    };
+    out[4..6].copy_from_slice(&x.to_le_bytes());
+    // Pedals land on their mapped descriptor bytes (Z = 6, Rz = 7,
+    // Y = 8); the vendor bytes (9–11) stay 0 (neutral).
+    let mut pedals = [0u8; 3];
+    pedals[g29_pedal_index(map.accelerator)] = g29_pedal_byte(state.accelerator, caps.has_axis_y);
+    pedals[g29_pedal_index(map.brake)] = g29_pedal_byte(state.brake, caps.has_axis_z);
+    pedals[g29_pedal_index(map.clutch)] = g29_pedal_byte(state.clutch, caps.has_axis_rx);
+    out[6] = pedals[0];
+    out[7] = pedals[1];
+    out[8] = pedals[2];
+}
+
+/// Neutral 12-byte G29 raw report (watchdog / shutdown): steering
+/// centred (32768), pedals released, no buttons, hat neutral.
+pub fn neutral_g29_raw_report(caps: &HidMaestroCapabilities, out: &mut [u8; G29_RAW_REPORT_SIZE]) {
+    build_g29_raw_report(&OutputState::neutral(), caps, G29PedalMap::PROFILE, out);
+}
+
+/// True when G29 wheel button `button` (1–25) is pressed in a G29
+/// raw report. Out-of-range buttons (0, 26+) return false — they
+/// have no wire slot on the G29 profile.
+#[must_use]
+pub fn is_g29_button_pressed(report: &[u8; G29_RAW_REPORT_SIZE], button: u8) -> bool {
+    if !(1..=25).contains(&button) {
+        return false;
+    }
+    let bit = 4 + usize::from(button) - 1;
+    report[bit / 8] & (1u8 << (bit % 8)) != 0
+}
+
+/// Read the G29 steering value back out of a raw report (test/verify).
+#[must_use]
+pub fn read_g29_steering(report: &[u8; G29_RAW_REPORT_SIZE]) -> u16 {
+    u16::from_le_bytes([report[4], report[5]])
 }
 
 fn write_u16(out: &mut [u8; CUSTOM_RAW_REPORT_SIZE], offset: usize, value: u16) {
@@ -743,5 +1028,206 @@ mod tests {
         plan.clutch.enabled = true;
         let caps = HidMaestroCapabilities::new(true, true, true, false, true, 32, false);
         assert_eq!(validate_capabilities(&plan, &caps).len(), 0);
+    }
+
+    // --- G29 spoof profile (v2.0.16) ---
+
+    #[test]
+    fn g29_descriptor_hex_is_123_bytes_and_matches_task() {
+        let bytes = (0..G29_DESCRIPTOR_HEX.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&G29_DESCRIPTOR_HEX[i..i + 2], 16).expect("hex"))
+            .collect::<Vec<u8>>();
+        assert_eq!(bytes.len(), 123);
+        assert_eq!(G29_DESCRIPTOR_HEX.len(), 246);
+        // Spot-check the head and tail against the task's verbatim hex.
+        assert!(G29_DESCRIPTOR_HEX.starts_with("05010904a101093915002507"));
+        assert!(G29_DESCRIPTOR_HEX.ends_with("75089102c0"));
+    }
+
+    #[test]
+    fn g29_raw_report_size_is_12() {
+        // Hat+buttons (32 bits) + X (16) + 3 pedals (24) + vendor (24)
+        // = 96 bits = 12 bytes, no Report ID.
+        assert_eq!(G29_RAW_REPORT_SIZE, 12);
+        assert_eq!(32 + 16 + 24 + 24, G29_RAW_REPORT_SIZE * 8);
+        assert_eq!(G29_BUTTON_COUNT, 25);
+    }
+
+    #[test]
+    fn g29_steering_endpoints_exact() {
+        assert_eq!(g29_steering_u16(-1.0), 0);
+        assert_eq!(g29_steering_u16(0.0), 32768);
+        assert_eq!(g29_steering_u16(1.0), 65535);
+        assert_eq!(g29_steering_u16(f32::NAN), 32768);
+        assert_eq!(g29_steering_u16(f32::INFINITY), 32768);
+        assert_eq!(g29_steering_u16(-2.0), 0);
+        assert_eq!(g29_steering_u16(2.0), 65535);
+        // Quarter deflection: (-0.5 + 1) * 32767.5 = 16383.75 → 16384.
+        assert_eq!(g29_steering_u16(-0.5), 16384);
+    }
+
+    #[test]
+    fn g29_pedal_endpoints_exact() {
+        assert_eq!(g29_pedal_u8(0.0), 0);
+        assert_eq!(g29_pedal_u8(1.0), 255);
+        assert_eq!(g29_pedal_u8(0.5), 128);
+        assert_eq!(g29_pedal_u8(f32::NAN), 0);
+        assert_eq!(g29_pedal_u8(-0.5), 0);
+        assert_eq!(g29_pedal_u8(2.0), 255);
+    }
+
+    #[test]
+    fn g29_neutral_report_bytes_exact() {
+        let mut out = [0u8; G29_RAW_REPORT_SIZE];
+        neutral_g29_raw_report(&HidMaestroCapabilities::g29_wheel(), &mut out);
+        // Bytes 0-3: hat neutral 0x08, no buttons.
+        assert_eq!(out[0], 0x08);
+        assert_eq!(out[1..4], [0, 0, 0]);
+        // X = 32768 LE.
+        assert_eq!(read_g29_steering(&out), 32768);
+        assert_eq!(out[4..6], [0x00, 0x80]);
+        // Pedals 0, vendor bytes 0.
+        assert_eq!(out[6..12], [0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn g29_full_deflection_endpoints_exact() {
+        let mut out = [0u8; G29_RAW_REPORT_SIZE];
+        build_g29_raw_report(
+            &full_state(),
+            &HidMaestroCapabilities::g29_wheel(),
+            G29PedalMap::PROFILE,
+            &mut out,
+        );
+        assert_eq!(read_g29_steering(&out), 65535);
+        // PROFILE map: Z (byte 6) = accel 255, Rz (byte 7) = brake
+        // 255, Y (byte 8) = clutch 255. Handbrake 1.0 > 0.5 sets L2.
+        assert_eq!(out[6], 255);
+        assert_eq!(out[7], 255);
+        assert_eq!(out[8], 255);
+        assert_eq!(out[9..12], [0, 0, 0]);
+        // Buttons 1-25 all set: bits 4-28 → word 0x1FFFFFF8 LE.
+        assert_eq!(out[0..4], [0xF8, 0xFF, 0xFF, 0x1F]);
+        // Hat nibble is overwritten by button 1's bit only in the
+        // sense that 0xF8 keeps the low nibble 0x08 (neutral).
+        assert_eq!(out[0] & 0x0F, 0x08);
+    }
+
+    #[test]
+    fn g29_buttons_1_to_25_pack_one_to_one() {
+        for button in 1..=25u8 {
+            let mut s = OutputState::neutral();
+            s.buttons = 1u32 << (u32::from(button) - 1);
+            let mut out = [0u8; G29_RAW_REPORT_SIZE];
+            build_g29_raw_report(
+                &s,
+                &HidMaestroCapabilities::g29_wheel(),
+                G29PedalMap::PROFILE,
+                &mut out,
+            );
+            assert!(
+                is_g29_button_pressed(&out, button),
+                "button {button} not set"
+            );
+            // Exactly one button bit set (plus the hat nibble 0x08).
+            let word = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+            assert_eq!(word & !0x0F, 1u32 << (4 + u32::from(button) - 1));
+            assert_eq!(word & 0x0F, 0x08);
+        }
+    }
+
+    #[test]
+    fn g29_buttons_26_plus_have_no_wire_slot() {
+        let mut s = OutputState::neutral();
+        s.buttons = 1u32 << 25 | 1u32 << 31; // buttons 26 and 32
+        s.buttons_ex = u32::MAX;
+        let mut out = [0u8; G29_RAW_REPORT_SIZE];
+        build_g29_raw_report(
+            &s,
+            &HidMaestroCapabilities::g29_wheel(),
+            G29PedalMap::PROFILE,
+            &mut out,
+        );
+        assert_eq!(out[0..4], [0x08, 0, 0, 0]);
+        assert!(!is_g29_button_pressed(&out, 26));
+        assert!(!is_g29_button_pressed(&out, 0));
+    }
+
+    #[test]
+    fn g29_hat_always_neutral() {
+        let mut out = [0u8; G29_RAW_REPORT_SIZE];
+        build_g29_raw_report(
+            &full_state(),
+            &HidMaestroCapabilities::g29_wheel(),
+            G29PedalMap::PROFILE,
+            &mut out,
+        );
+        assert_eq!(out[0] & 0x0F, 0x08);
+    }
+
+    #[test]
+    fn g29_handbrake_button_threshold() {
+        let caps = HidMaestroCapabilities::g29_wheel();
+        // At/below 0.5: no L2 (button 8).
+        for value in [0.0, 0.25, 0.5] {
+            let mut s = OutputState::neutral();
+            s.handbrake = value;
+            let mut out = [0u8; G29_RAW_REPORT_SIZE];
+            build_g29_raw_report(&s, &caps, G29PedalMap::PROFILE, &mut out);
+            assert!(
+                !is_g29_button_pressed(&out, G29_HANDBRAKE_BUTTON),
+                "handbrake {value} must not press L2"
+            );
+        }
+        // Above 0.5: L2 pressed, and only L2.
+        let mut s = OutputState::neutral();
+        s.handbrake = 0.51;
+        let mut out = [0u8; G29_RAW_REPORT_SIZE];
+        build_g29_raw_report(&s, &caps, G29PedalMap::PROFILE, &mut out);
+        assert!(is_g29_button_pressed(&out, G29_HANDBRAKE_BUTTON));
+        let word = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+        assert_eq!(word, 0x08 | (1u32 << (4 + 8 - 1)));
+    }
+
+    #[test]
+    fn g29_pedal_map_swapped_moves_accel_to_y() {
+        let mut s = OutputState::neutral();
+        s.accelerator = 1.0;
+        s.clutch = 0.0;
+        let caps = HidMaestroCapabilities::g29_wheel();
+        let mut out = [0u8; G29_RAW_REPORT_SIZE];
+        build_g29_raw_report(&s, &caps, G29PedalMap::PROFILE, &mut out);
+        assert_eq!((out[6], out[7], out[8]), (255, 0, 0)); // Z = accel
+        build_g29_raw_report(&s, &caps, G29PedalMap::ACCEL_CLUTCH_SWAPPED, &mut out);
+        assert_eq!((out[6], out[7], out[8]), (0, 0, 255)); // Y = accel
+    }
+
+    #[test]
+    fn g29_caps_have_no_rx_no_slider() {
+        let caps = HidMaestroCapabilities::g29_wheel();
+        assert!(caps.has_axis_x && caps.has_hat);
+        assert!(!caps.has_axis_slider);
+        assert_eq!(caps.button_count, 25);
+    }
+
+    #[test]
+    fn validate_g29_handbrake_needs_no_slider_but_other_axes_still_checked() {
+        let plan = PipelinePlan::default();
+        let caps = HidMaestroCapabilities::g29_wheel();
+        // Full G29 caps + handbrake on: valid (button-mapped).
+        assert_eq!(
+            validate_capabilities_for_profile(&plan, &caps, true).len(),
+            0
+        );
+        // Same caps under the custom profile: handbrake fails (no Slider).
+        let errors = validate_capabilities(&plan, &caps);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("Handbrake"));
+        // G29 with steering missing still fails for steering.
+        let caps_no_x = HidMaestroCapabilities::new(false, true, true, true, false, 25, true);
+        let errors = validate_capabilities_for_profile(&plan, &caps_no_x, true);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("Steering"));
     }
 }

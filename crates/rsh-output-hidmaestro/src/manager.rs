@@ -61,7 +61,7 @@ use std::time::{Duration, Instant};
 #[cfg(debug_assertions)]
 use crate::SIDECAR_PATH_ENV;
 use crate::error::HidMaestroError;
-use crate::mapping::HidMaestroCapabilities;
+use crate::mapping::{G29_DESCRIPTOR_HEX, G29_PID, G29_VID, HidMaestroCapabilities};
 use crate::protocol::{
     CapabilitiesJson, Command, Reply, bytes_to_hex, encode_command, parse_reply, reply_to_error,
     validate_hello,
@@ -69,7 +69,7 @@ use crate::protocol::{
 use crate::transport::{LiveTransport, TransportEvent, spawn_stdio};
 #[cfg(windows)]
 use crate::transport::{accept_loopback_with_diagnostics, generate_token, listen_loopback};
-use crate::{PROFILE_ID, SIDECAR_EXE_NAME};
+use crate::{G29_PROFILE_ID, PROFILE_ID, SIDECAR_EXE_NAME};
 
 /// Timeout budget (P1-1, update4-fix): the UI bound must EXCEED the
 /// daemon worst case, or a slow-but-healthy switch is reported as
@@ -315,6 +315,10 @@ pub struct SidecarManager {
     transport_index: Option<i32>,
     driver_version: Option<String>,
     sdk_version: Option<String>,
+    /// Profile id of the created controller (`rsh-wheel-custom` or
+    /// `logitech-g29`), once `create` succeeds; cleared on every
+    /// teardown so a dead session never reports a live profile.
+    active_profile: Option<String>,
 }
 
 /// True when the sidecar process behind `process` is known to have
@@ -373,6 +377,7 @@ impl SidecarManager {
             transport_index: None,
             driver_version: None,
             sdk_version: None,
+            active_profile: None,
         }
     }
 
@@ -448,6 +453,14 @@ impl SidecarManager {
     #[must_use]
     pub fn sdk_version(&self) -> Option<String> {
         self.sdk_version.clone()
+    }
+
+    /// Profile id of the created controller (`rsh-wheel-custom` or
+    /// `logitech-g29`), once `create` succeeds; `None` before create
+    /// or after any teardown.
+    #[must_use]
+    pub fn active_profile_id(&self) -> Option<&str> {
+        self.active_profile.as_deref()
     }
 
     /// Recent stderr lines from the sidecar (diagnostics; empty on the
@@ -1089,43 +1102,60 @@ impl SidecarManager {
         })
     }
 
-    /// `create` for the custom wheel profile. Only
-    /// [`PROFILE_ID`] is ever requested.
+    /// `create` for one of the two allowed profiles:
+    /// [`PROFILE_ID`] (`rsh-wheel-custom`) or [`G29_PROFILE_ID`]
+    /// (`logitech-g29`). Any other id is refused locally (never sent)
+    /// — the sidecar refuses it too, but a refused `create` must not
+    /// cost a driver round-trip. The sidecar loads the G29 catalog
+    /// profile via the SDK and validates its descriptor; the reply's
+    /// `input_report_size` must equal the profile's expected size
+    /// (15 custom / 12 G29) or the connect fails here.
     ///
     /// # Errors
     ///
     /// Propagates request errors plus `ProfileRefused` / `CreateFailed`.
-    pub fn create(&mut self) -> Result<CreateInfo, HidMaestroError> {
+    pub fn create(&mut self, profile_id: &str) -> Result<CreateInfo, HidMaestroError> {
+        let expected_size = crate::raw_report_size_for_profile(profile_id).ok_or_else(|| {
+            HidMaestroError::ProfileRefused(format!(
+                "profile '{profile_id}' refused: only '{PROFILE_ID}' and '{G29_PROFILE_ID}' are built"
+            ))
+        })?;
         let reply = self.request_with_timeout(
             &Command::Create {
-                profile: PROFILE_ID.to_string(),
+                profile: profile_id.to_string(),
             },
             self.config.driver_op_timeout,
         )?;
         reply_to_error(&reply)?;
         // C2: parse the REAL sidecar shape — `axes` is a count
         // (`axes == 5` ⇒ all five axes). No `capabilities` object
-        // (older sidecar) falls back to the custom-wheel caps.
+        // (older sidecar) falls back to the profile's known caps.
         // HID P2-1 (polish round): the 15-byte raw-report layout
         // was assumed on both sides and never verified — `create`
         // ignored the sidecar's derived `input_report_size`. A
         // mismatch now fails the connect instead of misaligning
-        // every frame.
+        // every frame. Same rule for the G29's 12 bytes.
         if let Some(size) = reply.input_report_size
-            && size != crate::mapping::CUSTOM_RAW_REPORT_SIZE
+            && size != expected_size
         {
             return Err(HidMaestroError::CreateFailed(format!(
-                "create reply input_report_size is {size}, expected {} — the HID descriptor layout does not match the Rust raw-report layout",
-                crate::mapping::CUSTOM_RAW_REPORT_SIZE
+                "create reply input_report_size is {size}, expected {expected_size} for profile '{profile_id}' — the HID descriptor layout does not match the Rust raw-report layout"
             )));
         }
         let caps = reply.capabilities.map_or_else(
-            HidMaestroCapabilities::custom_wheel,
+            || {
+                if profile_id == G29_PROFILE_ID {
+                    HidMaestroCapabilities::g29_wheel()
+                } else {
+                    HidMaestroCapabilities::custom_wheel()
+                }
+            },
             CapabilitiesJson::to_capabilities,
         );
         self.transport_index = reply.transport_index;
         // `clone_from` reuses the stored string's allocation.
         self.driver_version.clone_from(&reply.driver);
+        self.active_profile = Some(profile_id.to_string());
         Ok(CreateInfo {
             transport_index: reply.transport_index,
             driver_version: reply.driver.clone(),
@@ -1133,32 +1163,72 @@ impl SidecarManager {
         })
     }
 
-    /// Verify the live profile against the expected descriptor
+    /// Verify the named profile against the expected descriptor
     /// (HID P2-1, polish round): `describe-profile` reports the
     /// descriptor + derived input-report size the sidecar built with
     /// the SDK. A mismatch means the SDK packed the report
-    /// differently from the hardcoded 15-byte Rust layout, and every
-    /// frame would be silently misaligned — fail the connect instead
-    /// of shipping garbage to the game.
+    /// differently from the hardcoded Rust layout, and every frame
+    /// would be silently misaligned — fail the connect instead of
+    /// shipping garbage to the game. For `logitech-g29` the descriptor
+    /// hex must additionally equal the catalog profile's 123-byte
+    /// descriptor exactly ([`G29_DESCRIPTOR_HEX`]).
     ///
     /// # Errors
     ///
     /// Propagates request errors plus `CreateFailed` on a size /
-    /// descriptor mismatch.
-    pub fn describe_profile(&mut self) -> Result<Reply, HidMaestroError> {
-        let reply =
-            self.request_with_timeout(&Command::DescribeProfile, self.config.driver_op_timeout)?;
+    /// descriptor mismatch, or `ProfileRefused` for an unknown id.
+    pub fn describe_profile(&mut self, profile_id: &str) -> Result<Reply, HidMaestroError> {
+        let expected_size = crate::raw_report_size_for_profile(profile_id).ok_or_else(|| {
+            HidMaestroError::ProfileRefused(format!(
+                "profile '{profile_id}' refused: only '{PROFILE_ID}' and '{G29_PROFILE_ID}' are built"
+            ))
+        })?;
+        let reply = self.request_with_timeout(
+            &Command::DescribeProfile {
+                profile: Some(profile_id.to_string()),
+            },
+            self.config.driver_op_timeout,
+        )?;
         reply_to_error(&reply)?;
         match reply.input_report_size {
-            Some(size) if size == crate::mapping::CUSTOM_RAW_REPORT_SIZE => Ok(reply),
-            Some(size) => Err(HidMaestroError::CreateFailed(format!(
-                "sidecar input_report_size is {size}, expected {} — the HID descriptor layout does not match the Rust raw-report layout",
-                crate::mapping::CUSTOM_RAW_REPORT_SIZE
-            ))),
-            None => Err(HidMaestroError::CreateFailed(
-                "describe-profile reply carries no input_report_size".to_string(),
-            )),
+            Some(size) if size == expected_size => {}
+            Some(size) => {
+                return Err(HidMaestroError::CreateFailed(format!(
+                    "sidecar input_report_size is {size}, expected {expected_size} for profile '{profile_id}' — the HID descriptor layout does not match the Rust raw-report layout"
+                )));
+            }
+            None => {
+                return Err(HidMaestroError::CreateFailed(
+                    "describe-profile reply carries no input_report_size".to_string(),
+                ));
+            }
         }
+        if profile_id == G29_PROFILE_ID {
+            match reply.descriptor_hex.as_deref() {
+                Some(hex) if hex.eq_ignore_ascii_case(G29_DESCRIPTOR_HEX) => {}
+                Some(_) => {
+                    return Err(HidMaestroError::CreateFailed(
+                        "sidecar G29 descriptor does not match the catalog logitech-g29 descriptor — refusing to create a device with an unverified identity"
+                            .to_string(),
+                    ));
+                }
+                None => {
+                    return Err(HidMaestroError::CreateFailed(
+                        "describe-profile reply carries no G29 descriptor".to_string(),
+                    ));
+                }
+            }
+            if reply.descriptor_len != Some(123)
+                || reply.vid != Some(u32::from(G29_VID))
+                || reply.pid_value != Some(u32::from(G29_PID))
+            {
+                return Err(HidMaestroError::CreateFailed(
+                    "sidecar G29 identity is not VID 0x046D / PID 0xC24F with a 123-byte descriptor"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(reply)
     }
 
     /// Submit one frame without waiting for the reply (PERF P1-1,
@@ -1438,6 +1508,9 @@ impl SidecarManager {
         // to clear here: every diagnostic read of the PID / exit
         // code happens BEFORE `kill_transport` is called.
         self.token = None;
+        // The session is gone — so is its profile (a later `create`
+        // sets it again; a dead session must never report one).
+        self.active_profile = None;
         #[cfg(windows)]
         {
             self.last_spawn_pid = None;

@@ -2506,6 +2506,7 @@ impl Ctx {
         self.sync_diag(win);
         self.sync_keep_in_tray(win);
         self.sync_steam_fh4_mode(win);
+        self.sync_g29_spoof_mode(win);
         self.sync_vjoy(win);
     }
 
@@ -4073,6 +4074,24 @@ impl Ctx {
         });
     }
 
+    /// Seed the G29 spoof mode switch from the API: change-guarded,
+    /// like [`Self::sync_steam_fh4_mode`] — the 1 Hz
+    /// `resync_from_cache` keeps it honest when the daemon-side
+    /// value moves. Skipped while a `SettingsOp` job is in flight,
+    /// so an unrelated generation bump cannot revert the
+    /// optimistic flip before the toggle job answers (the job's
+    /// own apply, or the timeout path below, owns the revert).
+    /// The sim's trait default is OFF.
+    fn sync_g29_spoof_mode(&self, win: &MainWindow) {
+        if self.busy_jobs.borrow().contains_key(&JobKind::SettingsOp) {
+            return;
+        }
+        let mode = self.api().g29_spoof_mode();
+        set_if_changed(win.get_g29_spoof_mode(), mode, |v| {
+            win.set_g29_spoof_mode(v);
+        });
+    }
+
     /// Start a background job (A9/B5): the work runs on its own
     /// thread — the UI thread never blocks on IPC, a spawn, or a
     /// flash. The busy label is recorded immediately (feedback in
@@ -4734,6 +4753,10 @@ impl Ctx {
                 // the in-flight guard in `sync_steam_fh4_mode`
                 // does not block this revert.)
                 self.sync_steam_fh4_mode(win);
+                // G29 spoof mode: same revert as the Steam FH4
+                // toggle above — a timed-out toggle reverts to the
+                // cached (pre-toggle) value.
+                self.sync_g29_spoof_mode(win);
             }
             // R2-18: a timed-out tuning push reverts its slider to
             // the stored value — the UI must not keep showing a
@@ -5727,6 +5750,60 @@ impl Ctx {
         );
     }
 
+    /// Apply a G29 spoof mode toggle, mirroring
+    /// [`Self::apply_steam_fh4_mode`]: a `SettingsOp` job (10 s
+    /// bound, busy strip = loading state, timeout reverts via
+    /// `check_job_timeouts`), so the switch is disabled while any
+    /// `SettingsOp` runs and a duplicate start cannot leave it
+    /// flipped with no apply. Success confirms the authoritative
+    /// value and toasts the restart notice; failure reverts the
+    /// prop and explains — the switch never lies about the real
+    /// setting.
+    fn apply_g29_spoof_mode(&self, win: &MainWindow, enabled: bool) {
+        self.run_generic_job(
+            win,
+            JobKind::SettingsOp,
+            "Saving…",
+            move |api| JobResult::Bool(api.set_g29_spoof_mode(enabled)),
+            move |ctx, w, result| {
+                let JobResult::Bool(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(new_state) => {
+                        w.set_g29_spoof_mode(new_state);
+                        // The flag only takes effect after the
+                        // game controller backend is restarted /
+                        // reconnected.
+                        ctx.notify_success(
+                            w,
+                            "Settings",
+                            if new_state {
+                                "G29 spoof mode on"
+                            } else {
+                                "G29 spoof mode off"
+                            },
+                            if new_state {
+                                "G29 spoof mode is on. Restart or reconnect the game controller backend for the change to take effect."
+                            } else {
+                                "G29 spoof mode is off. Restart or reconnect the game controller backend for the change to take effect."
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        // Revert the switch the binding already
+                        // flipped, and show the typed reason (a
+                        // vJoy enable says HID-only, not
+                        // "Unknown").
+                        w.set_g29_spoof_mode(!enabled);
+                        ctx.notify_error(w, "Settings", &e);
+                        ui_log!("RSH-UI set_g29_spoof_mode failed: {} ({})", e.code, e.title);
+                    }
+                }
+            },
+        );
+    }
+
     /// Open the setup wizard at Step 0 (Connect, D16): the user
     /// joins the wheel's Wi-Fi or plugs in USB there — no Begin,
     /// no pairing. A reopen starts from a clean wizard slate (no
@@ -5999,6 +6076,7 @@ impl Ctx {
         }
         win.set_autostart_enabled(seed.autostart);
         win.set_steam_fh4_mode(seed.steam_fh4_mode);
+        win.set_g29_spoof_mode(seed.g29_spoof_mode);
         // D19: the seed carries the fresh Wi-Fi state — sync the
         // Settings password card + the wizard's SSID from it (the
         // 1 Hz tick re-syncs from the cache afterwards).
@@ -12511,6 +12589,15 @@ fn wire_transport(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         let win = win.as_weak();
         let ctx = ctx.clone();
+        win.unwrap().on_g29_spoof_mode_selected(move |enabled| {
+            if let Some(w) = win.upgrade() {
+                ctx.apply_g29_spoof_mode(&w, enabled);
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
         win.unwrap().on_run_setup_again(move || {
             if let Some(w) = win.upgrade() {
                 // A18: delete the marker and open the wizard at step 0.
@@ -15686,6 +15773,7 @@ mod tests {
             backend: "vJoy".to_string(),
             autostart: true,
             steam_fh4_mode: false,
+            g29_spoof_mode: false,
             connect,
             wifi: WifiStatus {
                 ssid: None,
@@ -15805,6 +15893,7 @@ mod tests {
             backend: "vJoy".to_string(),
             autostart: true,
             steam_fh4_mode: false,
+            g29_spoof_mode: false,
             connect,
             wifi: WifiStatus {
                 ssid: None,
@@ -17079,6 +17168,7 @@ mod tests {
             backend: "vJoy".to_string(),
             autostart: true,
             steam_fh4_mode: false,
+            g29_spoof_mode: false,
             connect,
             wifi: WifiStatus {
                 ssid: None,
