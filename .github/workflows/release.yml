@@ -1,110 +1,169 @@
-# RSH v2.0 — Release (RESTRUCTURED DRAFT — 6 parallel jobs, NOT YET APPLIED)
-#
-# DRAFT — see the team report for the evidence + expected timings. DO NOT
-# apply without a dry-run first (workflow_dispatch dry_run=true): the two
-# Rust jobs use a NEW shared rust-cache key, so the first run may compile
-# cold (~+10 min each) until the cache is warm.
+# RSH v2.0 — Release (FOUR-ASSET, daemon + Slint UI)
 #
 # FOUR-ASSET RELEASE (user orders 2026-11-16 ~20:20 + 2026-11-17
-# ~07:48; SHA256SUMS added v2.0.13, P1-3) — UNCHANGED, exactly four:
+# ~07:48 — supersedes the 2026-11-15 exe-only rule; SHA256SUMS
+# added v2.0.13, P1-3): the release contains EXACTLY FOUR assets:
 #   1. NSIS installer `RSH_<version>_x64-setup.exe`
 #   2. Merged full-flash firmware `RSH-Firmware-DevKitV1-<version>.bin`
+#      (factory image, flash at 0x0)
 #   3. Signed OTA firmware `RSH-Firmware-DevKitV1-<version>-OTA.bin`
-#   4. `SHA256SUMS.txt` — SHA-256 of assets 1-3.
-# Nothing else is staged or uploaded as a release asset: no MSI, no
-# `.sig` files, no `latest.json`, no SBOMs. Auto-update is OFF.
+#      (Ed25519-signed app image — `firmware-signed.bin` — the image
+#      the app's WebOTA flow flashes to the board)
+#   4. `SHA256SUMS.txt` — SHA-256 of assets 1-3, so the installer
+#      download is verifiable (P1-3).
+# Nothing else is staged or uploaded: no MSI, no `.sig` files, no
+# `latest.json`, no SBOMs. Auto-update is OFF: no
+# `latest.json` is published, users install by downloading the exe
+# manually.
 #
-# Jobs (DAG — wall time is the longest path, not the sum):
-#   resolve       (~1 min, windows)  tag resolve + version match + the
-#                 DS-04 fail-closed CI-green check for the tag commit.
-#                 Every heavy job needs it: a red CI fails fast here
-#                 before any build starts (same as the old step order).
-#   sidecar       (~2 min, windows)  .NET + stage-sidecar.ps1 + hello
-#                 check. Uploads the 3 sidecar files as one artifact.
-#   firmware      (~2-3 min, windows) PlatformIO build + Ed25519 sign +
-#                 verify (DS-13 pubkey cross-check). Uploads merged +
-#                 signed OTA as one artifact. Needs ONLY the secret.
-#   test-release  (~18 min, windows) cargo test --release (ship crates)
-#                 + cargo deny check. The release-only --release proof;
-#                 CI runs debug tests only, so this MUST stay here.
-#   build-release (~14 min, windows) cargo build --release + perf-gate
-#                 + PDB archive/upload + PE-subsystem check + NSIS
-#                 build. Needs sidecar + firmware artifacts (the
-#                 installer bundles both). Uploads the installer exe.
-#   package       (~3 min, windows)  downloads installer + firmware
-#                 artifacts, stages + verifies exactly three files,
-#                 writes SHA256SUMS.txt, runs the headless smoke test
-#                 (install + update + firewall + daemon check +
-#                 uninstall — VERBATIM block, still under the 21,000
-#                 char GitHub expression ceiling), then creates the
-#                 GitHub Release (or the dry-run step).
-# Critical path: resolve (~1) + max(test-release ~18, build-release
-# ~14) + package (~3) = ~22 min, vs 46m38s for v2.0.15 (run
-# 45948123954). Serialized GitHub time (CI ~30 min clean + release
-# ~22 min) ≈ 52 min vs ~80 min.
+# v2.0 architecture (REDESIGN-PLAN): the SHIPPED app has no Tauri shell
+# anymore — the installer ships Slint rsh-ui + rsh-daemon only.
+# (DS-71: src-tauri/ + frontend/ still EXIST in the repo, kept-but-
+# unshipped — see the note under 'REMOVED' below. The Tauri shell is
+# still built by CI's tauri-build job, and its src-tauri/binaries/
+# dir is still the staging place for the HIDMaestro sidecar exe.)
+# The installer bundles two binaries + the HIDMaestro sidecar, all in
+# one install dir:
+#   rsh-daemon.exe            always-on daemon (engine + transport +
+#                             output + tray + auto profiles)
+#   rsh-ui.exe                Slint main window (spawned from the tray)
+#   RshCoreHiDcr.exe          HIDMaestro NativeAOT sidecar — MUST sit
+#                             beside rsh-daemon.exe: the daemon resolves
+#                             it as <own exe dir>/RshCoreHiDcr.exe
+#                             (rsh-output-hidmaestro `resolve_sidecar_path`)
+# Firmware v4.0.6 IS shipped in this release (user orders 2026-11-16
+# ~20:20 + 2026-11-17 ~07:48): BOTH firmware files, built + signed
+# HERE on the runner from the tagged source (step 6 below) — never
+# copied from a developer machine. The merged factory image is for
+# USB/full-flash; the signed OTA image is what the app's WebOTA flow
+# flashes (the board verifies the Ed25519 signature against the
+# pubkey baked into firmware/signing_pubkey.h before applying it).
+# (DS-13: the Verify step below cross-checks that baked pubkey
+# against the pubkey derived from the RSH_SIGNING_KEY_PEM secret —
+# a rotation that only one side knows about fails the release.)
+# NOTE (honest): the WebOTA flow itself (app → board) has NOT been
+# verified on the user's board yet — that stays a human gate.
 #
-# What was REMOVED from the old single job, and why each is covered:
-#   * `cargo fmt --check` + `cargo clippy --workspace --exclude
-#     rsh-app` — covered by CI for the SAME commit (DS-04 gates on
-#     CI green): CI fmt job; CI windows-check job runs exactly this
-#     clippy command for the Windows target
-#     (`--workspace --exclude rsh-app --all-targets --target
-#     x86_64-pc-windows-msvc -D warnings`); CI clippy-windows covers
-#     rsh-app. Removing them saves ~4 min and cannot hide a lint the
-#     release would have caught, because the commit is identical.
-#   * `cargo install cargo-deny --locked` (3m04s from source) —
-#     replaced by the pinned PREBUILT 0.20.2 Windows zip (SHA-256
-#     verified against the published .sha256). The `cargo deny check`
-#     step itself STAYS (the advisory DB is live — an advisory
-#     published between CI and release must still fail the release).
+# What it does, in order (every step fail-closed — a missing asset
+# or a version mismatch fails the run, never a silent partial release):
+#   1. Sidecar FIRST: fetch HIDMaestro v2.1.0, verify ZIP + DLL SHA-256,
+#      `dotnet publish` NativeAOT win-x64 (shared script
+#      `tools/ci/stage-sidecar.ps1`; it stages to
+#      `src-tauri/binaries/…` — the v2.0 installer picks the exe up
+#      from there; the Tauri shell itself is not built BY THIS
+#      WORKFLOW (CI's tauri-build job still builds it — DS-71,
+#      kept-but-unshipped).
+#   2. Gates: `cargo fmt --check`, `cargo clippy --workspace
+#      --exclude rsh-app` (Windows — every non-Tauri member),
+#      `cargo test -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc
+#      --release` (the ship crates, release mode — the one
+#      release-only proof; the debug full suite is CI's job),
+#      `cargo deny check`.
+#   3. `cargo build --release -p rsh-daemon -p rsh-ui`.
+#   4. PE-subsystem check: daemon + UI + sidecar must ALL be
+#      GUI-subsystem (2) — a console-subsystem (3) binary would pop
+#      a terminal window on launch (v1.0.0 lesson). rsh-ui sets
+#      `windows_subsystem = "windows"` (Phase 3), so this check
+#      passes; a console-subsystem binary fails it.
+#   5. NSIS installer: the committed `installer/rsh.nsi` (P1-1,
+#      v2.0.13 — extracted from this workflow), version-substituted
+#      by the "Prepare NSIS script" step, built with `makensis`.
+#      The installer:
+#        * requests admin ONCE at install time (`RequestExecutionLevel
+#          admin`) — never at login;
+#        * modern MUI2 wizard (welcome / license / directory /
+#          install / finish + RSH branding + a "Run RSH" finish
+#          checkbox that launches the UI NON-elevated via
+#          explorer.exe — v2.0.11 P4: the old ExecShell launch
+#          inherited the elevated installer token, so the UI and
+#          the daemon it spawns ran elevated) — silent
+#          (/S) installs skip all pages, so the headless smoke
+#          test is structurally unaffected;
+#        * creates the program-scoped inbound UDP firewall rule for
+#          rsh-daemon.exe (Private + Public, LOGIC-FIX-PLAN §4.3 /
+#          C-10) via `netsh` (hidden, `nsExec`), and removes it on
+#          uninstall;
+#        * registers the WER LocalDumps keys for rsh-daemon.exe /
+#          rsh-ui.exe / RshCoreHiDcr.exe (Round 3 WS-6, R3-AK-02 —
+#          native-crash dumps to `%ProgramData%\RSH\dumps`,
+#          DumpCount 5; v2.0.11 P0 adds the sidecar — its native
+#          crash used to leave no dump at all) and removes
+#          them on uninstall (the dumps themselves are kept, like
+#          `%APPDATA%\RSH`);
+#        * creates NO scheduled task (removed v2.0.13, P2-1:
+#          the old "RSH Daemon" task's logon trigger duplicated
+#          the Run key and its restart duplicated the WER restart
+#          registration); the uninstaller still removes a legacy
+#          task from older installs;
+#        * does NOT write the autostart Run key itself (P1-4):
+#          Settings owns autostart — the daemon syncs the Run key
+#          from `settings.autostart` on startup (default on), in
+#          the real user's hive.
+#   6. Firmware (v4.0.6): build with PlatformIO (`esp32dev` env),
+#      sign the app image with the release Ed25519 key (GitHub secret
+#      RSH_SIGNING_KEY_PEM — the private key never enters the repo),
+#      verify the signature + version marker fail-closed, then stage
+#      BOTH firmware assets into release-staging/ (merged factory
+#      image + signed OTA image). The merged image is the full-flash
+#      file; the OTA image is what the app's WebOTA flow flashes.
+#   7. Stage + verify: exactly THREE files in release-staging/
+#      (exe + merged + OTA), then SHA256SUMS.txt is written as a
+#      4th asset, then `gh release create` with all four
+#      (skipped on dry-run).
+#   8. Headless launch smoke test: silently install the staged NSIS
+#      exe, prove the firewall rule exists, run
+#      `rsh-daemon --check --no-tray --no-connect` (exit 0 = IPC
+#      answers), then install a SECOND time over the first (update
+#      path: user data survives, registry version is the new one,
+#      the daemon restarts non-elevated with a new pid, the Run key
+#      points at the installed daemon), launch the UI and prove a
+#      main window appears, uninstall silently, prove the rule, the
+#      install dir and the WER keys are gone. Cannot prove window
+#      paint on a headless runner — process + IPC + rule is the
+#      strongest launch evidence in CI; real paint stays a human gate.
 #
-# What was NOT reused from CI, and why (checked, not assumed):
-#   * CI test-windows builds DEBUG binaries (`cargo test --workspace`)
-#     — the shipped exes are --release with fat LTO + 1 codegen unit
-#     (Cargo.toml [profile.release]) and strip=false + PDBs. A debug
-#     binary is not the shipped binary.
-#   * CI perf-gate builds --release on LINUX — wrong OS for a Windows
-#     installer. CI tauri-build builds rsh-app (the kept-but-unshipped
-#     Tauri shell), not rsh-daemon/rsh-ui. No CI job produces the
-#     exact Windows release binaries, so none is reused; the release
-#     still compiles them once, in build-release.
-#   * The sidecar COULD be reused from CI (test-windows stages it for
-#     the same commit, pinned HIDMaestro v2.1.0 + SDK 10.0.404) but
-#     is NOT: that would couple the release to a CI artifact upload
-#     (new CI change + retention + run lookup) for the same ~71 s a
-#     parallel sidecar job already saves. Revisit only if the sidecar
-#     build itself gets slower.
+# PREREQUISITES (human gates — NOT checked by this workflow):
+#   * Workspace version bumped to the tag version (Cargo.toml
+#     `[workspace.package]`): the tag check below FAILS CLOSED until
+#     then — bump first, then tag.
+#   * App ships UNSIGNED (OV cert deferred, D-R11).
+#   * pid.codes PR for VID 0x1209 / PID 0x5253 merged (Phase G gate).
+#   * vJoy DLL SHA-256 measured on a Windows machine (G-G3) — this
+#     workflow only records whether the runner happens to have vJoy
+#     installed (it will not).
 #
-# What was deliberately NOT cached:
-#   * pip + PlatformIO (firmware job): the job is off the critical
-#     path (~2-3 min < test-release ~18 min), so caching it buys zero
-#     wall time; restoring a multi-GB ~/.platformio cache could cost
-#     more than the `pip install platformio==6.2.0` it replaces.
-#   * NSIS via choco (11 s in v2.0.15): same reasoning, keep the
-#     pinned `choco install nsis --version 3.13.0`.
+# Release assets (exact list — FOUR assets, as listed in this workflow's header):
+#   RSH_2.0.13_x64-setup.exe            (NSIS installer — app version)
+#   RSH-Firmware-DevKitV1-v4.0.6.bin    (merged full-flash firmware image — firmware version)
+#   RSH-Firmware-DevKitV1-v4.0.6-OTA.bin (Ed25519-signed OTA image — firmware version)
+#   SHA256SUMS.txt                      (SHA-256 of assets 1-3)
 #
-# Rig-gate (CI): LEFT ALONE. It is 29m20s of the ~30 min clean CI run
-# (rig step itself 27m36s, run 45941413455) because the quick suite is
-# 73 scenarios run SEQUENTIALLY with real-time sleeps (sum 727 s =
-# 12.1 min) on runners ~2x slower than the dev box, and the single
-# longest scenario, ntp-ping, is 200 s by design (p99 needs ~201
-# samples). Sharding via --only is technically possible but is a CI
-# change with its own failure semantics + report merge, and no shard
-# can beat the 200 s ntp-ping floor — so this draft does not touch
-# ci.yml or weaken the gate to buy speed.
-#
-# HARD CONSTRAINTS kept (verify before applying):
-#   * DS-04 CI-green check for the tag commit (resolve job, verbatim).
-#   * Four release assets exactly; smoke test verbatim; local gate
-#     unchanged; the smoke-test run block is NOT grown (byte-identical
-#     to the old file — check with packaging-gate.sh §3).
-#   * PDBs still come from the SAME compilation as the shipped exes
-#     (build-release job, CARGO_PROFILE_RELEASE_STRIP=false, R3-18).
-#   * Firmware is still built + signed HERE from the tagged source
-#     (firmware job), never copied from a developer machine.
-#   * `cargo test --release`, perf-gate, PE-subsystem check, firmware
-#     verify (DS-13), staged-asset verify and SHA256SUMS all stay.
-#
+# REMOVED in the v2.0 rewrite (2026-11-16) — these v1.x steps no longer
+# exist in this file:
+#   * `cargo tauri build` + the whole Tauri bundler path
+#     (`src-tauri/tauri.conf.json` version/title/bundle-targets checks,
+#     `createUpdaterArtifacts`, updater signing env, `.sig` handling)
+#     — DS-71 note: src-tauri/ + frontend/ still EXIST in the repo
+#     (the `rsh-app` workspace member, built by CI's tauri-build job)
+#     but the v2.0 installer does NOT ship the Tauri bundle: it ships
+#     the Slint `rsh-ui` + `rsh-daemon` binaries. The Tauri shell is
+#     kept-but-unshipped; its `src-tauri/binaries/` dir is still the
+#     staging place for the HIDMaestro sidecar exe (step below).
+#   * Frontend gates (`frontend/` lint/tests/build) — the v2.0 UI is
+#     the Slint `rsh-ui` crate; the `frontend/` React app is only the
+#     Tauri shell's frontendDist (kept-but-unshipped, see above).
+#   * `cargo test --workspace --release` (replaced by the four ship
+#     crates; the full debug suite runs in CI, not here — user order:
+#     no repeated full-suite loops)
+#   * Firmware build/sign/verify + SBOM regeneration/verification
+#     (the v2.0 rewrite removed them — nothing firmware/SBOM was
+#     published in a v2.0/v2.0.1 release; firmware build + sign +
+#     verify is RE-ADDED in v2.0.2 for the OTA asset, step 6 above.
+#     SBOMs are still NOT published.)
+#   * The v1.x headless smoke test that launched `RSH.exe` and waited
+#     for "event loop ready" in `%APPDATA%\RSH\logs` (replaced by the
+#     daemon `--check` + firewall-rule smoke test below)
+
 name: RSH v2.0 — Release
 
 on:
@@ -135,13 +194,33 @@ env:
   RUST_TOOLCHAIN: "1.100.0"
 
 jobs:
-  resolve:
-    name: resolve
+  release:
+    name: release
     runs-on: windows-latest
-    timeout-minutes: 10
-    outputs:
-      tag: ${{ steps.tag.outputs.tag }}
-      version: ${{ steps.tag.outputs.version }}
+    timeout-minutes: 120
+    env:
+      # R3-18 (v2.0.7 release runs 44962668126 + 44967991529 both
+      # failed at the PDB step): TWO causes, both fixed. (1) On
+      # Windows-MSVC cargo's `strip` DELETES the .pdb files — with
+      # [profile.release] strip = true, `debug = true` emits PDBs and
+      # cargo then removes them. (2) The step looked for the WRONG
+      # filenames: rustc names the PDB after the CRATE name
+      # (underscores) — the CodeView record in the shipped v2.0.6
+      # rsh-daemon.exe names `rsh_daemon.pdb`, not `rsh-daemon.pdb`
+      # (same for rsh_ui.pdb). Run 44967991529 proved (2): strip was
+      # already disabled (env in effect in every step dump, build
+      # logged "[optimized + debuginfo]") and the step still failed.
+      # The PDBs must come from the SAME compilation as the shipped
+      # exes (GUID/Age fingerprint), so strip is disabled for this job
+      # only via the documented CARGO_PROFILE_RELEASE_STRIP override
+      # (verified: cargo honors the env var; the step below searches
+      # for the real underscore names). CI/local builds keep
+      # strip = true (Linux binary sizes + perf-gate limits are
+      # measured with it). On Windows the shipped exes barely grow —
+      # debuginfo lives in the PDB, not the exe — and the release
+      # perf-gate below still enforces the size limits on the actual
+      # shipped binaries.
+      CARGO_PROFILE_RELEASE_STRIP: "false"
     steps:
       - uses: actions/checkout@v4
 
@@ -222,13 +301,15 @@ jobs:
             exit 1
           }
           Write-Host "CI gate GREEN for commit $sha (run $($run.databaseId)): $($run.url)"
-  sidecar:
-    name: sidecar
-    runs-on: windows-latest
-    timeout-minutes: 30
-    needs: [resolve]
-    steps:
-      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.100.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
 
       - name: Set up .NET 10 SDK
         uses: actions/setup-dotnet@v4
@@ -236,6 +317,31 @@ jobs:
           # Pinned (R3-12): SDK 10.0.404 is the version installed on
           # the green v2.0.6 release run (44717524848) — "10.0.x" floats.
           dotnet-version: "10.0.404"
+
+      - name: Install NSIS (makensis)
+        shell: pwsh
+        run: |
+          # windows-latest no longer ships NSIS on PATH (release run
+          # 43870249083 failed the makensis check below) — install it
+          # via Chocolatey and put it on PATH for the later steps.
+          # Pinned (R3-12): NSIS 3.13.0 is the version installed on
+          # the green v2.0.6 release run (44717524848, makensis v3.13)
+          # — an unpinned `choco install nsis` floats with the feed.
+          choco install nsis --version 3.13.0 -y --no-progress
+          $nsis = "C:\Program Files (x86)\NSIS"
+          if (Test-Path "$nsis\makensis.exe") { "$nsis" >> $env:GITHUB_PATH }
+
+      - name: Check makensis present (fail closed)
+        shell: pwsh
+        run: |
+          $makensis = Get-Command makensis -ErrorAction SilentlyContinue
+          if (-not $makensis) { Write-Error "makensis not found on the runner — the NSIS installer cannot be built. Install NSIS (https://nsis.sourceforge.io/) on the runner image."; exit 1 }
+          makensis -VERSION
+          # E2 (installer-modern): the pin above is only a request —
+          # prove the installed makensis IS the pinned 3.13.x,
+          # fail-closed, instead of trusting the choco install.
+          $ver = (makensis -VERSION) -join " "
+          if ($ver -notmatch "^v3\.13") { Write-Error "makensis version is '$ver', expected v3.13.x (NSIS pinned to 3.13.0, R3-12)."; exit 1 }
 
       # ---- Sidecar FIRST: fetch pinned HIDMaestro, verify hashes, AOT publish ----
       # The v2.0 installer bundles the staged sidecar exe beside
@@ -265,31 +371,116 @@ jobs:
       - name: Check staged sidecar hello (stdio + TCP connect-back)
         shell: pwsh
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/check-sidecar-hello.ps1
-      - name: Stage sidecar artifact (flat staging dir)
-        # The three files the installer + PE check need, copied flat so
-        # the download side needs no upload-artifact path assumptions.
+
+      # ---- Gates (superset of the CI gates for the ship crates) ----
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy --workspace --exclude rsh-app (warnings denied)
+        # Windows runner: every non-Tauri member compiles here
+        # (rsh-app is excluded — v2.0 does not build or ship it;
+        # the package name is rsh-app, NOT src-tauri: --exclude
+        # src-tauri does not match it and clippy then compiles the
+        # Tauri shell, which panics on the missing frontend/dist).
+        run: cargo clippy --workspace --exclude rsh-app --all-targets -- -D warnings
+
+      - name: cargo test (ship crates, --release)
+        # The debug full suite runs in CI on every push (user order:
+        # no repeated full-suite loops in dry runs). The --release run
+        # below stays — CI never runs --release tests, so only this
+        # workflow proves the ship crates in release mode.
+        run: cargo test -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc --release
+
+      - name: Install cargo-deny
+        # cargo-deny is not preinstalled on the runner (release run
+        # 43875439798 failed here with "no such command: `deny`").
+        # Pinned to 0.20.2 --locked, same as CI (ci.yml audit job).
+        run: cargo install cargo-deny --version 0.20.2 --locked
+
+      - name: cargo deny check
+        run: cargo deny check
+
+      # ---- Build the ship binaries ----
+      - name: cargo build --release (daemon + UI)
+        run: cargo build --release -p rsh-daemon -p rsh-ui
+
+      # R3-03: the perf gate (binary sizes vs 27/34 MB, daemon
+      # --check <= 5000 ms) never ran in the release workflow — a
+      # size/startup regression would have shipped silently. Same
+      # tools/gate-checks/perf-gate.sh the local gate and CI's
+      # `perf-gate` job run, fail-closed (no --record-only flag).
+      - name: perf-gate (sizes + daemon --check, fail-closed)
+        shell: bash
+        run: bash tools/gate-checks/perf-gate.sh --out "$RUNNER_TEMP/perf-gate"
+
+      # R3-18: archive the PDBs for this tag so a field crash can be
+      # symbolicated later. NOT a release asset — the release still
+      # ships exactly 3 files (see "Verify staged assets"). Requires
+      # [profile.release] debug = true (Cargo.toml); if the PDBs are
+      # missing the step fails closed instead of archiving nothing.
+      # PDB FILENAME: rustc names the PDB after the CRATE name
+      # (underscores), not the bin-target name (hyphens) — the
+      # CodeView record in the shipped v2.0.6 rsh-daemon.exe names
+      # `rsh_daemon.pdb` (rsh-ui.exe: `rsh_ui.pdb`); a step looking
+      # for target/release/rsh-daemon.pdb fails on a filename that
+      # never exists (v2.0.7 runs 44962668126 + 44967991529). Search
+      # the top level first, then deps/ (cargo's out-dir; the
+      # test-harness PDBs there are hash-suffixed, so the exact
+      # unhashed name is unambiguous), and normalise the found PDB
+      # to the hyphenated name the upload step below expects. The
+      # PDB must come from the SAME compilation as the shipped exes
+      # (GUID/Age fingerprint) — it does: it is emitted by the
+      # `cargo build --release` step above.
+      - name: Archive PDBs (symbols for this tag, not a release asset)
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path artifact-staging/sidecar | Out-Null
-          foreach ($f in @("src-tauri/binaries/RshCoreHiDcr-x86_64-pc-windows-msvc.exe", "src-tauri/binaries/HIDMaestro.Core.dll", "tools/rsh-hm-sidecar/HIDMaestro-LICENSE.txt")) {
-            if (-not (Test-Path $f -PathType Leaf)) { Write-Error "Sidecar artifact staging: expected file '$f' is missing."; exit 1 }
-            Copy-Item $f artifact-staging/sidecar/
+          foreach ($name in @("rsh_daemon.pdb", "rsh_ui.pdb")) {
+            $dest = "target/release/" + ($name -replace "_", "-")
+            $found = $null
+            foreach ($candidate in @("target/release/$name", "target/release/deps/$name")) {
+              if (Test-Path $candidate) { $found = $candidate; break }
+            }
+            if (-not $found) { Write-Error "PDB missing: $name (looked in target/release/ and target/release/deps/) — [profile.release] debug = true must emit it. Refusing to release without symbols (R3-18)."; exit 1 }
+            if ($found -ne $dest) { Copy-Item $found $dest }
+            Write-Host "PDB found: $found -> $dest"
           }
-      - name: Upload sidecar artifact
+      - name: Upload PDBs artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rsh-sidecar-${{ needs.resolve.outputs.tag }}
-          path: artifact-staging/sidecar/
-          retention-days: 7
-  firmware:
-    name: firmware
-    runs-on: windows-latest
-    timeout-minutes: 30
-    needs: [resolve]
-    outputs:
-      fw_version: ${{ steps.verify-firmware.outputs.fw_version }}
-    steps:
-      - uses: actions/checkout@v4
+          name: rsh-symbols-${{ steps.tag.outputs.tag }}
+          path: |
+            target/release/rsh-daemon.pdb
+            target/release/rsh-ui.pdb
+          retention-days: 90
+
+      # ---- No console window — PE subsystem must be GUI ----
+      # The v1.0.0 launch failure (user PC): the app opened behind a
+      # visible console window and then vanished. Causes were
+      # console-subsystem binaries. This step proves, before anything
+      # is published, that ALL THREE binaries are
+      # IMAGE_SUBSYSTEM_WINDOWS_GUI (2) — a CUI binary (3) fails the
+      # run. Paths: the sidecar path is where stage-sidecar.ps1 stages
+      # it; the daemon/UI exes are the workspace-root target dir.
+      - name: No console window — PE subsystem must be GUI
+        shell: pwsh
+        run: |
+          function Get-PESubsystem([string]$Path) {
+            $bytes = [System.IO.File]::ReadAllBytes($Path)
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+            return [BitConverter]::ToUInt16($bytes, $peOffset + 24 + 68)
+          }
+          $bins = @(
+            "src-tauri/binaries/RshCoreHiDcr-x86_64-pc-windows-msvc.exe",
+            "target/release/rsh-daemon.exe",
+            "target/release/rsh-ui.exe"
+          )
+          foreach ($b in $bins) {
+            if (-not (Test-Path $b)) { throw "missing binary: $b" }
+            $sub = Get-PESubsystem $b
+            # 2 = IMAGE_SUBSYSTEM_WINDOWS_GUI, 3 = IMAGE_SUBSYSTEM_WINDOWS_CUI
+            if ($sub -ne 2) { throw "$b has PE subsystem $sub, expected 2 (GUI) — a console window would open" }
+            Write-Host "$b : subsystem 2 (GUI) OK"
+          }
 
       # ---- Firmware v4.0.5: build + sign (TWO assets) ----
       # Runs BEFORE the NSIS build: the installer bundles
@@ -390,233 +581,6 @@ jobs:
           # DS-72: expose the derived firmware version for the release
           # notes below — never hardcode it there again.
           "fw_version=$fwVersion" >> $env:GITHUB_OUTPUT
-      - name: Stage firmware artifact (flat staging dir)
-        shell: pwsh
-        run: |
-          $buildDir = "firmware/.pio/build/esp32dev"
-          $merged = Get-ChildItem (Join-Path $buildDir "RSH-Firmware-DevKitV1-*.bin") -File | Where-Object { $_.Name -notmatch "-OTA\.bin$" }
-          if ($merged.Count -ne 1) { Write-Error "Expected exactly one merged firmware image in $buildDir, found $($merged.Count)."; exit 1 }
-          $signed = Join-Path $buildDir "firmware-signed.bin"
-          if (-not (Test-Path $signed)) { Write-Error "Signed OTA image (firmware-signed.bin) not found — the firmware build step did not run."; exit 1 }
-          New-Item -ItemType Directory -Force -Path artifact-staging/firmware | Out-Null
-          Copy-Item $merged[0].FullName artifact-staging/firmware/
-          Copy-Item $signed artifact-staging/firmware/
-      - name: Upload firmware artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rsh-firmware-${{ needs.resolve.outputs.tag }}
-          path: artifact-staging/firmware/
-          retention-days: 7
-  test-release:
-    name: test-release
-    runs-on: windows-latest
-    timeout-minutes: 60
-    needs: [resolve]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust 1.100.0
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.100.0"
-          components: rustfmt, clippy
-      - name: Cache Cargo dependencies (restore-only; build-release saves)
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-windows
-          save-if: "false"
-
-      - name: cargo test (ship crates, --release)
-        # The debug full suite runs in CI on every push (user order:
-        # no repeated full-suite loops in dry runs). The --release run
-        # below stays — CI never runs --release tests, so only this
-        # workflow proves the ship crates in release mode.
-        run: cargo test -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc --release
-      - name: Install cargo-deny 0.20.2 (prebuilt binary, NOT cargo install)
-        # Was `cargo install cargo-deny --version 0.20.2 --locked`
-        # (release run 45948123954: 3m04s compiling from source on a
-        # cold cache). The pinned upstream release ships a prebuilt
-        # Windows zip; download it, verify the published SHA-256,
-        # extract, put on PATH. Same version, same `cargo deny check`
-        # below — the check itself is unchanged (the advisory DB is
-        # live, so the check still runs here even though CI's audit
-        # job also runs it for the same commit).
-        shell: pwsh
-        run: |
-          $ver = "0.20.2"
-          $asset = "cargo-deny-$ver-x86_64-pc-windows-msvc.tar.gz"
-          $base = "https://github.com/EmbarkStudios/cargo-deny/releases/download/$ver"
-          $zip = Join-Path $env:RUNNER_TEMP $asset
-          Invoke-WebRequest -Uri "$base/$asset" -OutFile $zip
-          Invoke-WebRequest -Uri "$base/$asset.sha256" -OutFile "$zip.sha256"
-          $want = ((Get-Content "$zip.sha256" -Raw) -split '\s+')[0].ToLower()
-          $got = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          if ($got -ne $want) { Write-Error "cargo-deny download SHA-256 mismatch: got $got, published $want. Refusing a tampered binary."; exit 1 }
-          $dir = Join-Path $env:RUNNER_TEMP "cargo-deny-$ver"
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          tar -xzf $zip -C $dir
-          $exe = Get-ChildItem -Path $dir -Recurse -Filter "cargo-deny.exe" -File
-          if ($exe.Count -ne 1) { Write-Error "Expected exactly one cargo-deny.exe in the extracted archive, found $($exe.Count)."; exit 1 }
-          $exe.DirectoryName >> $env:GITHUB_PATH
-          & $exe.FullName --version
-
-      - name: cargo deny check
-        run: cargo deny check
-  build-release:
-    name: build-release
-    runs-on: windows-latest
-    timeout-minutes: 60
-    needs: [resolve, sidecar, firmware]
-    env:
-      # R3-18: strip=false for this job only so [profile.release]
-      # debug = true emits the PDBs the archive step needs (cargo's
-      # strip DELETES .pdb files on Windows-MSVC). CI/local keep
-      # strip = true.
-      CARGO_PROFILE_RELEASE_STRIP: "false"
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust 1.100.0
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.100.0"
-          components: rustfmt, clippy
-      - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-windows
-      - name: Download sidecar artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: rsh-sidecar-${{ needs.resolve.outputs.tag }}
-          path: sidecar-artifact
-      - name: Download firmware artifact (signed image for the installer)
-        uses: actions/download-artifact@v4
-        with:
-          name: rsh-firmware-${{ needs.resolve.outputs.tag }}
-          path: firmware-artifact
-      - name: Place downloaded artifacts at the NSIS / PE-check paths
-        # The NSIS build + PE-subsystem steps below are verbatim and
-        # read these exact paths, so place the downloads there.
-        shell: pwsh
-        run: |
-          foreach ($f in @("sidecar-artifact/RshCoreHiDcr-x86_64-pc-windows-msvc.exe", "sidecar-artifact/HIDMaestro.Core.dll", "sidecar-artifact/HIDMaestro-LICENSE.txt", "firmware-artifact/firmware-signed.bin")) {
-            if (-not (Test-Path $f -PathType Leaf)) { Write-Error "Downloaded artifact missing: $f."; exit 1 }
-          }
-          New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
-          New-Item -ItemType Directory -Force -Path tools/rsh-hm-sidecar | Out-Null
-          New-Item -ItemType Directory -Force -Path firmware/.pio/build/esp32dev | Out-Null
-          Copy-Item sidecar-artifact/RshCoreHiDcr-x86_64-pc-windows-msvc.exe src-tauri/binaries/
-          Copy-Item sidecar-artifact/HIDMaestro.Core.dll src-tauri/binaries/
-          Copy-Item sidecar-artifact/HIDMaestro-LICENSE.txt tools/rsh-hm-sidecar/
-          Copy-Item firmware-artifact/firmware-signed.bin firmware/.pio/build/esp32dev/
-
-      - name: Install NSIS (makensis)
-        shell: pwsh
-        run: |
-          # windows-latest no longer ships NSIS on PATH (release run
-          # 43870249083 failed the makensis check below) — install it
-          # via Chocolatey and put it on PATH for the later steps.
-          # Pinned (R3-12): NSIS 3.13.0 is the version installed on
-          # the green v2.0.6 release run (44717524848, makensis v3.13)
-          # — an unpinned `choco install nsis` floats with the feed.
-          choco install nsis --version 3.13.0 -y --no-progress
-          $nsis = "C:\Program Files (x86)\NSIS"
-          if (Test-Path "$nsis\makensis.exe") { "$nsis" >> $env:GITHUB_PATH }
-
-      - name: Check makensis present (fail closed)
-        shell: pwsh
-        run: |
-          $makensis = Get-Command makensis -ErrorAction SilentlyContinue
-          if (-not $makensis) { Write-Error "makensis not found on the runner — the NSIS installer cannot be built. Install NSIS (https://nsis.sourceforge.io/) on the runner image."; exit 1 }
-          makensis -VERSION
-          # E2 (installer-modern): the pin above is only a request —
-          # prove the installed makensis IS the pinned 3.13.x,
-          # fail-closed, instead of trusting the choco install.
-          $ver = (makensis -VERSION) -join " "
-          if ($ver -notmatch "^v3\.13") { Write-Error "makensis version is '$ver', expected v3.13.x (NSIS pinned to 3.13.0, R3-12)."; exit 1 }
-
-      # ---- Build the ship binaries ----
-      - name: cargo build --release (daemon + UI)
-        run: cargo build --release -p rsh-daemon -p rsh-ui
-
-      # R3-03: the perf gate (binary sizes vs 27/34 MB, daemon
-      # --check <= 5000 ms) never ran in the release workflow — a
-      # size/startup regression would have shipped silently. Same
-      # tools/gate-checks/perf-gate.sh the local gate and CI's
-      # `perf-gate` job run, fail-closed (no --record-only flag).
-      - name: perf-gate (sizes + daemon --check, fail-closed)
-        shell: bash
-        run: bash tools/gate-checks/perf-gate.sh --out "$RUNNER_TEMP/perf-gate"
-
-      # R3-18: archive the PDBs for this tag so a field crash can be
-      # symbolicated later. NOT a release asset — the release still
-      # ships exactly 3 files (see "Verify staged assets"). Requires
-      # [profile.release] debug = true (Cargo.toml); if the PDBs are
-      # missing the step fails closed instead of archiving nothing.
-      # PDB FILENAME: rustc names the PDB after the CRATE name
-      # (underscores), not the bin-target name (hyphens) — the
-      # CodeView record in the shipped v2.0.6 rsh-daemon.exe names
-      # `rsh_daemon.pdb` (rsh-ui.exe: `rsh_ui.pdb`); a step looking
-      # for target/release/rsh-daemon.pdb fails on a filename that
-      # never exists (v2.0.7 runs 44962668126 + 44967991529). Search
-      # the top level first, then deps/ (cargo's out-dir; the
-      # test-harness PDBs there are hash-suffixed, so the exact
-      # unhashed name is unambiguous), and normalise the found PDB
-      # to the hyphenated name the upload step below expects. The
-      # PDB must come from the SAME compilation as the shipped exes
-      # (GUID/Age fingerprint) — it does: it is emitted by the
-      # `cargo build --release` step above.
-      - name: Archive PDBs (symbols for this tag, not a release asset)
-        shell: pwsh
-        run: |
-          foreach ($name in @("rsh_daemon.pdb", "rsh_ui.pdb")) {
-            $dest = "target/release/" + ($name -replace "_", "-")
-            $found = $null
-            foreach ($candidate in @("target/release/$name", "target/release/deps/$name")) {
-              if (Test-Path $candidate) { $found = $candidate; break }
-            }
-            if (-not $found) { Write-Error "PDB missing: $name (looked in target/release/ and target/release/deps/) — [profile.release] debug = true must emit it. Refusing to release without symbols (R3-18)."; exit 1 }
-            if ($found -ne $dest) { Copy-Item $found $dest }
-            Write-Host "PDB found: $found -> $dest"
-          }
-      - name: Upload PDBs artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rsh-symbols-${{ needs.resolve.outputs.tag }}
-          path: |
-            target/release/rsh-daemon.pdb
-            target/release/rsh-ui.pdb
-          retention-days: 90
-
-      # ---- No console window — PE subsystem must be GUI ----
-      # The v1.0.0 launch failure (user PC): the app opened behind a
-      # visible console window and then vanished. Causes were
-      # console-subsystem binaries. This step proves, before anything
-      # is published, that ALL THREE binaries are
-      # IMAGE_SUBSYSTEM_WINDOWS_GUI (2) — a CUI binary (3) fails the
-      # run. Paths: the sidecar path is where stage-sidecar.ps1 stages
-      # it; the daemon/UI exes are the workspace-root target dir.
-      - name: No console window — PE subsystem must be GUI
-        shell: pwsh
-        run: |
-          function Get-PESubsystem([string]$Path) {
-            $bytes = [System.IO.File]::ReadAllBytes($Path)
-            $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
-            return [BitConverter]::ToUInt16($bytes, $peOffset + 24 + 68)
-          }
-          $bins = @(
-            "src-tauri/binaries/RshCoreHiDcr-x86_64-pc-windows-msvc.exe",
-            "target/release/rsh-daemon.exe",
-            "target/release/rsh-ui.exe"
-          )
-          foreach ($b in $bins) {
-            if (-not (Test-Path $b)) { throw "missing binary: $b" }
-            $sub = Get-PESubsystem $b
-            # 2 = IMAGE_SUBSYSTEM_WINDOWS_GUI, 3 = IMAGE_SUBSYSTEM_WINDOWS_CUI
-            if ($sub -ne 2) { throw "$b has PE subsystem $sub, expected 2 (GUI) — a console window would open" }
-            Write-Host "$b : subsystem 2 (GUI) OK"
-          }
 
       # ---- NSIS installer (exe + bundled firmware image) ----
       # The installer is the COMMITTED installer/rsh.nsi (P1-1,
@@ -655,7 +619,7 @@ jobs:
           # same -replace the old inline step used). The committed
           # file keeps the placeholders; the substituted copy is
           # what makensis builds (runner workspace only).
-          (Get-Content installer\rsh.nsi -Raw) -replace '\$\{VERSION\}', "${{ needs.resolve.outputs.version }}" | Set-Content -Path installer\rsh.nsi -Encoding ASCII
+          (Get-Content installer\rsh.nsi -Raw) -replace '\$\{VERSION\}', "${{ steps.tag.outputs.version }}" | Set-Content -Path installer\rsh.nsi -Encoding ASCII
           # Audit (v2.0.13): fail fast if any placeholder survived
           # the substitution — a literal "${VERSION}" would
           # otherwise ship into DisplayVersion and only fail 40
@@ -692,49 +656,25 @@ jobs:
           # makensis defines, split from the tag version — the
           # installer's old WordFind parse returned the wrong
           # minor (2 instead of 0 for 2.0.13).
-          $tagVersion = "${{ needs.resolve.outputs.version }}"
+          $tagVersion = "${{ steps.tag.outputs.version }}"
           if ($tagVersion -notmatch '^\d+\.\d+\.\d+$') { Write-Error "Tag version '$tagVersion' is not x.y.z — cannot derive VersionMajor/Minor."; exit 1 }
           $major = [int]($tagVersion.Split('.')[0]); $minor = [int]($tagVersion.Split('.')[1])
           makensis "-DESTIMATEDSIZEKB=$installedKb" "-DVERSIONMAJOR=$major" "-DVERSIONMINOR=$minor" installer\rsh.nsi
           Get-ChildItem release-staging -File | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) B)" }
-      - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rsh-installer-${{ needs.resolve.outputs.tag }}
-          path: release-staging/RSH_${{ needs.resolve.outputs.version }}_x64-setup.exe
-          retention-days: 7
-  package:
-    name: package
-    runs-on: windows-latest
-    timeout-minutes: 30
-    needs: [resolve, test-release, build-release, firmware]
-    env:
-      # Short alias for the tag version: the smoke-test run block is
-      # counted against GitHub's 21,000-char ceiling, so it reads
-      # $env:RSH_VERSION (17 chars) instead of the 38-char
-      # ${{ needs.resolve.outputs.version }} expression (same value).
-      RSH_VERSION: ${{ needs.resolve.outputs.version }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download installer artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: rsh-installer-${{ needs.resolve.outputs.tag }}
-          path: release-staging
-      - name: Download firmware artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: rsh-firmware-${{ needs.resolve.outputs.tag }}
-          path: firmware-artifact
+
+      # ---- Stage firmware assets (after the NSIS build) ----
+      # Copies the verified merged + OTA images into release-staging
+      # under their release names. Runs after the NSIS build so the
+      # staged exe and the firmware assets land together; the
+      # "Verify staged assets" step below expects exactly three files.
       - name: Stage firmware assets
-        # Same checks as the old step, but the source is the firmware
-        # job's artifact (flat dir) instead of firmware/.pio/build/.
         shell: pwsh
         run: |
-          $merged = Get-ChildItem "firmware-artifact/RSH-Firmware-DevKitV1-*.bin" -File | Where-Object { $_.Name -notmatch "-OTA\.bin$" }
-          if ($merged.Count -ne 1) { Write-Error "Expected exactly one merged firmware image in firmware-artifact, found $($merged.Count)."; exit 1 }
-          $signed = Join-Path "firmware-artifact" "firmware-signed.bin"
-          if (-not (Test-Path $signed)) { Write-Error "Signed OTA image (firmware-signed.bin) not found in the firmware artifact — the firmware job did not run."; exit 1 }
+          $buildDir = "firmware/.pio/build/esp32dev"
+          $merged = Get-ChildItem (Join-Path $buildDir "RSH-Firmware-DevKitV1-*.bin") -File | Where-Object { $_.Name -notmatch "-OTA\.bin$" }
+          if ($merged.Count -ne 1) { Write-Error "Expected exactly one merged firmware image in $buildDir, found $($merged.Count)."; exit 1 }
+          $signed = Join-Path $buildDir "firmware-signed.bin"
+          if (-not (Test-Path $signed)) { Write-Error "Signed OTA image (firmware-signed.bin) not found — the firmware build step did not run."; exit 1 }
           $otaName = $merged[0].BaseName + "-OTA.bin"
           Copy-Item $merged[0].FullName (Join-Path "release-staging" $merged[0].Name)
           Copy-Item $signed (Join-Path "release-staging" $otaName)
@@ -746,14 +686,14 @@ jobs:
         shell: pwsh
         run: |
           $staging = "release-staging"
-          $version = "${{ needs.resolve.outputs.version }}"
+          $version = "${{ steps.tag.outputs.version }}"
           $files = Get-ChildItem $staging -File
           if ($files.Count -ne 3) { Write-Error "Expected exactly THREE staged assets (NSIS exe + merged firmware + OTA firmware), found $($files.Count): $(($files | ForEach-Object { $_.Name }) -join ', ')."; exit 1 }
           $names = $files | ForEach-Object { $_.Name }
           if ($names -notcontains "RSH_${version}_x64-setup.exe") { Write-Error "Staged NSIS exe 'RSH_${version}_x64-setup.exe' not found (found: $($names -join ', '))."; exit 1 }
           # P3: pin the firmware names to the version the Verify
           # firmware step derived from the built image
-          # (needs.firmware.outputs.fw_version) — the old
+          # (steps.verify-firmware.outputs.fw_version) — the old
 
       # P1-3 (v2.0.13 polish): publish SHA256SUMS.txt as a 4th
       # release asset so the installer download is verifiable
@@ -784,7 +724,7 @@ jobs:
           Get-Content (Join-Path $staging "SHA256SUMS.txt")
           # generic v\d+\.\d+\.\d+ regexes would have accepted a
           # stale/wrong-version firmware file as the release asset.
-          $fwVersion = "${{ needs.firmware.outputs.fw_version }}"
+          $fwVersion = "${{ steps.verify-firmware.outputs.fw_version }}"
           if (-not $fwVersion) { Write-Error "Staged-asset check: the Verify firmware step produced no fw_version output — cannot pin the firmware names. Failing closed."; exit 1 }
           $merged = @($names | Where-Object { $_ -match ('^RSH-Firmware-DevKitV1-v' + [regex]::Escape($fwVersion) + '\.bin$') })
           $ota = @($names | Where-Object { $_ -match ('^RSH-Firmware-DevKitV1-v' + [regex]::Escape($fwVersion) + '-OTA\.bin$') })
@@ -894,7 +834,7 @@ jobs:
           $reg32 = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry32)
           $unKey = $reg32.OpenSubKey("Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH")
           if (-not $unKey) { Write-Error "Smoke test: ARP Uninstall key 'RSH' not found after install (32-bit view)."; exit 1 }
-          $version = "$env:RSH_VERSION"
+          $version = "${{ steps.tag.outputs.version }}"
           if ($unKey.GetValue("DisplayName") -notlike "RSH*") { Write-Error "Smoke test: ARP DisplayName is '$($unKey.GetValue("DisplayName"))', expected 'RSH* '."; exit 1 }
           if ($unKey.GetValue("DisplayVersion") -ne $version) { Write-Error "Smoke test: ARP DisplayVersion is '$($unKey.GetValue("DisplayVersion"))', expected '$version'."; exit 1 }
           if ($unKey.GetValue("Publisher") -ne "Dreamsofts") { Write-Error "Smoke test: ARP Publisher is '$($unKey.GetValue("Publisher"))', expected 'Dreamsofts'."; exit 1 }
@@ -912,7 +852,7 @@ jobs:
           Start-WaitOrFail $daemon @("--check", "--no-tray", "--no-connect", "--data-dir", $dataDir) 60 "daemon --check (IPC must answer)"
           Write-Host "Smoke test PASS: daemon --check exit 0 (IPC answers)."
           # --- Update path: install a second time over the first --------
-          $version = "$env:RSH_VERSION"
+          $version = "${{ steps.tag.outputs.version }}"
           $realDataDir = Join-Path $env:APPDATA "RSH"
           New-Item -ItemType Directory -Force -Path $realDataDir | Out-Null
           Set-Content -Path (Join-Path $realDataDir "smoke-marker.txt") -Value "user data must survive an update" -Encoding ASCII
@@ -1099,7 +1039,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ needs.resolve.outputs.tag }}"
+          $tag = "${{ steps.tag.outputs.tag }}"
           # Audit (v2.0.13, B P3): fail closed unless the tag exists
           # — a typo'd inputs.tag would otherwise make `gh release
           # create` invent the tag at the dispatch ref and publish
@@ -1110,7 +1050,7 @@ jobs:
           if ($files.Count -ne 4) { Write-Error "Expected exactly four staged files (NSIS exe + merged firmware + OTA firmware + SHA256SUMS.txt) — refusing to create a partial release."; exit 1 }
           Write-Host "Releasing 4 files:"
           $files | ForEach-Object { Write-Host "  $_" }
-          $notes = "RSH v${{ needs.resolve.outputs.version }} — NSIS installer + firmware v${{ needs.firmware.outputs.fw_version }} (merged full-flash image + Ed25519-signed OTA image for the app's WebOTA flow). v2.0 redesign: Slint UI + always-on daemon (tray popup + menu, autostart, lazy-start — no UAC prompt at login). Auto-update is off for this release: no latest.json is published — download and install manually. App ships unsigned (OV cert deferred, D-R11). Installer SHA-256: ${{ steps.sha256sums.outputs.exe_sha256 }} (verify against SHA256SUMS.txt). Uninstall keeps %APPDATA%\RSH (profiles/settings/logs) and %ProgramData%\RSH\dumps (crash dumps) — delete them manually for a fully clean start. Uninstall leaves the vJoy device 1 wheel configuration in place (re-configure it in vJoyConf if needed)."
+          $notes = "RSH v${{ steps.tag.outputs.version }} — NSIS installer + firmware v${{ steps.verify-firmware.outputs.fw_version }} (merged full-flash image + Ed25519-signed OTA image for the app's WebOTA flow). v2.0 redesign: Slint UI + always-on daemon (tray popup + menu, autostart, lazy-start — no UAC prompt at login). Auto-update is off for this release: no latest.json is published — download and install manually. App ships unsigned (OV cert deferred, D-R11). Installer SHA-256: ${{ steps.sha256sums.outputs.exe_sha256 }} (verify against SHA256SUMS.txt). Uninstall keeps %APPDATA%\RSH (profiles/settings/logs) and %ProgramData%\RSH\dumps (crash dumps) — delete them manually for a fully clean start. Uninstall leaves the vJoy device 1 wheel configuration in place (re-configure it in vJoyConf if needed)."
           # Audit (v2.0.13, B P2): `gh release create` fails (HTTP
           # 422, already exists) when a release for the tag exists
           # — a re-run after a partially-successful create would
@@ -1123,7 +1063,7 @@ jobs:
             gh release edit $tag --notes $notes
             if ($LASTEXITCODE -ne 0) { Write-Error "gh release edit failed for $tag."; exit 1 }
           } else {
-            gh release create $tag --title "RSH v${{ needs.resolve.outputs.version }}" --notes $notes $files
+            gh release create $tag --title "RSH v${{ steps.tag.outputs.version }}" --notes $notes $files
             if ($LASTEXITCODE -ne 0) { Write-Error "gh release create failed for $tag."; exit 1 }
           }
 
