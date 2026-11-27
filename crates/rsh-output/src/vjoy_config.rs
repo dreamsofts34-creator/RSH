@@ -1146,6 +1146,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn set_wheel_flag_is_windows_only_off_windows() {
         // Linux build: the registry write cannot run here.
         assert!(
