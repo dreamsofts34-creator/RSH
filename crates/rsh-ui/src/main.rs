@@ -1070,24 +1070,34 @@ impl JobKind {
             // IPC (390 s) > worst case incl. UAC (370 s) > worst
             // case post-UAC (310 s).
             JobKind::Backend => Duration::from_secs(420),
-            // FirmwareUpdate is 10 s on purpose (A9); settings ops
-            // share it — they can cross a UAC prompt (HIDMaestro
-            // enable), the same bound the old callers tolerated,
-            // but now with a visible timeout. The app update check
-            // (DS-20) shares it too: it is one bounded network
-            // round-trip (`curl --max-time 8`). The sensitivity push
-            // shares it as well: it is four board control sessions
-            // (read → stage → commit → confirm), not one round-trip.
+            // v2.0.18 job/IPC invariant: a job timeout MUST exceed
+            // the IPC bound of the call it runs, or a healthy but
+            // slow call is declared timed out, its apply dropped,
+            // and the user told it failed while the daemon keeps
+            // working (the v2.0.17 G29-toggle shape — the IPC arm
+            // was fixed to 390 s but the job still gave up at 10 s).
+            // `set_tuning` / `set_shifter_sensitivity` /
+            // `update_firmware` / `firmware_check` all ride a 10 s
+            // IPC arm (`timeout_for_method`), so their jobs get
+            // 15 s — a lossy link + board control retries can push
+            // a push/check past the old 5–10 s bounds while the
+            // daemon still lands it.
             JobKind::FirmwareUpdate
-            | JobKind::SettingsOp
-            | JobKind::AppUpdateCheck
-            | JobKind::SensitivityPush => Duration::from_secs(10),
-            // Everything else is a couple of round-trips at most
-            // (F6: a tuning push is one `set_tuning`).
-            JobKind::Transport
+            | JobKind::SensitivityPush
             | JobKind::FirmwareCheck
+            | JobKind::TuningPush => Duration::from_secs(15),
+            // Settings ops share 10 s — they are fast settings
+            // writes (500 ms IPC default), EXCEPT the slow ones,
+            // which pass an explicit timeout to
+            // `run_generic_job_timeout` instead (G29 spoof /
+            // send-to-game 420 s, Wi-Fi join 300 s, Wi-Fi password
+            // 30 s, backup/restore 40 s). The app update check
+            // (DS-20) shares it too: it is one bounded network
+            // round-trip (`curl --max-time 8`).
+            JobKind::SettingsOp | JobKind::AppUpdateCheck => Duration::from_secs(10),
+            // Everything else is a couple of round-trips at most.
+            JobKind::Transport
             | JobKind::RawAvailable
-            | JobKind::TuningPush
             | JobKind::ProfileOp
             | JobKind::BindingOp
             | JobKind::CaptureOp
@@ -1132,12 +1142,18 @@ impl JobKind {
     }
 }
 
+/// Running jobs, by kind: (busy label, started at, give-up
+/// timeout) — the timeout is `kind.timeout()` for most jobs, the
+/// explicit override for the slow `SettingsOp` jobs (see
+/// [`Ctx::run_generic_job_timeout`]).
+type BusyJobs = HashMap<JobKind, (String, Instant, Duration)>;
+
 /// The oldest running job (DS-54): the strip shows one job at a
 /// time — the one that started first; ties break by
 /// [`JobKind::order`]. Returns the kind + its label.
-fn oldest_busy_job(jobs: &HashMap<JobKind, (String, Instant)>) -> Option<(JobKind, &str)> {
+fn oldest_busy_job(jobs: &BusyJobs) -> Option<(JobKind, &str)> {
     let mut best: Option<(Instant, u8, JobKind, &str)> = None;
-    for (kind, (label, started)) in jobs {
+    for (kind, (label, started, _)) in jobs {
         let candidate = (*started, kind.order(), *kind, label.as_str());
         let take = best.is_none_or(|(old_started, old_order, _, _)| {
             candidate.0 < old_started || (candidate.0 == old_started && candidate.1 < old_order)
@@ -1152,7 +1168,7 @@ fn oldest_busy_job(jobs: &HashMap<JobKind, (String, Instant)>) -> Option<(JobKin
 /// Busy-strip state (B5, FC2) for a `busy_jobs` map: `(false, "")`
 /// when nothing runs, otherwise `(true, label)` of the OLDEST
 /// running job (see [`oldest_busy_job`]).
-fn busy_state_for(jobs: &HashMap<JobKind, (String, Instant)>) -> (bool, String) {
+fn busy_state_for(jobs: &BusyJobs) -> (bool, String) {
     oldest_busy_job(jobs).map_or_else(
         || (false, String::new()),
         |(_, label)| (true, label.to_string()),
@@ -1163,7 +1179,7 @@ fn busy_state_for(jobs: &HashMap<JobKind, (String, Instant)>) -> (bool, String) 
 /// [`JobKind::order`] value the Slint `busy-kind` prop reads
 /// (`-1` = idle): screens disable + dim the button that started it,
 /// so a second click while its job runs is impossible.
-fn busy_kind_for(jobs: &HashMap<JobKind, (String, Instant)>) -> i32 {
+fn busy_kind_for(jobs: &BusyJobs) -> i32 {
     oldest_busy_job(jobs).map_or(-1, |(kind, _)| i32::from(kind.order()))
 }
 
@@ -1223,6 +1239,28 @@ const FLAP_BURST_UPTIME: Duration = Duration::from_secs(30);
 /// own post-failure refusal window, so the UI and the daemon
 /// re-enable together.
 const BACKEND_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// v2.0.18 long-job timeouts (job/IPC invariant — see
+/// [`JobKind::timeout`]): the per-call bounds passed to
+/// [`Ctx::run_generic_job_timeout`] for the `SettingsOp` jobs whose
+/// IPC bound exceeds the kind's 10 s. Each exceeds its IPC bound
+/// with margin, so a healthy slow call is never declared timed out.
+///
+/// - G29 spoof / send-to-game: 420 s, the same invariant as the
+///   Backend job (420 s) > IPC (390 s) > daemon worst case (370 s).
+/// - Wi-Fi join: 300 s — scan (45 s IPC) + rejoin (180 s IPC) +
+///   connect, run sequentially, worst case ≈ 230 s.
+/// - Wi-Fi password set/forget: 30 s — one board control session
+///   (HELLO retries 3 × 750 ms + command retries 3 × 250 ms, a
+///   couple of sessions ≈ 15 s worst case); the 180 s IPC arm is
+///   shared headroom with the netsh rejoin flow, not this call's
+///   own work.
+/// - Backup/restore: 40 s — the IPC arm is 30 s (file copies).
+const LONG_JOB_TIMEOUT_SPOOF: Duration = Duration::from_secs(420);
+const LONG_JOB_TIMEOUT_SEND: Duration = Duration::from_secs(420);
+const LONG_JOB_TIMEOUT_WIFI_JOIN: Duration = Duration::from_secs(300);
+const LONG_JOB_TIMEOUT_WIFI_PASSWORD: Duration = Duration::from_secs(30);
+const LONG_JOB_TIMEOUT_BACKUP: Duration = Duration::from_secs(40);
 
 /// F12 (v2.0.3): a burst count older than this is stale — a much
 /// later, unrelated death must not claim "flapped ×N".
@@ -2103,10 +2141,10 @@ struct Ctx {
     /// `Mutex` is needed for the drain side.
     job_tx: std::sync::mpsc::Sender<JobDone>,
     job_rx: Rc<RefCell<std::sync::mpsc::Receiver<JobDone>>>,
-    /// Jobs currently running, by kind: (busy label, started at).
-    /// The frame timer times a stale entry out with a visible error
-    /// — loading is never infinite (B5).
-    busy_jobs: Rc<RefCell<HashMap<JobKind, (String, Instant)>>>,
+    /// Jobs currently running, by kind: (busy label, started at,
+    /// give-up timeout). The frame timer times a stale entry out
+    /// with a visible error — loading is never infinite (B5).
+    busy_jobs: Rc<RefCell<BusyJobs>>,
     /// Next generic-job id (F6): handed out by `run_generic_job`,
     /// routed back by `JobDone::Generic`.
     next_job_id: Rc<Cell<u64>>,
@@ -3801,17 +3839,23 @@ impl Ctx {
         let jobs = self.busy_jobs.borrow();
         let (busy, label) = busy_state_for(&jobs);
         let kind = busy_kind_for(&jobs);
-        if !busy || kind != i32::from(JobKind::Backend.order()) {
+        if !busy {
             return (busy, label, kind, String::new());
         }
-        let secs = jobs
-            .get(&JobKind::Backend)
-            .map_or(0, |(_, started)| started.elapsed().as_secs());
+        // v2.0.18 (P1-6 generalised): the elapsed clock runs for
+        // EVERY job, not just the Backend switch — a 420 s G29
+        // toggle or a 300 s Wi-Fi join must show it is still
+        // working, not a bare spinner. The oldest busy job owns
+        // the strip (same tie-break as the label/kind above).
+        let secs = oldest_busy_job(&jobs).map_or(0, |(job_kind, _)| {
+            jobs.get(&job_kind)
+                .map_or(0, |(_, started, _)| started.elapsed().as_secs())
+        });
         let elapsed = Self::fmt_elapsed(secs);
-        // Stage label (see above): the stored label stays
+        // Stage label (Backend only): the stored label stays
         // "Switching controller…" — only the displayed label
         // stages, so the timeout toast still names the job.
-        let label = if secs >= 60 {
+        let label = if kind == i32::from(JobKind::Backend.order()) && secs >= 60 {
             "Switching controller… — still working".to_string()
         } else {
             label
@@ -4171,7 +4215,7 @@ impl Ctx {
         }
         self.busy_jobs
             .borrow_mut()
-            .insert(kind, (label.to_string(), Instant::now()));
+            .insert(kind, (label.to_string(), Instant::now(), kind.timeout()));
         // B5/FC2: the strip shows the job immediately (<100 ms
         // feedback — the frame timer is 50 ms, but the label is
         // already in `busy_jobs`, so drive the props now).
@@ -4194,12 +4238,20 @@ impl Ctx {
     /// `Rc` state and window props — it never leaves the UI thread.
     /// A second job of the same kind is ignored (same rule as
     /// [`Ctx::run_job`]); the apply is dropped when the job times
-    /// out, so a late result never applies.
-    fn run_generic_job(
+    /// out, so a late result never applies. The job times out after
+    /// `timeout` — for the `SettingsOp` jobs whose IPC bound exceeds
+    /// the kind's 10 s (G29 spoof / send-to-game / Wi-Fi join /
+    /// Wi-Fi password / backup/restore; see the
+    /// `LONG_JOB_TIMEOUT_*` consts). The kind stays `SettingsOp`,
+    /// so the Slint `busy-kind == 14` disables and the timeout
+    /// revert block in [`Self::check_job_timeouts`] still apply —
+    /// only the give-up bound moves.
+    fn run_generic_job_timeout(
         &self,
         win: &MainWindow,
         kind: JobKind,
         label: &str,
+        timeout: Duration,
         work: impl FnOnce(Arc<dyn AppApi>) -> JobResult + Send + 'static,
         apply: impl FnOnce(&Ctx, &MainWindow, JobResult) + 'static,
     ) -> bool {
@@ -4214,7 +4266,7 @@ impl Ctx {
             .insert(id, (kind, Box::new(apply)));
         self.busy_jobs
             .borrow_mut()
-            .insert(kind, (label.to_string(), Instant::now()));
+            .insert(kind, (label.to_string(), Instant::now(), timeout));
         self.sync_busy(win);
         let api = self.api();
         let tx = self.job_tx.clone();
@@ -4227,6 +4279,20 @@ impl Ctx {
                 }
             });
         true
+    }
+
+    /// Same as [`Self::run_generic_job_timeout`] with
+    /// `timeout = kind.timeout()`.
+    fn run_generic_job(
+        &self,
+        win: &MainWindow,
+        kind: JobKind,
+        label: &str,
+        work: impl FnOnce(Arc<dyn AppApi>) -> JobResult + Send + 'static,
+        apply: impl FnOnce(&Ctx, &MainWindow, JobResult) + 'static,
+    ) -> bool {
+        let timeout = kind.timeout();
+        self.run_generic_job_timeout(win, kind, label, timeout, work, apply)
     }
 
     /// Drain finished jobs on the UI thread (frame timer): each
@@ -4708,8 +4774,14 @@ impl Ctx {
     fn check_job_timeouts(&self, win: &MainWindow) {
         let now = Instant::now();
         let mut timed_out: Vec<(JobKind, String)> = Vec::new();
-        for (kind, (label, started)) in self.busy_jobs.borrow().iter() {
-            if now.duration_since(*started) > kind.timeout() {
+        for (kind, (label, started, timeout)) in self.busy_jobs.borrow().iter() {
+            // v2.0.18: the give-up bound is the one stored with the
+            // entry — `kind.timeout()` for most jobs, the explicit
+            // override for the slow SettingsOp jobs (see
+            // `run_generic_job_timeout`). Comparing against the
+            // kind default here would time a 420 s G29 toggle out
+            // at 10 s again.
+            if now.duration_since(*started) > *timeout {
                 timed_out.push((*kind, label.clone()));
             }
         }
@@ -4802,6 +4874,14 @@ impl Ctx {
                 // flight — so for any other SettingsOp timeout
                 // this is a no-op clear of an already-false prop.
                 win.set_wifi_password_busy(false);
+                // v2.0.18: the same dropped-apply shape wedges the
+                // wizard's Wi-Fi Join button — its apply is the
+                // only place `setup_wifi_joining` clears, and the
+                // button stays "Joining…" + disabled while the
+                // prop is true (setup.slint:310). Clear it here so
+                // a timed-out join can be retried in the wizard
+                // instead of needing a reopen.
+                win.set_setup_wifi_joining(false);
                 // A2: a timed-out Steam FH4 toggle reverts to the
                 // cached (pre-toggle) value — the switch must not
                 // keep showing a state the daemon never confirmed.
@@ -5319,10 +5399,11 @@ impl Ctx {
         win.set_wifi_password_message("".into());
         self.wifi_password_message_for.set(None);
         let password = new.clone();
-        self.run_generic_job(
+        self.run_generic_job_timeout(
             win,
             JobKind::SettingsOp,
             "Saving Wi-Fi password…",
+            LONG_JOB_TIMEOUT_WIFI_PASSWORD,
             move |api| {
                 JobResult::Text(
                     api.set_wifi_password(&password, &confirm)
@@ -5381,10 +5462,11 @@ impl Ctx {
         win.set_wifi_password_busy(true);
         win.set_wifi_password_message("".into());
         self.wifi_password_message_for.set(None);
-        self.run_generic_job(
+        self.run_generic_job_timeout(
             win,
             JobKind::SettingsOp,
             "Forgetting Wi-Fi password…",
+            LONG_JOB_TIMEOUT_WIFI_PASSWORD,
             move |api| JobResult::Text(api.clear_wifi_password().map(|_| String::new())),
             move |ctx, win, result| {
                 // R3-UI-02: the button un-busy on every outcome.
@@ -5434,10 +5516,11 @@ impl Ctx {
         }
         win.set_setup_wifi_joining(true);
         win.set_setup_wifi_error("".into());
-        self.run_generic_job(
+        self.run_generic_job_timeout(
             win,
             JobKind::SettingsOp,
             "Joining wheel Wi-Fi…",
+            LONG_JOB_TIMEOUT_WIFI_JOIN,
             move |api| {
                 let ssids = api.scan_rsh_networks();
                 let Some(ssid) = ssids.into_iter().next() else {
@@ -5812,8 +5895,9 @@ impl Ctx {
     }
 
     /// Apply a G29 spoof mode toggle, mirroring
-    /// [`Self::apply_steam_fh4_mode`]: a `SettingsOp` job (10 s
-    /// bound, busy strip = loading state, timeout reverts via
+    /// [`Self::apply_steam_fh4_mode`]: a `SettingsOp` job (420 s
+    /// bound — `LONG_JOB_TIMEOUT_SPOOF`, the 390 s IPC arm plus
+    /// margin — busy strip = loading state, timeout reverts via
     /// `check_job_timeouts`), so the switch is disabled while any
     /// `SettingsOp` runs and a duplicate start cannot leave it
     /// flipped with no apply. Success confirms the authoritative
@@ -5821,10 +5905,16 @@ impl Ctx {
     /// prop and explains — the switch never lies about the real
     /// setting.
     fn apply_g29_spoof_mode(&self, win: &MainWindow, enabled: bool) {
-        self.run_generic_job(
+        // v2.0.18: the LONG timeout — `set_g29_spoof_mode` rides
+        // the 390 s IPC arm (sidecar respawn + UAC dwell), so the
+        // 10 s SettingsOp bound declared a healthy switch timed
+        // out, reverted the toggle, and let the next poll flip it
+        // back on silently minutes later.
+        self.run_generic_job_timeout(
             win,
             JobKind::SettingsOp,
             "Saving…",
+            LONG_JOB_TIMEOUT_SPOOF,
             move |api| JobResult::Bool(api.set_g29_spoof_mode(enabled)),
             move |ctx, w, result| {
                 let JobResult::Bool(result) = result else {
@@ -5874,10 +5964,10 @@ impl Ctx {
     /// value and toasts it; failure re-syncs from the daemon
     /// (the source of truth — the radios must not keep showing a
     /// layout the daemon never stored) and explains. The daemon
-    /// recreates the live HID backend with the new map when
-    /// connected; while disconnected the change applies when the
-    /// HID backend connects (the Bug 4 note above the radios
-    /// says so).
+    /// pushes the layout live to the HID backend (next tick, no
+    /// restart, no recreate); while disconnected the change
+    /// applies when the HID backend connects (the Bug 4 note
+    /// above the radios says so).
     fn apply_g29_pedal_layout(&self, win: &MainWindow, layout: &str) {
         let layout = normalize_g29_pedal_layout(layout).to_string();
         self.run_generic_job(
@@ -5923,9 +6013,9 @@ impl Ctx {
     /// stepper tap (the value is clamped to 1–25 before it is
     /// sent). Success confirms the authoritative value and toasts
     /// it; failure re-syncs from the daemon and explains. The
-    /// daemon recreates the live HID backend with the new button
-    /// when connected; while disconnected the change applies when
-    /// the HID backend connects.
+    /// daemon pushes the button live to the HID backend (next
+    /// tick, no restart, no recreate); while disconnected the
+    /// change applies when the HID backend connects.
     fn apply_g29_handbrake_button(&self, win: &MainWindow, button: i32) {
         let button = clamp_g29_handbrake_button(button);
         // The API carries a `u32`; the clamp above already proved
@@ -12886,11 +12976,15 @@ fn wire_settings_action(win: &MainWindow, ctx: &Rc<Ctx>) {
                 "update-check" => ctx.start_app_update_check_job(&w),
                 // F6: backup / restore run on a SettingsOp job
                 // thread — the click never blocks on the daemon.
+                // v2.0.18: the LONG timeout — both ride the 30 s
+                // IPC arm (file copies), so the 10 s kind bound
+                // declared a slow-disk backup timed out.
                 "backup" => {
-                    ctx.run_generic_job(
+                    ctx.run_generic_job_timeout(
                         &w,
                         JobKind::SettingsOp,
                         "Saving backup…",
+                        LONG_JOB_TIMEOUT_BACKUP,
                         move |api| JobResult::Text(api.backup_now()),
                         move |ctx, w, result| {
                             let JobResult::Text(result) = result else {
@@ -12919,10 +13013,11 @@ fn wire_settings_action(win: &MainWindow, ctx: &Rc<Ctx>) {
                     );
                 }
                 "restore" => {
-                    ctx.run_generic_job(
+                    ctx.run_generic_job_timeout(
                         &w,
                         JobKind::SettingsOp,
                         "Restoring backup…",
+                        LONG_JOB_TIMEOUT_BACKUP,
                         move |api| JobResult::Text(api.restore_backup()),
                         move |ctx, w, result| {
                             let JobResult::Text(result) = result else {
@@ -12969,6 +13064,7 @@ fn wire_diagnostics_opener(win: &MainWindow, ctx: &Rc<Ctx>) {
 /// the diagnostics opener live in their own functions above
 /// (v2.0.1 hotfix). Save-profile notifies visibly now (A23) —
 /// never silent.
+#[allow(clippy::too_many_lines)]
 fn wire_actions(win: &MainWindow, ctx: &Rc<Ctx>) {
     wire_reconnect(win, ctx);
     wire_action_notifications(win, ctx);
@@ -13023,10 +13119,19 @@ fn wire_actions(win: &MainWindow, ctx: &Rc<Ctx>) {
                 return;
             };
             let next = !ctx.api().output_enabled();
-            ctx.run_generic_job(
+            // v2.0.18: the LONG timeout — `set_output_enabled`
+            // rides the 390 s IPC arm (it can run the full backend
+            // switch inline), so the 10 s SettingsOp bound declared
+            // a healthy switch timed out and left the toggle showing
+            // the old state until the next poll corrected it.
+            // The shell switch disables while busy-kind == 14 (the
+            // `send-busy` prop), so a second click cannot queue
+            // behind the long job.
+            ctx.run_generic_job_timeout(
                 &w,
                 JobKind::SettingsOp,
                 "Updating output…",
+                LONG_JOB_TIMEOUT_SEND,
                 move |api| {
                     api.set_output_enabled(next);
                     JobResult::Unit(Ok(()))
@@ -14855,15 +14960,26 @@ mod tests {
     #[test]
     fn fc2_busy_state_oldest_job_wins() {
         // B5/FC2: the strip shows one label — the oldest job's.
-        let mut jobs: HashMap<JobKind, (String, Instant)> = HashMap::new();
+        let mut jobs: BusyJobs = HashMap::new();
         assert_eq!(busy_state_for(&jobs), (false, String::new()));
         let old = Instant::now();
         let new = old + Duration::from_millis(1);
         jobs.insert(
             JobKind::Transport,
-            ("Switching connection…".to_string(), new),
+            (
+                "Switching connection…".to_string(),
+                new,
+                JobKind::Transport.timeout(),
+            ),
         );
-        jobs.insert(JobKind::Reconnect, ("Reconnecting…".to_string(), old));
+        jobs.insert(
+            JobKind::Reconnect,
+            (
+                "Reconnecting…".to_string(),
+                old,
+                JobKind::Reconnect.timeout(),
+            ),
+        );
         assert_eq!(busy_state_for(&jobs), (true, "Reconnecting…".to_string()));
         jobs.remove(&JobKind::Reconnect);
         assert_eq!(
@@ -14879,21 +14995,36 @@ mod tests {
         // DS-54: the Slint `busy-kind` prop carries the OLDEST job's
         // JobKind::order value (-1 = idle) so the invoking button can
         // disable + dim while its job runs.
-        let mut jobs: HashMap<JobKind, (String, Instant)> = HashMap::new();
+        let mut jobs: BusyJobs = HashMap::new();
         assert_eq!(busy_kind_for(&jobs), -1);
         let old = Instant::now();
         let new = old + Duration::from_millis(1);
         jobs.insert(
             JobKind::Transport,
-            ("Switching connection…".to_string(), new),
+            (
+                "Switching connection…".to_string(),
+                new,
+                JobKind::Transport.timeout(),
+            ),
         );
-        jobs.insert(JobKind::Reconnect, ("Reconnecting…".to_string(), old));
+        jobs.insert(
+            JobKind::Reconnect,
+            (
+                "Reconnecting…".to_string(),
+                old,
+                JobKind::Reconnect.timeout(),
+            ),
+        );
         assert_eq!(busy_kind_for(&jobs), 0);
         jobs.remove(&JobKind::Reconnect);
         assert_eq!(busy_kind_for(&jobs), 1);
         jobs.insert(
             JobKind::AppUpdateCheck,
-            ("Checking for updates…".to_string(), new),
+            (
+                "Checking for updates…".to_string(),
+                new,
+                JobKind::AppUpdateCheck.timeout(),
+            ),
         );
         // Transport (order 1) is still oldest — AppUpdateCheck (16)
         // does not hide it.
@@ -14901,7 +15032,11 @@ mod tests {
         jobs.clear();
         jobs.insert(
             JobKind::AppUpdateCheck,
-            ("Checking for updates…".to_string(), old),
+            (
+                "Checking for updates…".to_string(),
+                old,
+                JobKind::AppUpdateCheck.timeout(),
+            ),
         );
         assert_eq!(busy_kind_for(&jobs), 16);
     }
@@ -14933,14 +15068,13 @@ mod tests {
             (JobKind::AppUpdateCheck, 16),
         ];
         for (kind, number) in expected {
-            let jobs: HashMap<JobKind, (String, Instant)> =
-                [(kind, ("test".to_string(), Instant::now()))]
-                    .into_iter()
-                    .collect();
+            let jobs: BusyJobs = [(kind, ("test".to_string(), Instant::now(), kind.timeout()))]
+                .into_iter()
+                .collect();
             assert_eq!(busy_kind_for(&jobs), number, "{kind:?}");
             assert_eq!(busy_state_for(&jobs), (true, "test".to_string()));
         }
-        let empty: HashMap<JobKind, (String, Instant)> = HashMap::new();
+        let empty: BusyJobs = HashMap::new();
         assert_eq!(busy_kind_for(&empty), -1);
         assert_eq!(busy_state_for(&empty), (false, String::new()));
     }
@@ -15625,11 +15759,11 @@ mod tests {
         ctx.refresh(&win, 0);
         // Bug 7: the deadzone cap is 30% now, so 9% is 9/30.
         assert_eq!(win.get_deadzone(), 0.3);
-        // A push started 6 s ago (past the 5 s TuningPush timeout)
-        // and still pending.
+        // A push started 16 s ago (past the 15 s TuningPush
+        // timeout) and still pending.
         let due = Instant::now()
-            .checked_sub(Duration::from_secs(6))
-            .expect("6 s ago exists");
+            .checked_sub(Duration::from_secs(16))
+            .expect("16 s ago exists");
         ctx.steer_push_due.set(Some(due));
         let base = ctx.steering.borrow().clone();
         ctx.busy_jobs.borrow_mut().insert(
@@ -15637,8 +15771,9 @@ mod tests {
             (
                 "Saving steering…".to_string(),
                 Instant::now()
-                    .checked_sub(Duration::from_secs(6))
-                    .expect("6 s ago exists"),
+                    .checked_sub(Duration::from_secs(16))
+                    .expect("16 s ago exists"),
+                JobKind::TuningPush.timeout(),
             ),
         );
         *ctx.tuning_push_in_flight.borrow_mut() = Some(TuningPushTarget::Steering { due, base });
@@ -17192,6 +17327,7 @@ mod tests {
                     Instant::now()
                         .checked_sub(Duration::from_secs(421))
                         .expect("421 s ago exists"),
+                    JobKind::Backend.timeout(),
                 ),
             );
         };
@@ -17613,7 +17749,11 @@ mod tests {
             .expect("11 s ago exists");
         ctx.busy_jobs.borrow_mut().insert(
             JobKind::SettingsOp,
-            ("Saving Wi-Fi password…".to_string(), started),
+            (
+                "Saving Wi-Fi password…".to_string(),
+                started,
+                JobKind::SettingsOp.timeout(),
+            ),
         );
         win.set_wifi_password_busy(true);
         ctx.check_job_timeouts(&win);
@@ -17624,6 +17764,189 @@ mod tests {
         assert!(
             !ctx.busy_jobs.borrow().contains_key(&JobKind::SettingsOp),
             "timed-out entry must be gone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v2.0.18 job/IPC invariant: every job timeout exceeds the
+    /// IPC bound of the call it runs. A job that gives up first
+    /// declares a healthy slow call timed out, drops its apply,
+    /// and tells the user it failed while the daemon keeps working
+    /// (the v2.0.17 G29-toggle shape). Pinned against the real
+    /// `timeout_for_method` table, not a copy of the numbers.
+    #[test]
+    fn job_timeouts_exceed_ipc_bounds() {
+        use rsh_ipc::timeout_for_method;
+        // Kind-level bounds (job > IPC for the method the kind runs).
+        assert!(
+            JobKind::Backend.timeout() > timeout_for_method("set_output_backend"),
+            "Backend job must outlast the backend-switch IPC bound"
+        );
+        assert!(
+            JobKind::GameOp.timeout() > timeout_for_method("add_game"),
+            "GameOp job must outlast the game-write IPC bound"
+        );
+        assert!(
+            JobKind::GameOp.timeout() > timeout_for_method("launch_game"),
+            "GameOp job must outlast the game-launch IPC bound"
+        );
+        assert!(
+            JobKind::TuningPush.timeout() > timeout_for_method("set_tuning"),
+            "TuningPush job must outlast the set_tuning IPC bound"
+        );
+        assert!(
+            JobKind::SensitivityPush.timeout() > timeout_for_method("set_shifter_sensitivity"),
+            "SensitivityPush job must outlast the shifter-sensitivity IPC bound"
+        );
+        assert!(
+            JobKind::FirmwareUpdate.timeout() > timeout_for_method("update_firmware"),
+            "FirmwareUpdate job must outlast the update_firmware IPC bound"
+        );
+        assert!(
+            JobKind::FirmwareCheck.timeout() > timeout_for_method("firmware_check"),
+            "FirmwareCheck job must outlast the firmware_check IPC bound"
+        );
+        // Per-call overrides (SettingsOp kind bound is only 10 s).
+        assert!(
+            LONG_JOB_TIMEOUT_SPOOF > timeout_for_method("set_g29_spoof_mode"),
+            "G29 spoof job must outlast the set_g29_spoof_mode IPC bound"
+        );
+        assert!(
+            LONG_JOB_TIMEOUT_SEND > timeout_for_method("set_output_enabled"),
+            "send-to-game job must outlast the set_output_enabled IPC bound"
+        );
+        assert!(
+            LONG_JOB_TIMEOUT_WIFI_JOIN
+                > timeout_for_method("scan_rsh_networks")
+                    + timeout_for_method("rejoin_wifi_open")
+                    + timeout_for_method("connect"),
+            "Wi-Fi join job must outlast scan + rejoin + connect, run in sequence"
+        );
+        assert!(
+            LONG_JOB_TIMEOUT_BACKUP > timeout_for_method("backup_now"),
+            "backup job must outlast the backup_now IPC bound"
+        );
+        assert!(
+            LONG_JOB_TIMEOUT_BACKUP > timeout_for_method("restore_backup"),
+            "restore job must outlast the restore_backup IPC bound"
+        );
+    }
+
+    /// v2.0.18: the stored timeout — not the kind default — is
+    /// what `check_job_timeouts` enforces. A `SettingsOp` entry
+    /// carrying the 420 s G29 override and aged 60 s must still
+    /// be busy (the old code compared against the 10 s kind bound
+    /// and timed it out); the same entry aged 421 s must time out.
+    #[test]
+    fn job_timeout_override_is_enforced_not_the_kind_default() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("job-override window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        // 60 s old with a 420 s override: not due.
+        ctx.busy_jobs.borrow_mut().insert(
+            JobKind::SettingsOp,
+            (
+                "Saving…".to_string(),
+                Instant::now()
+                    .checked_sub(Duration::from_secs(60))
+                    .expect("60 s ago exists"),
+                LONG_JOB_TIMEOUT_SPOOF,
+            ),
+        );
+        ctx.check_job_timeouts(&win);
+        assert!(
+            ctx.busy_jobs.borrow().contains_key(&JobKind::SettingsOp),
+            "a 60 s old job with a 420 s override must stay busy"
+        );
+        // 421 s old with the same override: due.
+        ctx.busy_jobs.borrow_mut().insert(
+            JobKind::SettingsOp,
+            (
+                "Saving…".to_string(),
+                Instant::now()
+                    .checked_sub(Duration::from_secs(421))
+                    .expect("421 s ago exists"),
+                LONG_JOB_TIMEOUT_SPOOF,
+            ),
+        );
+        ctx.check_job_timeouts(&win);
+        assert!(
+            !ctx.busy_jobs.borrow().contains_key(&JobKind::SettingsOp),
+            "a 421 s old job with a 420 s override must time out"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v2.0.18: a timed-out Wi-Fi join must unstick the wizard's
+    /// Join button. The join job's apply is the only place
+    /// `setup_wifi_joining` clears, so a timeout used to leave the
+    /// button "Joining…" + disabled until the wizard was reopened.
+    #[test]
+    fn wifi_join_timeout_clears_joining_flag() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("wifi-join window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        win.set_setup_wifi_joining(true);
+        ctx.busy_jobs.borrow_mut().insert(
+            JobKind::SettingsOp,
+            (
+                "Joining wheel Wi-Fi…".to_string(),
+                Instant::now()
+                    .checked_sub(Duration::from_secs(11))
+                    .expect("11 s ago exists"),
+                JobKind::SettingsOp.timeout(),
+            ),
+        );
+        ctx.check_job_timeouts(&win);
+        assert!(
+            !win.get_setup_wifi_joining(),
+            "a timed-out join must re-enable the wizard Join button"
+        );
+        assert!(
+            !ctx.busy_jobs.borrow().contains_key(&JobKind::SettingsOp),
+            "timed-out entry must be gone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v2.0.18 (P1-6 generalised): the busy strip shows the
+    /// elapsed clock for any job, not just the Backend switch —
+    /// a 420 s G29 toggle must read as still working, not a bare
+    /// spinner. The Backend stage label stays Backend-only.
+    #[test]
+    fn busy_elapsed_shows_for_any_job() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("busy-elapsed window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        ctx.busy_jobs.borrow_mut().insert(
+            JobKind::SettingsOp,
+            (
+                "Saving…".to_string(),
+                Instant::now()
+                    .checked_sub(Duration::from_secs(65))
+                    .expect("65 s ago exists"),
+                LONG_JOB_TIMEOUT_SPOOF,
+            ),
+        );
+        ctx.sync_busy(&win);
+        assert!(win.get_busy(), "strip must show while the job runs");
+        assert_eq!(
+            win.get_busy_elapsed().as_str(),
+            "1:05",
+            "elapsed must tick for a non-Backend job"
+        );
+        assert_eq!(
+            win.get_busy_label().as_str(),
+            "Saving…",
+            "no Backend stage label on a SettingsOp job"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -17728,7 +18051,11 @@ mod tests {
         // DS-54: the busy-kind prop carries the running job's kind.
         ctx.busy_jobs.borrow_mut().insert(
             JobKind::Backend,
-            ("Switching controller…".to_string(), Instant::now()),
+            (
+                "Switching controller…".to_string(),
+                Instant::now(),
+                JobKind::Backend.timeout(),
+            ),
         );
         ctx.sync_busy(&win);
         assert!(win.get_busy());
