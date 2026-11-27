@@ -1,10 +1,52 @@
 # Changelog — RSH (Real Sim Hub)
 
 All notable changes to the RSH app and firmware. Current versions:
-**app v2.0.15 · firmware v4.0.6 · protocol v2.2 (frozen)**.
+**app v2.0.16 · firmware v4.0.6 · protocol v2.2 (frozen)**.
 Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
+
+## [2.0.16] — 2026-11-27 (HIDMaestro G29 spoof mode)
+
+App 2.0.16 + firmware 4.0.6 unchanged (protocol v2.2 frozen — no wire-format
+change, no firmware code change in this release).
+
+**G29 spoof mode (HID backend only, default OFF).** New Settings → Game
+Controller toggle presents the wheel to games as a Logitech G29 (VID 046D /
+PID C24F, product string "G29 Driving Force Racing Wheel") using HIDMaestro's
+built-in `logitech-g29` profile — the 123-byte C24F descriptor, verified
+byte-for-byte against the pinned v2.1.0 DLL (never hand-rolled). Steering → X
+16-bit (centre 32768); pedals → Z/Rz/Y 8-bit (accelerator/brake/clutch per the
+HIDMaestro profile layout — PCGamingWiki disagrees on which 8-bit field is the
+accelerator, so the assignment is one constant away from swapping and must be
+verified on the PC test); 25 buttons per the G29 map; D-pad = hat; handbrake →
+L2 button past 50% (the G29 has no handbrake axis). Force-feedback writes from
+the game are accepted and discarded (the wheel has no motor — no FFB, no
+centring spring). Toggling the mode restarts/reconnects the HID backend with
+the other profile; turning it off restores the RSH 1209/5253 identity
+byte-for-byte. Enabling on the vJoy backend is refused (`g29_spoof_hid_only`);
+disabling always succeeds. **Honest labelling:** this presents the wheel AS a
+G29 for game compatibility; it is not a Logitech product. **Expectations
+(research, not proven):** even a real G29 is "not recognized in game by
+default" on FH4 and needs a custom control scheme (Forza Known Issues) —
+expect to bind a custom wheel profile in FH4, not auto-recognition (~50%
+usable via custom profile, ~25–35% auto-recognition). **Risks (disclosed, not
+hidden):** using Logitech's VID/PID violates USB-IF policy as written (no
+enforcement found for private hobby use); no Forza ToS text on device spoofing
+was found (risk low, not zero); the pid.codes 0x1209/0x5253 claim is unaffected
+(simply unused while G29 mode is on). The Steam FH4 (OEMData) toggle and code
+stay in place as a fallback until G29 mode is proven on the PC.
+
+**DeferredApi forwarding fix (v2.0.15 lesson).** The v2.0.15 Steam FH4 toggle
+failed on the PC with "api not supported": the daemon's IPC server holds a
+`DeferredApi` that never forwarded `set_steam_fh4_mode`, so the call fell
+through to the trait default and the live daemon implementation was unreachable
+(the gate's IPC round-trip test had exercised the daemon directly, not through
+`DeferredApi`). The G29 toggle is wired through the same path, so
+`g29_spoof_mode` / `set_g29_spoof_mode` are now forwarded in `DeferredApi`,
+with a test that drives the exact UI call path (IPC dispatch → `DeferredApi` →
+`DaemonApi`). The FH4 toggle itself is intentionally NOT fixed (user decision
+2026-11-27: G29 replaces it; the OEMData code stays as fallback).
 
 ## [2.0.15] — 2026-11-27 (FH4 Steam wheel mode + mouse-click fix)
 

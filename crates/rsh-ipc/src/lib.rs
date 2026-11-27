@@ -122,6 +122,7 @@ pub struct IpcRequest {
     /// `set_board_address`, `module_enabled`, `set_module_enabled`,
     /// `auto_pause`, `set_auto_pause`, `close_to_tray`,
     /// `set_close_to_tray`, `steam_fh4_mode`, `set_steam_fh4_mode`,
+    /// `g29_spoof_mode`, `set_g29_spoof_mode`,
     /// `restore_backup`, `rename_profile`,
     /// `link_profile`, `knob_actions`, `set_knob_action`).
     pub method: String,
@@ -464,6 +465,8 @@ pub fn dispatch(
         | "set_close_to_tray"
         | "steam_fh4_mode"
         | "set_steam_fh4_mode"
+        | "g29_spoof_mode"
+        | "set_g29_spoof_mode"
         | "restore_backup"
         | "rename_profile"
         | "link_profile"
@@ -650,6 +653,7 @@ fn detailed_api_error(error: &rsh_api::UserError) -> IpcError {
 /// `set_auto_pause` use `{"paused"}`; `close_to_tray` /
 /// `set_close_to_tray` use `{"close_to_tray"}` / `{"enabled"}`;
 /// `steam_fh4_mode` / `set_steam_fh4_mode` use `{"steam_fh4_mode"}` / `{"enabled"}`;
+/// `g29_spoof_mode` / `set_g29_spoof_mode` use `{"g29_spoof_mode"}` / `{"enabled"}`;
 /// `restore_backup` → `{"message"}`; `rename_profile` takes
 /// `{"id", "name"}`; `link_profile` takes `{"id", "game_slug"}`;
 /// `knob_actions` → `{"knobs": [[...], [...]]}`; `set_knob_action`
@@ -763,6 +767,13 @@ fn dispatch_round3(
             let enabled = parse_bool_param(params, "enabled")?;
             api.set_steam_fh4_mode(enabled)
                 .map(|new_state| serde_json::json!({"steam_fh4_mode": new_state}))
+                .map_err(|error| detailed_api_error(&error))
+        }
+        "g29_spoof_mode" => Ok(serde_json::json!({"g29_spoof_mode": api.g29_spoof_mode()})),
+        "set_g29_spoof_mode" => {
+            let enabled = parse_bool_param(params, "enabled")?;
+            api.set_g29_spoof_mode(enabled)
+                .map(|new_state| serde_json::json!({"g29_spoof_mode": new_state}))
                 .map_err(|error| detailed_api_error(&error))
         }
         "restore_backup" => api

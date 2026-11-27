@@ -13,7 +13,7 @@ use rsh_output_hidmaestro::manager::{HelloInfo, SidecarConfig, SidecarManager};
 use rsh_output_hidmaestro::protocol::Command;
 use rsh_output_hidmaestro::{
     CUSTOM_RAW_REPORT_SIZE, GamepadFrame, HidMaestroError, PINNED_DLL_SHA256, PINNED_VERSION,
-    PROFILE_PID, PROFILE_VID,
+    PROFILE_ID, PROFILE_PID, PROFILE_VID,
 };
 
 fn stub_path() -> PathBuf {
@@ -89,7 +89,9 @@ fn version_round_trip() {
 fn describe_profile_reports_15_byte_report() {
     let mut m = manager(&[]);
     m.connect().unwrap();
-    let reply = m.request(&Command::DescribeProfile).unwrap();
+    let reply = m
+        .request(&Command::DescribeProfile { profile: None })
+        .unwrap();
     assert!(reply.ok);
     assert_eq!(reply.descriptor_len, Some(124));
     assert_eq!(reply.input_report_size, Some(15));
@@ -138,7 +140,7 @@ fn install_driver_not_admin() {
 fn create_ok_reports_custom_caps() {
     let mut m = manager(&[]);
     m.connect().unwrap();
-    let created = m.create().unwrap();
+    let created = m.create(PROFILE_ID).unwrap();
     assert_eq!(created.transport_index, Some(0));
     assert_eq!(created.driver_version.as_deref(), Some(PINNED_VERSION));
     assert_eq!(
@@ -152,7 +154,7 @@ fn create_ok_reports_custom_caps() {
 fn create_refused_is_one_failure_not_fallback_yet() {
     let mut m = manager(&[("HM_STUB_FAIL_CREATE", "1")]);
     m.connect().unwrap();
-    let err = m.create().unwrap_err();
+    let err = m.create(PROFILE_ID).unwrap_err();
     assert!(matches!(err, HidMaestroError::CreateFailed(_)));
     assert_eq!(
         m.consecutive_failures(),
@@ -218,7 +220,7 @@ fn bad_dll_hash_is_refused() {
 fn submit_round_trip_reports_latency() {
     let mut m = manager(&[]);
     m.connect().unwrap();
-    m.create().unwrap();
+    m.create(PROFILE_ID).unwrap();
     let us = m.submit(GamepadFrame::neutral()).unwrap();
     assert_eq!(us, 12.0);
     assert_eq!(m.submit_count(), 1);
@@ -231,7 +233,7 @@ fn submit_round_trip_reports_latency() {
 fn submit_raw_ok_and_wrong_size_refused() {
     let mut m = manager(&[]);
     m.connect().unwrap();
-    m.create().unwrap();
+    m.create(PROFILE_ID).unwrap();
     let ok = m.submit_raw(&[0u8; CUSTOM_RAW_REPORT_SIZE]).unwrap();
     assert_eq!(ok, 12.0);
     let err = m.submit_raw(&[0u8; 26]).unwrap_err();
@@ -244,7 +246,7 @@ fn submit_raw_ok_and_wrong_size_refused() {
 fn crash_mid_session_is_detected() {
     let mut m = manager(&[("HM_STUB_CRASH_AFTER_SUBMITS", "1")]);
     m.connect().unwrap();
-    m.create().unwrap();
+    m.create(PROFILE_ID).unwrap();
     m.submit(GamepadFrame::neutral()).unwrap();
     let err = m.submit(GamepadFrame::neutral()).unwrap_err();
     assert!(matches!(err, HidMaestroError::SidecarDied(_)));
@@ -259,11 +261,11 @@ fn crash_twice_uses_the_one_retry_then_fallback() {
     // 1), the retry connect#2 dies too (failure 2) → fallback latch.
     let mut m = manager(&[("HM_STUB_CRASH_AFTER_SUBMITS", "0")]);
     m.connect().unwrap();
-    m.create().unwrap();
+    m.create(PROFILE_ID).unwrap();
     assert!(m.submit(GamepadFrame::neutral()).is_err());
     assert!(!m.fallback_needed());
     m.connect().unwrap(); // the one retry
-    m.create().unwrap();
+    m.create(PROFILE_ID).unwrap();
     assert!(m.submit(GamepadFrame::neutral()).is_err());
     assert!(m.fallback_needed());
     let err = m.connect().unwrap_err();
@@ -274,10 +276,10 @@ fn crash_twice_uses_the_one_retry_then_fallback() {
 fn reset_fallback_clears_latch() {
     let mut m = manager(&[("HM_STUB_CRASH_AFTER_SUBMITS", "0")]);
     m.connect().unwrap();
-    m.create().unwrap();
+    m.create(PROFILE_ID).unwrap();
     assert!(m.submit(GamepadFrame::neutral()).is_err());
     m.connect().unwrap();
-    m.create().unwrap();
+    m.create(PROFILE_ID).unwrap();
     assert!(m.submit(GamepadFrame::neutral()).is_err());
     assert!(m.fallback_needed());
     m.reset_fallback();
@@ -287,7 +289,7 @@ fn reset_fallback_clears_latch() {
     // and the crash that follows is a first failure again — not a
     // FallbackNeeded.
     m.connect().expect("fresh attempt allowed after reset");
-    m.create().unwrap();
+    m.create(PROFILE_ID).unwrap();
     let err = m.submit(GamepadFrame::neutral()).unwrap_err();
     assert!(matches!(err, HidMaestroError::SidecarDied(_)));
     assert!(!m.fallback_needed());
@@ -339,7 +341,9 @@ fn request_without_connect_is_not_connected() {
 fn unknown_command_is_bad_reply() {
     let mut m = manager(&[]);
     m.connect().unwrap();
-    let reply = m.request(&Command::DescribeProfile).unwrap();
+    let reply = m
+        .request(&Command::DescribeProfile { profile: None })
+        .unwrap();
     assert!(reply.ok);
     // Unknown commands come back ok:false; request_checked maps them.
     let err = m
@@ -353,14 +357,14 @@ fn unknown_command_is_bad_reply() {
 
 /// C2 contract test: the verbatim real-sidecar `create` reply
 /// (PROTOCOL.md capabilities example) flows through `parse_reply` →
-/// `manager.create()` and yields the custom-wheel caps — the exact
+/// `manager.create(PROFILE_ID)` and yields the custom-wheel caps — the exact
 /// path a real sidecar's reply takes.
 #[test]
 fn create_verbatim_real_sidecar_caps_parse_to_custom_wheel() {
     let caps = r#"{"axes":5,"buttons":32,"has_hat":true,"input_report_size":15,"submit_state_max_button":25,"submit_state_button_mask":33554431}"#;
     let mut m = manager(&[("HM_STUB_CAPS_JSON", caps)]);
     m.connect().unwrap();
-    let created = m.create().unwrap();
+    let created = m.create(PROFILE_ID).unwrap();
     assert_eq!(
         created.capabilities,
         rsh_output_hidmaestro::HidMaestroCapabilities::custom_wheel()
@@ -376,7 +380,7 @@ fn create_partial_axis_count_derives_partial_caps() {
     let caps = r#"{"axes":1,"buttons":0,"has_hat":false,"input_report_size":15,"submit_state_max_button":25,"submit_state_button_mask":33554431}"#;
     let mut m = manager(&[("HM_STUB_CAPS_JSON", caps)]);
     m.connect().unwrap();
-    let created = m.create().unwrap();
+    let created = m.create(PROFILE_ID).unwrap();
     assert_eq!(
         created.capabilities,
         rsh_output_hidmaestro::HidMaestroCapabilities::new(
@@ -511,7 +515,7 @@ fn real_sidecar_stdio_smoke() {
     assert_eq!(version.dll_sha256.as_deref(), Some(PINNED_DLL_SHA256));
     assert_eq!(version.dll_sha256_ok, Some(true));
     let reply = m
-        .request(&Command::DescribeProfile)
+        .request(&Command::DescribeProfile { profile: None })
         .expect("real sidecar describe-profile");
     assert!(reply.ok);
     assert_eq!(reply.input_report_size, Some(CUSTOM_RAW_REPORT_SIZE));
@@ -522,5 +526,76 @@ fn real_sidecar_stdio_smoke() {
     // with not-admin rather than crash the sidecar.
     let err = m.install_driver().unwrap_err();
     assert!(matches!(err, HidMaestroError::NotAdmin));
+    m.shutdown();
+}
+
+// --- G29 spoof profile (v2.0.16) ---
+
+#[test]
+fn describe_g29_reports_12_byte_report_and_catalog_descriptor() {
+    use rsh_output_hidmaestro::mapping::G29_DESCRIPTOR_HEX;
+    use rsh_output_hidmaestro::{G29_PROFILE_ID, G29_RAW_REPORT_SIZE};
+    let mut m = manager(&[]);
+    m.connect().unwrap();
+    let reply = m.describe_profile(G29_PROFILE_ID).unwrap();
+    assert!(reply.ok);
+    assert_eq!(reply.profile.as_deref(), Some(G29_PROFILE_ID));
+    assert_eq!(reply.descriptor_len, Some(123));
+    assert_eq!(reply.input_report_size, Some(G29_RAW_REPORT_SIZE));
+    assert_eq!(reply.input_report_size, Some(12));
+    assert_eq!(reply.vid, Some(0x046D));
+    assert_eq!(reply.pid_value, Some(0xC24F));
+    assert_eq!(reply.vid_pid_provisional, Some(false));
+    assert_eq!(
+        reply.descriptor_hex.as_deref(),
+        Some(G29_DESCRIPTOR_HEX),
+        "stub G29 descriptor must equal the catalog bytes exactly"
+    );
+    m.shutdown();
+}
+
+#[test]
+fn create_g29_reports_g29_caps_and_active_profile() {
+    use rsh_output_hidmaestro::{G29_PROFILE_ID, HidMaestroCapabilities};
+    let mut m = manager(&[]);
+    m.connect().unwrap();
+    let created = m.create(G29_PROFILE_ID).unwrap();
+    assert_eq!(created.capabilities, HidMaestroCapabilities::g29_wheel());
+    assert_eq!(created.capabilities.button_count, 25);
+    assert!(!created.capabilities.has_axis_slider);
+    assert_eq!(m.active_profile_id(), Some(G29_PROFILE_ID));
+    m.shutdown();
+    assert_eq!(m.active_profile_id(), None, "teardown clears the profile");
+}
+
+#[test]
+fn create_unknown_profile_is_refused_locally() {
+    let mut m = manager(&[]);
+    m.connect().unwrap();
+    let err = m.create("logitech-g27").unwrap_err();
+    assert!(matches!(err, HidMaestroError::ProfileRefused(_)));
+    let err = m.describe_profile("logitech-g27").unwrap_err();
+    assert!(matches!(err, HidMaestroError::ProfileRefused(_)));
+    m.shutdown();
+}
+
+#[test]
+fn create_g29_then_submit_state_is_refused_by_stub() {
+    use rsh_output_hidmaestro::G29_PROFILE_ID;
+    let mut m = manager(&[]);
+    m.connect().unwrap();
+    m.create(G29_PROFILE_ID).unwrap();
+    // The SubmitState path must never be used for G29 — the stub
+    // mirrors the real sidecar's refusal.
+    let err = m
+        .submit(rsh_output_hidmaestro::GamepadFrame::neutral())
+        .unwrap_err();
+    assert!(matches!(err, HidMaestroError::UpdateFailed(_)));
+    // ...but the 12-byte raw report submits fine.
+    let report = [0x08u8, 0, 0, 0, 0x00, 0x80, 0, 0, 0, 0, 0, 0];
+    m.submit_raw(&report).expect("12-byte G29 raw report");
+    // A 15-byte custom report is refused under G29.
+    let err = m.submit_raw(&[0u8; 15]).unwrap_err();
+    assert!(matches!(err, HidMaestroError::UpdateFailed(_)));
     m.shutdown();
 }

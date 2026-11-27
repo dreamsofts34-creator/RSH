@@ -117,13 +117,17 @@ export component SettingsScreen inherits VerticalLayout {
     // (default OFF), seeded from the live cache — Rust reverts it
     // on a failed toggle, like the other switches above.
     in-out property <bool> steam-fh4-mode: false;
+    // G29 spoof mode: the daemon's `g29_spoof_mode` (default
+    // OFF), seeded from the live cache — Rust reverts it on a
+    // failed toggle, like the switch above.
+    in-out property <bool> g29-spoof-mode: false;
     // R2-31 (UI-UX polish, h): the STORED theme choice (0 Dark,
     // 1 Light, 2 Auto) — what the Appearance segment shows. The
     // window's `theme` prop stays the resolved 0/1 that drives
     // Theme.mode; the window binds this two-way to `theme-choice`.
     in-out property <int> theme-choice: 0;
     in-out property <[ProfileRow]> profiles;
-    in-out property <string> app-version: "RSH 2.0.15";
+    in-out property <string> app-version: "RSH 2.0.16";
     in-out property <string> firmware-text: "—";
     in-out property <string> app-update-text: "Auto-update is off — new versions are on GitHub Releases";
     in-out property <string> backup-text: "No backups yet";
@@ -151,6 +155,7 @@ export component SettingsScreen inherits VerticalLayout {
     callback toggled-start-windows(bool);
     callback toggled-keep-tray(bool);
     callback toggled-steam-fh4-mode(bool);
+    callback toggled-g29-spoof-mode(bool);
     callback theme-selected(int);
     callback new-profile();
     callback use-profile(int);
@@ -467,6 +472,42 @@ export component SettingsScreen inherits VerticalLayout {
                             // on/off (see the cooldown line above).
                             // The toggle also toasts this on change.
                             Text { visible: steam-fh4-mode; text: "Disable/enable vJoy and restart your PC."; font-size: Theme.fs-hint; color: Theme.warn; wrap: word-wrap; }
+                            Rectangle { height: 1px; background: Theme.line; }
+                            // G29 spoof mode: HID-only — the wheel is
+                            // presented as a Logitech G29 (VID 046D /
+                            // PID C24F), so on vJoy (backend == 1)
+                            // the switch is disabled with the reason
+                            // beside it. While a SettingsOp job runs
+                            // (busy-kind == 14) it is disabled too —
+                            // the busy strip is the loading state and
+                            // the job's 10 s bound is the timeout.
+                            // The daemon also refuses an enable on
+                            // vJoy (`g29_spoof_hid_only`); the toast
+                            // carries that reason. This is not a
+                            // Logitech product, and FH4
+                            // auto-recognition is not promised — even
+                            // a real G29 needs a custom control
+                            // scheme in Forza Horizon 4.
+                            HorizontalLayout {
+                                padding-top: 6px;
+                                padding-bottom: 6px;
+                                alignment: space-between;
+                                cross-axis-alignment: center;
+                                spacing: 10px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 0px;
+                                    Text { text: "G29 spoof mode"; font-size: Theme.fs-label; color: Theme.text; }
+                                    Text { text: backend == 0 ? "Presents the wheel as a Logitech G29 (VID 046D / PID C24F) for game compatibility. Not a Logitech product — even a real G29 needs a custom control scheme in Forza Horizon 4." : "HID only — switch the controller to HIDMaestro to use it."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
+                                }
+                                Switch { accessible-name: "G29 spoof mode"; on: g29-spoof-mode; disabled: backend != 0 || busy-kind == 14; toggled => { g29-spoof-mode = !g29-spoof-mode; toggled-g29-spoof-mode(g29-spoof-mode); } }
+                            }
+                            // The restart/reconnect notice — `visible`,
+                            // never `if`, so the card keeps the SAME
+                            // size on/off (see the cooldown line
+                            // above). The toggle also toasts this on
+                            // change.
+                            Text { visible: g29-spoof-mode; text: "Restart or reconnect the game controller backend for the change to take effect."; font-size: Theme.fs-hint; color: Theme.warn; wrap: word-wrap; }
                             // M-6 (v2.0.2): the sub-text wraps — at
                             // 920px the "Run setup" button is primary
                             // (wider), so the 39-char sub needs two

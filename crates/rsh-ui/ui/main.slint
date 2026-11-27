@@ -108,7 +108,7 @@ export component MainWindow inherits Window {
     in property <bool> buttons-listening: false;
     in property <string> profile-name: "GT3 Sprint";
     in property <string> auto-profile-text: "No profile yet";
-    in property <string> app-version: "2.0.15";
+    in property <string> app-version: "2.0.16";
     in property <bool> daemon-live: false;
     // B5 (v2.0.2): the global busy strip reads these — Rust drives
     // them from busy_jobs (each start_*_job records its label, the
@@ -362,6 +362,10 @@ export component MainWindow inherits Window {
     // (default OFF) — two-way with the Settings screen, Rust
     // reverts it on a failed toggle, like keep-in-tray.
     in-out property <bool> steam-fh4-mode: false;
+    // G29 spoof mode: the daemon's `g29_spoof_mode` (default OFF)
+    // — two-way with the Settings screen, Rust reverts it on a
+    // failed toggle, like steam-fh4-mode.
+    in-out property <bool> g29-spoof-mode: false;
     // M-7 (v2.0.2): two-way — Rust reads keep-in-tray for the close
     // handler and writes it back when set_close_to_tray fails, so the
     // switch never lies about the real state. Same for the Extras
@@ -604,6 +608,9 @@ export component MainWindow inherits Window {
     // A2 (Steam FH4 wheel mode): the Settings switch fires this
     // with the NEW state. Rust wiring: on_steam_fh4_mode_selected.
     callback steam-fh4-mode-selected(bool);
+    // G29 spoof mode: the Settings switch fires this with the NEW
+    // state. Rust wiring: on_g29_spoof_mode_selected.
+    callback g29-spoof-mode-selected(bool);
     callback settings-use-profile(int);
     callback settings-duplicate-profile(int);
     callback transport-selected(int);
@@ -1175,6 +1182,7 @@ export component MainWindow inherits Window {
                 start-with-windows <=> autostart-enabled;
                 keep-in-tray <=> keep-in-tray;
                 steam-fh4-mode <=> steam-fh4-mode;
+                g29-spoof-mode <=> g29-spoof-mode;
                 // R2-31 (h): the segment shows the STORED choice
                 // (theme-choice, 0/1/2) — never the resolved `theme`
                 // (0/1), so Auto stays visibly selected.
@@ -1203,6 +1211,7 @@ export component MainWindow inherits Window {
                 // M-7: forward the new switch state, don't drop it.
                 toggled-keep-tray(b) => { keep-tray-selected(b); }
                 toggled-steam-fh4-mode(b) => { steam-fh4-mode-selected(b); }
+                toggled-g29-spoof-mode(b) => { g29-spoof-mode-selected(b); }
                 theme-selected(i) => { theme-choice = i; theme-persist(i); }
                 new-profile => { settings-action("new-profile"); }
                 use-profile(i) => { settings-use-profile(i); }

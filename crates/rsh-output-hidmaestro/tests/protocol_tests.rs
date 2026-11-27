@@ -12,7 +12,10 @@ fn every_command_encodes_with_the_right_cmd_name() {
     let cases: Vec<(Command, &str)> = vec![
         (Command::Ping, "ping"),
         (Command::Version, "version"),
-        (Command::DescribeProfile, "describe-profile"),
+        (
+            Command::DescribeProfile { profile: None },
+            "describe-profile",
+        ),
         (Command::InstallDriver, "install-driver"),
         (
             Command::Create {

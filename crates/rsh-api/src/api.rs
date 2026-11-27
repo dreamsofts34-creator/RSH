@@ -888,6 +888,35 @@ pub trait AppApi: Send + Sync {
         ))
     }
 
+    /// Whether `G29` spoof mode is on (v2.0.16): the `HIDMaestro`
+    /// backend presents the built-in `logitech-g29` catalog profile
+    /// (VID `0x046D` / PID `0xC24F`) instead of the custom no-brand
+    /// wheel. Default: false — only the daemon overrides it.
+    fn g29_spoof_mode(&self) -> bool {
+        false
+    }
+
+    /// Set G29 spoof mode on/off; returns the new state. Enabling
+    /// is HIDMaestro-only: on any other backend the daemon refuses
+    /// with code `g29_spoof_hid_only`. Disabling always succeeds
+    /// (cleanup is never blocked by the backend). Enabling on a
+    /// connected `HIDMaestro` backend disposes and recreates the
+    /// controller with the G29 profile (a backend restart — it can
+    /// take as long as a backend switch, UAC dwell included); a
+    /// failed recreate rolls the persisted flag back and errors.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the setting cannot be persisted, when the
+    /// controller recreate fails, or when enabling on a non-`HIDMaestro`
+    /// backend.
+    fn set_g29_spoof_mode(&self, _enabled: bool) -> Result<bool, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "G29 spoof mode is not supported by this API",
+        ))
+    }
+
     /// Current tuning for one module (stored value, or the neutral
     /// default when nothing is stored).
     fn get_tuning(&self, module: &str) -> TuningSettings;
@@ -1650,7 +1679,7 @@ mod tests {
     /// Slint default copy too.
     #[test]
     fn app_version_matches_release_tag() {
-        assert_eq!(app_version(), "2.0.15");
+        assert_eq!(app_version(), "2.0.16");
     }
 
     /// L-4: a stub whose state flips between two reads — the

@@ -34,6 +34,7 @@ printf '%s\n' \
   '{"cmd":"ping"}' \
   '{"cmd":"version"}' \
   '{"cmd":"describe-profile"}' \
+  '{"cmd":"describe-profile","profile":"logitech-g29"}' \
   '{"cmd":"install-driver"}' \
   '{"cmd":"bogus"}' \
   '{"cmd":"create","profile":"generic-dinput-gamepad"}' \
@@ -59,13 +60,23 @@ assert prof.get("descriptor_len") == 124, f"descriptor len: {prof}"
 assert prof.get("input_report_size") == 15, f"report size: {prof}"
 assert prof.get("input_report_size_legacy_assumption") == 26, f"legacy: {prof}"
 assert prof.get("button_count") == 32 and prof.get("axis_count") == 5, f"counts: {prof}"
-install = lines[4]
+# G29 spoof (v2.0.16): the catalog logitech-g29 profile loads from the
+# SDK on Linux too (no driver needed for describe) — pinned identity.
+g29 = lines[4]
+assert g29.get("profile") == "logitech-g29", f"g29 profile: {g29}"
+assert g29.get("vid") == 0x046D and g29.get("pid_value") == 0xC24F, f"g29 vid/pid: {g29}"
+assert g29.get("descriptor_len") == 123, f"g29 descriptor len: {g29}"
+assert g29.get("input_report_size") == 12, f"g29 report size: {g29}"
+assert g29.get("button_count") == 25 and g29.get("axis_count") == 4, f"g29 counts: {g29}"
+assert g29.get("has_hat") is True, f"g29 hat: {g29}"
+assert g29.get("descriptor_hex") == "05010904a1010939150025073500463b0165147504950181420509190129196500250145017501951981027501950381030501093027ffff000047ffff000075109501810209320935093126ff0046ff007508950381020600ff0901950281020600ff0901950181020600ff090226ff0046ff00951075089102c0", f"g29 descriptor hex: {g29}"
+install = lines[5]
 assert install.get("ok") is False and install.get("code") == "not-admin", f"install on Linux: {install}"
-assert lines[5].get("code") == "unknown-command", f"unknown: {lines[5]}"
-assert lines[6].get("code") == "profile-refused", f"brand refusal: {lines[6]}"
-assert lines[7].get("code") == "no-controller", f"submit w/o create: {lines[7]}"
-assert lines[8].get("bye") is True, f"exit: {lines[8]}"
-print("verify-linux: OK — hello/version/describe-profile(15B)/install(not-admin)/unknown/brand-refusal/no-controller/exit")
+assert lines[6].get("code") == "unknown-command", f"unknown: {lines[6]}"
+assert lines[7].get("code") == "profile-refused", f"brand refusal: {lines[7]}"
+assert lines[8].get("code") == "no-controller", f"submit w/o create: {lines[8]}"
+assert lines[9].get("bye") is True, f"exit: {lines[9]}"
+print("verify-linux: OK — hello/version/describe-profile(15B)/describe-g29(12B,123-byte descriptor)/install(not-admin)/unknown/brand-refusal/no-controller/exit")
 PYEOF
 
 rm -f verify-linux.stdout verify-linux.stderr

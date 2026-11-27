@@ -392,3 +392,115 @@ fn processed_state_alias_is_output_state() {
     b.update(&state).unwrap();
     b.disconnect();
 }
+
+// --- G29 spoof mode (v2.0.16) ---
+
+fn g29_backend(envs: &[(&str, &str)]) -> HidMaestroOutput {
+    let mut cfg = config(envs);
+    cfg.g29_spoof = true;
+    HidMaestroOutput::with_config(cfg)
+}
+
+#[test]
+fn g29_connect_creates_g29_profile_with_g29_caps() {
+    let mut b = g29_backend(&[]);
+    assert!(b.g29_spoof());
+    assert_eq!(b.active_profile_id(), "logitech-g29");
+    b.try_connect().expect("G29 connect");
+    assert!(b.is_connected());
+    assert_eq!(
+        b.capabilities(),
+        rsh_output_hidmaestro::HidMaestroCapabilities::g29_wheel()
+    );
+    let status = b.status();
+    assert_eq!(status.kind, HidMaestroStateKind::Ready);
+    assert!(
+        status.message.contains("logitech-g29"),
+        "{}",
+        status.message
+    );
+    assert!(status.message.contains("G29"), "{}", status.message);
+    b.disconnect();
+}
+
+#[test]
+fn g29_update_submits_12_byte_raw_report_not_submit_state() {
+    use rsh_output::IJoystickOutput;
+    let mut b = g29_backend(&[]);
+    b.try_connect().unwrap();
+    b.update(&full_state()).expect("first G29 update");
+    settle_after_submit();
+    // Second update drains the first reply: a SubmitState submit
+    // would have been refused by the stub under G29, surfacing here.
+    b.update(&full_state())
+        .expect("second G29 update (drains first reply)");
+    assert_eq!(b.status().submit_count, 2);
+    b.disconnect();
+}
+
+#[test]
+fn g29_forces_raw_report_even_when_use_raw_report_is_false() {
+    use rsh_output::IJoystickOutput;
+    let mut cfg = config(&[]);
+    cfg.g29_spoof = true;
+    cfg.use_raw_report = false;
+    let mut b = HidMaestroOutput::with_config(cfg);
+    b.try_connect().unwrap();
+    b.update(&full_state()).expect("G29 update with raw off");
+    settle_after_submit();
+    b.update(&full_state())
+        .expect("second update drains the first (would fail on SubmitState)");
+    b.disconnect();
+}
+
+#[test]
+fn g29_toggle_recreates_controller_with_the_other_profile() {
+    use rsh_output::IJoystickOutput;
+    let mut b = backend(&[]);
+    b.try_connect().expect("custom connect");
+    assert!(b.status().message.contains("rsh-wheel-custom"));
+    // Enable: disconnect + recreate as G29 (stub sidecar, instant).
+    b.set_g29_spoof_mode(true);
+    assert!(b.g29_spoof());
+    assert!(b.is_connected(), "recreate after enabling must reconnect");
+    assert!(b.status().message.contains("logitech-g29"));
+    assert_eq!(
+        b.capabilities(),
+        rsh_output_hidmaestro::HidMaestroCapabilities::g29_wheel()
+    );
+    // Disable: back to the custom profile.
+    b.set_g29_spoof_mode(false);
+    assert!(!b.g29_spoof());
+    assert!(b.is_connected(), "recreate after disabling must reconnect");
+    assert!(b.status().message.contains("rsh-wheel-custom"));
+    assert_eq!(
+        b.capabilities(),
+        rsh_output_hidmaestro::HidMaestroCapabilities::custom_wheel()
+    );
+    b.disconnect();
+}
+
+#[test]
+fn g29_toggle_is_noop_when_already_in_that_mode() {
+    use rsh_output::IJoystickOutput;
+    let mut b = g29_backend(&[]);
+    b.try_connect().unwrap();
+    // Same mode: no disconnect/recreate — still connected, same caps.
+    b.set_g29_spoof_mode(true);
+    assert!(b.is_connected());
+    assert_eq!(
+        b.capabilities(),
+        rsh_output_hidmaestro::HidMaestroCapabilities::g29_wheel()
+    );
+    b.disconnect();
+}
+
+#[test]
+fn g29_plan_validation_allows_handbrake_without_slider() {
+    use rsh_engine::pipeline::PipelinePlan;
+    let mut b = g29_backend(&[]);
+    let plan = PipelinePlan::default(); // handbrake enabled by default
+    b.try_connect_with_plan(&plan)
+        .expect("G29 connect with a handbrake-on plan must validate");
+    b.disconnect();
+}

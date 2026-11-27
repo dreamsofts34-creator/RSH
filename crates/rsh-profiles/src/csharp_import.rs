@@ -500,6 +500,19 @@ pub struct AppSettings {
     /// never applied to the HID backend.
     #[serde(default)]
     pub steam_fh4_mode: bool,
+    /// `G29` spoof mode (v2.0.16): when on, the `HIDMaestro` backend
+    /// presents the built-in `logitech-g29` catalog profile (VID
+    /// `0x046D` / PID `0xC24F`) instead of the custom no-brand wheel,
+    /// so games that match wheels by VID/PID see a G29. Default
+    /// `false` (off) — never on for a fresh install, and never
+    /// applied to the vJoy backend (the daemon refuses enabling
+    /// there with `g29_spoof_hid_only`). RISK: presenting
+    /// Logitech's VID/PID violates USB-IF policy as written (no
+    /// enforcement found for private hobby use); FH4 end-to-end is
+    /// unproven — even a real G29 needs a custom control scheme in
+    /// FH4, so this mode promises no auto-recognition.
+    #[serde(default)]
+    pub g29_spoof_mode: bool,
     /// Per-module on/off switches, keyed by canonical module id
     /// (`"steering"`, `"accelerator"`, `"brake"`, `"clutch"`,
     /// `"handbrake"`, `"shifter"`, `"horn"`, `"buttons"`,
@@ -684,6 +697,7 @@ impl Default for AppSettings {
             auto_switch_profiles: true,
             auto_switch_paused: false,
             steam_fh4_mode: false,
+            g29_spoof_mode: false,
             modules: default_modules(),
         }
     }
@@ -798,6 +812,8 @@ pub struct AppSettingsPatch {
     pub auto_switch_paused: Option<bool>,
     /// Steam FH4 wheel mode (default off — see [`AppSettings::steam_fh4_mode`]).
     pub steam_fh4_mode: Option<bool>,
+    /// G29 spoof mode (default off — see [`AppSettings::g29_spoof_mode`]).
+    pub g29_spoof_mode: Option<bool>,
     /// Per-module switches, merged per key.
     pub modules: Option<HashMap<String, bool>>,
 }
@@ -855,6 +871,9 @@ impl AppSettings {
         }
         if let Some(steam_fh4_mode) = patch.steam_fh4_mode {
             self.steam_fh4_mode = steam_fh4_mode;
+        }
+        if let Some(g29_spoof_mode) = patch.g29_spoof_mode {
+            self.g29_spoof_mode = g29_spoof_mode;
         }
         if let Some(modules) = patch.modules {
             for (module, enabled) in modules {
@@ -1268,6 +1287,24 @@ mod tests {
         }"#;
         let settings = parse_csharp_settings(json).expect("SteamFh4Mode false parses");
         assert!(!settings.steam_fh4_mode);
+    }
+
+    #[test]
+    fn parses_g29_spoof_mode_when_present() {
+        // G29 spoof (v2.0.16): PascalCase key normalizes like the
+        // rest; absent in old settings → default off.
+        let settings = parse_csharp_settings(SAMPLE_SETTINGS_JSON).expect("sample settings parse");
+        assert!(!settings.g29_spoof_mode);
+        let json = r#"{
+          "G29SpoofMode": true
+        }"#;
+        let settings = parse_csharp_settings(json).expect("G29SpoofMode parses");
+        assert!(settings.g29_spoof_mode);
+        let json = r#"{
+          "G29SpoofMode": false
+        }"#;
+        let settings = parse_csharp_settings(json).expect("G29SpoofMode false parses");
+        assert!(!settings.g29_spoof_mode);
     }
 
     #[test]

@@ -5,8 +5,8 @@
 // `runas` (handle redirection does not survive a runas launch).
 // One command per line, one JSON reply per line. The sidecar owns the
 // whole HIDMaestro lifecycle: HMContext -> InstallDriver() -> custom
-// profile -> CreateController -> SubmitState / SubmitRawReport ->
-// Dispose. Rust never touches the SDK.
+// profile (or the G29 catalog profile, v2.0.16) -> CreateController ->
+// SubmitState / SubmitRawReport -> Dispose. Rust never touches the SDK.
 //
 // Commands: ping, version, describe-profile, install-driver, create,
 // submit, submit-raw, neutral, dispose, exit. See PROTOCOL.md.
@@ -38,6 +38,13 @@ internal static class Program
     static int inputReportSize;
     static long submitCount;
     static long lastLatencyUs;
+    // G29 spoof (v2.0.16): output/FFB packets received on a G29
+    // controller and DISCARDED (the wheel has no motor). A counter
+    // only — the payload is never logged, never surfaced to the user.
+    // Logged every 1000th packet (see the `OutputReceived`
+    // subscription in `Create`) so the file log shows the sink is
+    // alive without spamming it at game FFB rates.
+    static long outputReceivedCount;
     static volatile bool exitRequested;
     static string transportName = "stdio";
     static string? dllSha256Cache;
@@ -399,7 +406,7 @@ internal static class Program
                 TUs = sw.ElapsedTicks * 1_000_000.0 / Stopwatch.Frequency,
             },
             "version" => Version(),
-            "describe-profile" => DescribeProfile(),
+            "describe-profile" => DescribeProfile(root),
             "install-driver" => InstallDriver(),
             "create" => Create(root),
             "submit" => Submit(root),
@@ -426,10 +433,42 @@ internal static class Program
         Transport = transportName,
         SubmitCount = submitCount,
         OnSubmitLatencyUs = submitCount > 0 ? lastLatencyUs : null,
+        OutputReceivedCount = outputReceivedCount,
     };
 
-    static SidecarReply DescribeProfile()
+    /// <summary>
+    /// Describes a profile: the requested one (`{"profile": ...}`),
+    /// else the ACTIVE profile once a controller exists, else the
+    /// custom profile. G29 spoof (v2.0.16): describing
+    /// <c>logitech-g29</c> loads the catalog profile from the SDK
+    /// (needs the HIDMaestro context + <c>LoadDefaultProfiles</c> —
+    /// it is NOT pure like the custom descriptor build) and reports
+    /// its VID/PID/descriptor/derived size (123 bytes / 12 bytes).
+    /// Any other id is refused — only the two built profiles are
+    /// ever described.
+    /// </summary>
+    static SidecarReply DescribeProfile(JsonElement root)
     {
+        string? asked = null;
+        if (root.TryGetProperty("profile", out var profileEl)
+            && profileEl.ValueKind == JsonValueKind.String)
+        {
+            asked = profileEl.GetString();
+        }
+
+        var id = asked ?? profileId ?? Constants.ProfileId;
+        if (id != Constants.ProfileId && id != Constants.G29ProfileId)
+        {
+            return Error(
+                "profile-refused",
+                $"profile '{id}' refused: only '{Constants.ProfileId}' and '{Constants.G29ProfileId}' are described");
+        }
+
+        if (id == Constants.G29ProfileId)
+        {
+            return DescribeG29Profile();
+        }
+
         var (descriptor, derived) = BuildDescriptor();
         return new SidecarReply
         {
@@ -447,6 +486,93 @@ internal static class Program
             HasHat = true,
             Backend = "hidmaestro",
         };
+    }
+
+    /// <summary>
+    /// Describes the catalog <c>logitech-g29</c> profile, loaded from
+    /// the SDK. <c>HMProfile.InputReportSize</c> is 0 for catalog
+    /// profiles (verified against the real v2.1.0 DLL) and is never
+    /// trusted — the size is derived from the descriptor (12 bytes).
+    /// </summary>
+    static SidecarReply DescribeG29Profile()
+    {
+        try
+        {
+            EnsureCtx();
+        }
+        catch (Exception ex)
+        {
+            // P1 (v2.0.11): see InstallDriver — a context that cannot
+            // be created is `context-unavailable`, not a generic failure.
+            return Error("context-unavailable", $"cannot create HIDMaestro context: {ex.Message}");
+        }
+
+        HMProfile prof;
+        try
+        {
+            prof = LoadG29CatalogProfile(ctx!);
+        }
+        catch (Exception ex)
+        {
+            return Error(
+                "profile-refused",
+                $"catalog profile '{Constants.G29ProfileId}' could not be loaded: {ex.GetType().Name}: {ex.Message}");
+        }
+
+        var descriptor = prof.GetDescriptorBytes();
+        if (descriptor is null)
+        {
+            return Error(
+                "profile-refused",
+                $"catalog profile '{Constants.G29ProfileId}' has no descriptor bytes — refusing to describe an unverified device");
+        }
+
+        var derived = HidReportSize.DeriveInputReportSize(descriptor);
+        if (derived <= 0)
+        {
+            return Error(
+                "create-failed",
+                "could not derive the input report size from the G29 profile descriptor");
+        }
+
+        return new SidecarReply
+        {
+            Ok = true,
+            Profile = Constants.G29ProfileId,
+            Vid = prof.VendorId,
+            PidValue = prof.ProductId,
+            VidPidProvisional = false,
+            DescriptorLen = descriptor.Length,
+            DescriptorHex = Convert.ToHexString(descriptor).ToLowerInvariant(),
+            InputReportSize = derived,
+            InputReportSizeLegacyAssumption = Constants.LegacyReportSizeAssumption,
+            ButtonCount = prof.ButtonCount,
+            AxisCount = prof.AxisCount,
+            HasHat = prof.HasHat,
+            Backend = "hidmaestro",
+        };
+    }
+
+    /// <summary>
+    /// Loads the catalog <c>logitech-g29</c> profile from the SDK.
+    /// <c>LoadDefaultProfiles</c> is REQUIRED before
+    /// <c>GetProfile</c> — verified against the real v2.1.0 DLL:
+    /// <c>GetProfile</c> with no load throws
+    /// <c>NullReferenceException</c>.
+    /// </summary>
+    static HMProfile LoadG29CatalogProfile(HMContext context)
+    {
+        context.LoadDefaultProfiles();
+        var prof = context.GetProfile(Constants.G29ProfileId);
+        if (prof is null)
+        {
+            // The SDK returns null instead of throwing when the
+            // catalog has no such profile — fail closed.
+            throw new InvalidOperationException(
+                $"catalog profile '{Constants.G29ProfileId}' not found after LoadDefaultProfiles");
+        }
+
+        return prof;
     }
 
     static SidecarReply InstallDriver()
@@ -515,13 +641,19 @@ internal static class Program
             id = idEl.GetString()!;
         }
 
-        // Only the custom no-brand profile. Catalog profiles are all
-        // brand identities; creating one would spoof a brand.
-        if (id != Constants.ProfileId)
+        // Only the custom no-brand profile and the G29 catalog
+        // profile. Every OTHER catalog profile is still refused:
+        // creating one would spoof a brand. The G29 exception is
+        // explicit and user-gated (default-off `g29_spoof_mode`,
+        // HIDMaestro-only) — see Constants.G29ProfileId for the
+        // risk disclosure. The pid.codes 0x1209/0x5253 claim is
+        // unaffected: that identity is simply unused while G29 is
+        // active.
+        if (id != Constants.ProfileId && id != Constants.G29ProfileId)
         {
             return Error(
                 "profile-refused",
-                $"profile '{id}' refused: only '{Constants.ProfileId}' is built; catalog brand profiles are never created");
+                $"profile '{id}' refused: only '{Constants.ProfileId}' and '{Constants.G29ProfileId}' are built; catalog brand profiles are otherwise never created");
         }
 
         try
@@ -544,20 +676,71 @@ internal static class Program
             }
         }
 
-        var (descriptor, derived) = BuildDescriptor();
-        var prof = new HMProfileBuilder()
-            .Id(Constants.ProfileId)
-            .Name("RSH Wheel (custom)")
-            .Vendor(Constants.Vendor)
-            .Vid(Constants.Vid)
-            .Pid(Constants.Pid)
-            .ProductString(Constants.Product)
-            .ManufacturerString(Constants.Vendor)
-            .Type("wheel")
-            .Connection("usb")
-            .Descriptor(descriptor)
-            .InputReportSize(derived)
-            .Build();
+        HMProfile prof;
+        int derived;
+        string identityKey;
+        if (id == Constants.G29ProfileId)
+        {
+            // The catalog profile, loaded from the SDK — never
+            // hand-built. Its descriptor bytes must equal the
+            // pinned 123-byte G29 descriptor exactly; a different
+            // descriptor under this identity would be an unverified
+            // device, so create fails instead of shipping it.
+            try
+            {
+                prof = LoadG29CatalogProfile(ctx!);
+            }
+            catch (Exception ex)
+            {
+                return Error(
+                    "profile-refused",
+                    $"catalog profile '{Constants.G29ProfileId}' could not be loaded: {ex.GetType().Name}: {ex.Message}");
+            }
+
+            var descriptor = prof.GetDescriptorBytes();
+            var expected = Convert.FromHexString(Constants.G29DescriptorHex);
+            if (prof.Id != Constants.G29ProfileId
+                || prof.VendorId != Constants.G29Vid
+                || prof.ProductId != Constants.G29Pid
+                || !descriptor.SequenceEqual(expected))
+            {
+                return Error(
+                    "profile-refused",
+                    $"catalog profile '{Constants.G29ProfileId}' does not match the pinned G29 identity (VID 0x046D / PID 0xC24F, 123-byte descriptor) — refusing to create an unverified device");
+            }
+
+            // The SDK's own InputReportSize is 0 for catalog profiles
+            // (verified against the real v2.1.0 DLL) — derive the
+            // size from the descriptor (12 bytes), never trust it.
+            derived = HidReportSize.DeriveInputReportSize(descriptor);
+            if (derived != Constants.G29InputReportSize)
+            {
+                return Error(
+                    "create-failed",
+                    $"G29 descriptor derives input report size {derived}, expected {Constants.G29InputReportSize}");
+            }
+
+            identityKey = Constants.G29IdentityKey;
+        }
+        else
+        {
+            var (descriptor, derivedCustom) = BuildDescriptor();
+            prof = new HMProfileBuilder()
+                .Id(Constants.ProfileId)
+                .Name("RSH Wheel (custom)")
+                .Vendor(Constants.Vendor)
+                .Vid(Constants.Vid)
+                .Pid(Constants.Pid)
+                .ProductString(Constants.Product)
+                .ManufacturerString(Constants.Vendor)
+                .Type("wheel")
+                .Connection("usb")
+                .Descriptor(descriptor)
+                .InputReportSize(derivedCustom)
+                .Build();
+            derived = derivedCustom;
+            identityKey = Constants.IdentityKey;
+        }
 
         // SEC-H-06 refusal rules (mirrors the C# app's adapter):
         // usbip-backed or self-reporting or non-deployable profiles
@@ -574,7 +757,7 @@ internal static class Program
         var t0 = Stopwatch.GetTimestamp();
         try
         {
-            ctl = ctx.CreateController(prof, Constants.IdentityKey);
+            ctl = ctx.CreateController(prof, identityKey);
         }
         catch (Exception ex)
         {
@@ -586,10 +769,35 @@ internal static class Program
         inputReportSize = derived;
         submitCount = 0;
         lastLatencyUs = 0;
+        outputReceivedCount = 0;
         // The SDK's own per-submit latency hook — surfaced in
         // version / submit replies for diagnostics.
         ctl.OnSubmitLatencyMicros = us => Interlocked.Exchange(ref lastLatencyUs, us);
 
+        if (id == Constants.G29ProfileId)
+        {
+            // FFB SINK (research §5): the G29 profile keeps its
+            // 16-byte 0xFF00 Output report (the Driving Force
+            // force-feedback command channel), so FH4's FFB writes
+            // have somewhere to go instead of failing against a
+            // missing endpoint. The wheel has no motor, so the
+            // writes are DISCARDED here — a counter only, never
+            // payload data, never an error to the user.
+            // NOTE: `HapticReceived` does NOT exist on HMController
+            // (verified against the real v2.1.0 DLL — it lives on
+            // HMVRController, a VR type); `OutputReceived` is the
+            // channel that carries the game's output writes.
+            ctl.OutputReceived += (_, _) =>
+            {
+                var n = Interlocked.Increment(ref outputReceivedCount);
+                if (n % 1000 == 0)
+                {
+                    Log($"g29 output received x{n} (discarded — no FFB motor; payload never logged)");
+                }
+            };
+        }
+
+        var isG29 = id == Constants.G29ProfileId;
         return new SidecarReply
         {
             Ok = true,
@@ -599,10 +807,11 @@ internal static class Program
             Driver = ctl.DriverVersion?.ToString(),
             CreateMs = createMs,
             InputReportSize = derived,
+            OutputReceivedCount = outputReceivedCount,
             Capabilities = new CapabilitiesReply
             {
-                Axes = 5,
-                Buttons = 32,
+                Axes = isG29 ? 4 : 5,
+                Buttons = isG29 ? 25 : 32,
                 HasHat = true,
                 InputReportSize = derived,
                 SubmitStateMaxButton = 25,
@@ -616,6 +825,18 @@ internal static class Program
         if (ctl is null)
         {
             return Error("no-controller", "no controller — call create first");
+        }
+
+        // G29 spoof (v2.0.16): the SubmitState frame layout does not
+        // match the G29 profile — only the 12-byte raw report may be
+        // submitted for it (the Rust side forces the raw path; this
+        // is defence in depth, so a mismatched frame can never reach
+        // the driver even if the Rust side regresses).
+        if (profileId == Constants.G29ProfileId)
+        {
+            return Error(
+                "bad-command",
+                "submit (SubmitState) is not supported for the logitech-g29 profile — use submit-raw");
         }
 
         var axes = new Dictionary<HMAxis, float>();
@@ -718,6 +939,17 @@ internal static class Program
         }
         else
         {
+            // G29 spoof (v2.0.16): the SubmitState neutral frame does
+            // not match the G29 profile — only the raw neutral may be
+            // sent for it (the Rust side always passes raw:true
+            // under G29; this is defence in depth).
+            if (profileId == Constants.G29ProfileId)
+            {
+                return Error(
+                    "bad-command",
+                    "SubmitState neutral is not supported for the logitech-g29 profile — use raw:true");
+            }
+
             ctl.SubmitState(new HMGamepadState
             {
                 Axes = new Dictionary<HMAxis, float> { [HMAxis.X] = 0.5f },
@@ -776,13 +1008,28 @@ internal static class Program
     }
 
     /// <summary>
-    /// The 15-byte neutral raw report: steering centred (u16 16383),
-    /// pedals released (0), no buttons, hat centred (0x08 — the
-    /// first out-of-range value for a null-state hat). Same layout
-    /// the Rust crate builds in <c>neutral_raw_report</c>.
+    /// The neutral raw report for the ACTIVE profile: the 15-byte
+    /// custom report (steering centred at u16 16383, pedals released,
+    /// no buttons, hat centred 0x08 — the first out-of-range value
+    /// for a null-state hat), or the 12-byte G29 report (X = 32768,
+    /// pedals 0, hat neutral 0x08 low nibble, buttons 0, vendor bytes
+    /// 0). Same layout the Rust crate builds in
+    /// <c>neutral_raw_report</c> / <c>neutral_g29_raw_report</c>.
     /// </summary>
     static byte[] NeutralRawReport()
     {
+        if (profileId == Constants.G29ProfileId)
+        {
+            var g29 = new byte[Constants.G29InputReportSize];
+            // Hat = 0x08 (centred) in the low nibble; buttons = 0.
+            g29[0] = 0x08;
+            // X (steering) = 32768, little-endian.
+            g29[4] = 0x00;
+            g29[5] = 0x80;
+            // Pedals (6-8) and vendor bytes (9-11) = 0 (already zeroed).
+            return g29;
+        }
+
         var bytes = new byte[15];
         // X (steering) = 16383, little-endian.
         bytes[0] = 0xFF;
@@ -822,6 +1069,7 @@ internal static class Program
         ctl = null;
         profileId = null;
         inputReportSize = 0;
+        outputReceivedCount = 0;
         try
         {
             ctx?.Dispose();

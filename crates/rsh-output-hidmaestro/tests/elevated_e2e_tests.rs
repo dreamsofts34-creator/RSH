@@ -66,7 +66,7 @@ use std::path::PathBuf;
 use rsh_output_hidmaestro::manager::{HelloInfo, SidecarConfig, SidecarManager};
 use rsh_output_hidmaestro::mapping::{CUSTOM_RAW_REPORT_SIZE, GamepadFrame};
 use rsh_output_hidmaestro::protocol::Command;
-use rsh_output_hidmaestro::{PINNED_DLL_SHA256, PINNED_VERSION};
+use rsh_output_hidmaestro::{PINNED_DLL_SHA256, PINNED_VERSION, PROFILE_ID};
 
 /// The staged production sidecar, as `stage-sidecar.ps1` leaves it
 /// (fail-closed: a missing exe or DLL is a test failure, never a
@@ -174,7 +174,7 @@ fn elevated_sidecar_driver_path_e2e() {
     // describe-profile: the 15-byte raw-report layout must match
     // the Rust side (HID P2-1) — a mismatch fails the connect.
     let described = manager
-        .describe_profile()
+        .describe_profile(PROFILE_ID)
         .expect("describe-profile after hello");
     assert_eq!(
         described.input_report_size,
@@ -190,7 +190,9 @@ fn elevated_sidecar_driver_path_e2e() {
         "driver must be installed after install-driver: {installed:?}"
     );
     // create: a controller exists and reports its driver version.
-    let created = manager.create().expect("create custom wheel profile");
+    let created = manager
+        .create(PROFILE_ID)
+        .expect("create custom wheel profile");
     assert!(
         created.transport_index.is_some(),
         "create must report a transport index: {created:?}"

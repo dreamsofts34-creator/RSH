@@ -180,9 +180,9 @@ use rsh_output::vjoy::{VJOY_DOWNLOAD_URL, VJoyOutput, resolve_dll_path};
 #[cfg(windows)]
 use rsh_output::vjoy_config::configure_device_1_envelope_and_mappings;
 use rsh_output::{IJoystickOutput, ProcessedState, VJoyError};
-use rsh_output_hidmaestro::HidMaestroOutput;
 use rsh_output_hidmaestro::backend::UAC_NOTE;
 use rsh_output_hidmaestro::manager::resolve_sidecar_path;
+use rsh_output_hidmaestro::{HidMaestroConfig, HidMaestroOutput};
 use rsh_profiles::bindings::{BindingError, BindingStore, is_app_action};
 use rsh_profiles::csharp_import::{
     GameId, KNOWN_MODULES, PedalCalibration, PerModuleTuning, SteeringCalibration, WheelProfile,
@@ -3457,7 +3457,7 @@ impl AppStateCore {
     #[must_use]
     pub fn set_output_enabled(&self, enabled: bool) -> CommandOutputState {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
-        let factories = real_backend_factories(vjoy_device_id);
+        let factories = real_backend_factories(vjoy_device_id, self.settings().g29_spoof_mode);
         self.set_output_enabled_with_factories(enabled, &factories)
     }
 
@@ -3637,6 +3637,13 @@ impl AppStateCore {
             // — the plain reconnect below spawns a sidecar exactly
             // like a switch, so it must not bypass the guard.
             let backend_kind = BackendKind::from_backend_name(lock(&backend).name());
+            // G29 spoof (v2.0.16): the (re)connected backend gets the
+            // persisted G29 mode BEFORE connect, so the fresh
+            // instance creates the right profile — pushing after
+            // connect would be too late (the profile is chosen at
+            // create). The handle is extracted (no slot lock held),
+            // so a live recreate here cannot stall engine ticks.
+            lock(&backend).set_g29_spoof_mode(self.settings().g29_spoof_mode);
             let connected = lock(&backend).try_connect();
             // P1-1 (v2.0.12 scan): the flag is set from the connect
             // outcome, not from the request — a failed connect
@@ -3736,6 +3743,12 @@ impl AppStateCore {
         // a sink — but a failing `HIDMaestro` connect here is still
         // a spent sidecar spawn).
         let kind = BackendKind::from_backend_name(backend.name());
+        // G29 spoof (v2.0.16): the persisted mode goes in BEFORE
+        // connect, so the backend creates the right profile. On an
+        // already-connected backend this recreates it when the mode
+        // differs (the test-only path holds the handle lock here —
+        // the production path extracts the handle first, above).
+        backend.set_g29_spoof_mode(self.settings().g29_spoof_mode);
         match backend.try_connect() {
             Ok(()) => {
                 if kind == Some(BackendKind::HidMaestro) {
@@ -3815,7 +3828,7 @@ impl AppStateCore {
     /// fails, or the requested backend could not connect.
     pub fn set_output_backend(&self, name: &str) -> Result<CommandOutputState, String> {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
-        let factories = real_backend_factories(vjoy_device_id);
+        let factories = real_backend_factories(vjoy_device_id, self.settings().g29_spoof_mode);
         self.set_output_backend_with_factories(name, &factories)
     }
 
@@ -4230,7 +4243,7 @@ impl AppStateCore {
     #[must_use]
     pub fn activate_startup_backend(&self) -> StartupBackendOutcome {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
-        let factories = real_backend_factories(vjoy_device_id);
+        let factories = real_backend_factories(vjoy_device_id, self.settings().g29_spoof_mode);
         self.activate_startup_backend_with_factories(&factories)
     }
 
@@ -5738,7 +5751,7 @@ impl AppStateCore {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
         self.try_mid_session_fallback_with_factories(
             output,
-            &real_backend_factories(vjoy_device_id),
+            &real_backend_factories(vjoy_device_id, self.settings().g29_spoof_mode),
         )
     }
 
@@ -6264,6 +6277,81 @@ impl AppStateCore {
         let enabled = self.settings().steam_fh4_mode;
         let handle = self.backend_handle();
         lock(&handle).set_steam_fh4_mode(enabled);
+    }
+
+    /// Whether G29 spoof mode is on (v2.0.16): the stored
+    /// `g29_spoof_mode` flag (default off).
+    #[must_use]
+    pub fn g29_spoof_mode(&self) -> bool {
+        self.settings().g29_spoof_mode
+    }
+
+    /// Persist the G29 spoof mode choice (v2.0.16) and recreate the
+    /// live `HIDMaestro` backend with the right profile at once, so a
+    /// connected HID backend switches identity without a manual
+    /// backend re-select. The recreate runs OUTSIDE the backend slot
+    /// lock (R2-09 pattern — the extracted handle is swapped back
+    /// afterwards): it spawns a sidecar and may dwell on a UAC
+    /// prompt, and holding the slot lock for that would stall every
+    /// engine tick. A disconnected HID backend just records the flag
+    /// (its next connect creates the right profile); non-HID
+    /// backends ignore the push (trait default no-op — the daemon
+    /// refuses enabling there before this is ever called).
+    /// Returns the stored value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the settings save fails.
+    pub fn set_g29_spoof_mode(self: &Arc<Self>, enabled: bool) -> Result<bool, String> {
+        let merged = self.set_settings_patch(AppSettingsPatch {
+            g29_spoof_mode: Some(enabled),
+            ..Default::default()
+        })?;
+        // Only a HIDMaestro live backend has a profile to recreate.
+        if self.backend_name() == "HIDMaestro" {
+            self.recreate_live_backend_for_g29(enabled);
+        }
+        Ok(merged.g29_spoof_mode)
+    }
+
+    /// Recreate the installed `HIDMaestro` backend with the given `G29`
+    /// mode, outside the backend slot lock (see
+    /// [`Self::set_g29_spoof_mode`]). The backend handle is taken
+    /// out of the slot (a disconnected `NullSink` stands in, so engine
+    /// ticks keep flowing), the mode is applied on the extracted
+    /// handle — which disconnects + reconnects when connected, and
+    /// just records the flag when not — and the handle is swapped
+    /// back. A failed recreate leaves the backend disconnected with
+    /// the failure in its status; the daemon sees that and rolls the
+    /// persisted flag back.
+    fn recreate_live_backend_for_g29(&self, enabled: bool) {
+        let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
+        let factories = real_backend_factories(vjoy_device_id, enabled);
+        if let Some(placeholder) = factories.build(BackendKind::None) {
+            let handle = {
+                let mut slot = lock(&self.backend);
+                std::mem::replace(&mut *slot, Arc::new(Mutex::new(placeholder)))
+            };
+            lock(&handle).set_g29_spoof_mode(enabled);
+            *lock(&self.backend) = handle;
+        } else {
+            // No sink factory (test-only path): push on the live
+            // handle directly — test backends are no-ops here.
+            self.push_g29_spoof_mode_to_backend();
+        }
+    }
+
+    /// Push the persisted G29 spoof mode into the live backend
+    /// (v2.0.16). Idempotent when the flag already matches (the
+    /// trait method no-ops), and non-HID backends ignore it (trait
+    /// default no-op). Never call while the backend handle's own
+    /// lock is already held (connect paths push through their
+    /// locked `&mut` backend directly instead — see
+    /// [`Self::connect_and_resend`]).
+    fn push_g29_spoof_mode_to_backend(&self) {
+        let enabled = self.settings().g29_spoof_mode;
+        let handle = self.backend_handle();
+        lock(&handle).set_g29_spoof_mode(enabled);
     }
 
     /// Restore the newest present profiles backup (M7): `bak1` first,
@@ -8566,11 +8654,17 @@ fn run_vjoy_install_inner() -> Result<(), String> {
 
 /// Builds the real backend factories for the selector: vJoy
 /// (default), `HIDMaestro` (explicit choice, this settings' device
-/// id), and the no-device sink.
-fn real_backend_factories(vjoy_device_id: u32) -> BackendFactories {
+/// id), and the no-device sink. `g29_spoof` is the persisted G29
+/// mode: a freshly built `HIDMaestro` backend creates the `logitech-g29`
+/// profile when it is on (see `HidMaestroConfig::g29_spoof`) — the
+/// live toggle path recreates the installed instance instead, so the
+/// two paths never disagree about which profile is live.
+fn real_backend_factories(vjoy_device_id: u32, g29_spoof: bool) -> BackendFactories {
     BackendFactories {
-        hidmaestro: Some(Box::new(|| {
-            Box::new(HidMaestroOutput::new()) as Box<dyn IJoystickOutput>
+        hidmaestro: Some(Box::new(move || {
+            Box::new(HidMaestroOutput::with_config(
+                HidMaestroConfig::default().with_g29_spoof(g29_spoof),
+            )) as Box<dyn IJoystickOutput>
         })),
         vjoy: Some(Box::new(move || {
             Box::new(VJoyOutput::new(vjoy_device_id)) as Box<dyn IJoystickOutput>
@@ -10937,6 +11031,22 @@ mod tests {
         assert!(state.settings().steam_fh4_mode);
         assert!(!state.set_steam_fh4_mode(false).expect("persist off"));
         assert!(!state.steam_fh4_mode());
+    }
+
+    #[test]
+    fn g29_spoof_mode_defaults_off_and_persists() {
+        // G29 spoof (v2.0.16): default OFF, and the toggle
+        // round-trips through settings.json. The test backend is the
+        // NullSink (not HIDMaestro), so the push is a no-op — the
+        // persist itself is what this asserts.
+        let (state, _dir) = test_state();
+        assert!(!state.g29_spoof_mode(), "default must be off");
+        assert!(!state.settings().g29_spoof_mode);
+        assert!(state.set_g29_spoof_mode(true).expect("persist on"));
+        assert!(state.g29_spoof_mode());
+        assert!(state.settings().g29_spoof_mode);
+        assert!(!state.set_g29_spoof_mode(false).expect("persist off"));
+        assert!(!state.g29_spoof_mode());
     }
 
     #[test]

@@ -142,4 +142,20 @@ pub trait IJoystickOutput: Send {
     /// that (re)connects picks the current mode up without the
     /// caller remembering to re-push it.
     fn set_steam_fh4_mode(&mut self, _enabled: bool) {}
+
+    /// `G29` spoof mode (v2.0.16): when on, the backend presents the
+    /// `HIDMaestro` built-in `logitech-g29` catalog profile (VID
+    /// `0x046D` / PID `0xC24F`) instead of the custom no-brand wheel.
+    /// The default is a no-op — only `HIDMaestro` implements it
+    /// (`vJoy` has no `HIDMaestro` profile to switch; the daemon refuses
+    /// enabling on any other backend with `g29_spoof_hid_only`).
+    /// `HIDMaestro` recreates the controller with the right profile
+    /// when the mode changes while connected; a disconnected backend
+    /// just records the flag for its next connect. See
+    /// `HidMaestroOutput::set_g29_spoof_mode` for the restart
+    /// semantics. RISK: presenting Logitech's VID/PID violates
+    /// USB-IF policy as written (no enforcement found for private
+    /// hobby use); FH4 end-to-end is unproven — do not promise
+    /// auto-recognition.
+    fn set_g29_spoof_mode(&mut self, _enabled: bool) {}
 }

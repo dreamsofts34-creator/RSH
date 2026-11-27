@@ -379,6 +379,17 @@ fn steam_fh4_enable_allowed(backend_name: &str) -> bool {
         .is_none_or(|kind| kind != rsh_output::selector::BackendKind::HidMaestro)
 }
 
+/// G29 spoof enable guard (v2.0.16): enabling is HIDMaestro-only —
+///
+/// the `G29` profile is a `HIDMaestro` catalog profile, so there is no
+/// device to spoof with on vJoy (or with no backend). Disabling is
+/// always allowed and never consults this helper.
+#[must_use]
+fn g29_spoof_enable_allowed(backend_name: &str) -> bool {
+    rsh_output::selector::BackendKind::from_backend_name(backend_name)
+        == Some(rsh_output::selector::BackendKind::HidMaestro)
+}
+
 impl AppApi for DaemonApi {
     fn version(&self) -> String {
         app_version().to_string()
@@ -947,6 +958,53 @@ impl AppApi for DaemonApi {
                     error.to_string(),
                 ));
             }
+        }
+        Ok(stored)
+    }
+
+    fn g29_spoof_mode(&self) -> bool {
+        self.state.g29_spoof_mode()
+    }
+
+    fn set_g29_spoof_mode(&self, enabled: bool) -> Result<bool, UserError> {
+        // G29 spoof (v2.0.16): enabling on anything but HIDMaestro
+        // is refused BEFORE any persist — the G29 profile is a
+        // HIDMaestro catalog profile, so vJoy (or no backend) has no
+        // device to spoof with. Disabling always succeeds: cleanup
+        // is never blocked by the backend.
+        if enabled && !g29_spoof_enable_allowed(&self.state.backend_name()) {
+            return Err(UserError {
+                code: "g29_spoof_hid_only".to_string(),
+                title: "G29 spoof needs HIDMaestro".to_string(),
+                what_happened: "G29 spoof only works with the HIDMaestro backend — the current backend has no HIDMaestro profile to switch, so there is no G29 device to present."
+                    .to_string(),
+                what_to_do: "Switch the output backend to HIDMaestro first, then turn G29 spoof on."
+                    .to_string(),
+                detail: None,
+            });
+        }
+        // Was the live HID backend connected before the toggle? A
+        // connected backend is recreated with the new profile by
+        // `AppStateCore::set_g29_spoof_mode` (sidecar respawn + UAC
+        // dwell — this call can take as long as a backend switch);
+        // a disconnected one just records the flag for its next
+        // connect, so there is nothing to roll back there.
+        let was_connected = self.state.output_state().connected;
+        let stored = self
+            .state
+            .set_g29_spoof_mode(enabled)
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))?;
+        if enabled && was_connected && !self.state.output_state().connected {
+            // Recreate failed: roll the persisted flag back, like
+            // `set_steam_fh4_mode` does for a failed registry write
+            // — Settings must not show ON with the custom profile
+            // still live (and disconnected). The backend's own status
+            // carries the failure reason for the Output page.
+            let _ = self.state.set_g29_spoof_mode(false);
+            return Err(UserError::from_connection(
+                ConnectionError::Unknown,
+                "G29 spoof could not recreate the HIDMaestro controller with the G29 profile — the backend is disconnected; the mode was left off.",
+            ));
         }
         Ok(stored)
     }
@@ -1557,6 +1615,41 @@ mod tests {
         assert!(steam_fh4_enable_allowed("NullSink"));
         assert!(steam_fh4_enable_allowed("None"));
         assert!(steam_fh4_enable_allowed("something-unknown"));
+    }
+
+    /// G29 spoof (v2.0.16): the mode defaults off. The test backend
+    /// is the `NullSink`, which is not `HIDMaestro`, so enabling is
+    /// refused with `g29_spoof_hid_only` and the flag stays off;
+    /// disabling always succeeds (cleanup is never blocked).
+    #[test]
+    fn g29_spoof_mode_defaults_off_and_refuses_non_hid_backend() {
+        let (api, _dir) = live_api();
+        assert!(!api.g29_spoof_mode(), "default must be off");
+        let err = api
+            .set_g29_spoof_mode(true)
+            .expect_err("enable on NullSink");
+        assert_eq!(err.code, "g29_spoof_hid_only");
+        assert!(!api.g29_spoof_mode(), "refused enable must not persist");
+        assert!(
+            !api.set_g29_spoof_mode(false)
+                .expect("disable always succeeds")
+        );
+        assert!(!api.g29_spoof_mode());
+    }
+
+    /// G29 spoof (v2.0.16): enabling is allowed ONLY on
+    /// `HIDMaestro`; every other backend name (and unknown names)
+    /// refuses. Disabling never consults this guard (it is enforced
+    /// in `set_g29_spoof_mode`, not here).
+    #[test]
+    fn g29_spoof_enable_allowed_only_allows_hidmaestro() {
+        assert!(g29_spoof_enable_allowed("HIDMaestro"));
+        assert!(g29_spoof_enable_allowed("hidmaestro"));
+        assert!(!g29_spoof_enable_allowed("vJoy"));
+        assert!(!g29_spoof_enable_allowed("VJoy"));
+        assert!(!g29_spoof_enable_allowed("NullSink"));
+        assert!(!g29_spoof_enable_allowed("None"));
+        assert!(!g29_spoof_enable_allowed("something-unknown"));
     }
 
     /// R2-46: `diag_stats` exports the per-method IPC latency —
