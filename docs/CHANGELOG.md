@@ -1,10 +1,68 @@
 # Changelog — RSH (Real Sim Hub)
 
 All notable changes to the RSH app and firmware. Current versions:
-**app v2.0.14 · firmware v4.0.6 · protocol v2.2 (frozen)**.
+**app v2.0.15 · firmware v4.0.6 · protocol v2.2 (frozen)**.
 Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
+
+## [2.0.15] — 2026-11-27 (FH4 Steam wheel mode + mouse-click fix)
+
+App 2.0.15 + firmware 4.0.6 unchanged (protocol v2.2 frozen — no wire-format
+change, no firmware code change in this release). Two user-found fixes,
+both production-ready in this batch.
+
+**Steam FH4 wheel mode (Part A).** The user found and PC-tested it
+himself: writing `OEMData` REG_BINARY `40 00 00 00 00 00 00 00` under
+the vJoy OEM registry key makes the Steam version of Forza Horizon 4
+show the Wheel tab (v2.0.14's complete GameInput mapping alone did not
+do it for the Steam build). New Settings toggle "Steam FH4 wheel mode"
+(default OFF, vJoy only — disabled on the HIDMaestro backend, which
+never gets the flag: `VID_1209&PID_5253` is never written). Turning it
+on writes the exact bytes to the vJoy OEM key (`VID_1234&PID_BEAD`) in
+both HKCU (daemon, user context) and HKLM (one elevated run, one UAC
+prompt — skipped when HKLM already holds the flag); turning it off
+deletes only the `OEMData` value, never the key (it is vJoy's). The
+installer has an optional "Steam FH4 wheel mode" checkbox (off by
+default; silent installs never get it) that writes the HKLM flag plus
+a marker the daemon adopts on first read; the uninstaller deletes the
+flag only when that marker says RSH wrote it. The toggle warns to
+disable/enable vJoy and restart the PC. **Store-version risk (UNVERIFIED
+community claim, not tested): the flag may break the Microsoft Store
+version of FH4 — this mode is Steam-only, keep it off for the Store
+version.** Revert: toggle off, disable/enable vJoy, reboot (uninstaller
+also removes the flag when RSH wrote it; a standard-user install's
+HKCU value is removed by toggling off, since an elevated uninstaller
+cannot reach that hive). **Joystick Gremlin warning: RSH sends 8 axes
+and issue #471 reports a crash with 8 axes + this flag — Gremlin users
+should keep the mode off.**
+
+**Mouse 2-click fix (Part B).** After the Wheel tab appeared, FH4 menus
+needed two clicks: the pointer flickered on/off within milliseconds and
+the first click did nothing. Cause in code (verified): the engine feeds
+`UpdateVJD` 200×/s unconditionally, and ESP32 ADC idle jitter (~±24
+axis counts) meant almost every tick carried a slightly different
+position — the game kept flipping between controller mode and mouse
+mode. Fix, gated behind Steam FH4 wheel mode so other users' behaviour
+is unchanged: identical positions are not re-sent (100 ms keepalive,
+so the device still looks live at 10 Hz idle), and sub-32-count axis
+changes are held at the last sent value (32 counts ≈ 0.1% of range —
+above idle jitter, below any deliberate input; buttons/hats never
+filtered; any over-threshold move sends all axes fresh, no lag or
+precision loss). The game-side mode-flip mechanism itself is unverified
+(no source) — the PC retest is the proof: one click in FH4 menus with
+the mode on. If it still takes two clicks, the cause is the game's own
+behaviour with any active wheel, and the workaround is keyboard/wheel
+in menus.
+
+Tests/gates: 729 unit tests pass (incl. exact flag bytes, both-hives
+script, value-only disable, dedupe/keepalive/hysteresis against the
+mock DLL, IPC round-trip for the new methods); packaging gate asserts
+the default install writes no OEMData (checkbox-only section) and the
+uninstaller only deletes a marker-written value; smoke test asserts
+OEMData absent after default install, update, and uninstall. The FH4
+Wheel tab + one-click menus are user-PC proof — they cannot be
+verified on Linux.
 
 ## [2.0.14] — 2026-11-26 (FH4 wheel fix)
 
