@@ -25,6 +25,9 @@ struct StubApi {
     /// In-memory shifter sensitivity (`None` = no shifter
     /// configured, like a factory board).
     sensitivity: Mutex<Option<u8>>,
+    /// In-memory Steam FH4 wheel mode (default off, like the real
+    /// daemon — no registry writes in the stub).
+    steam_fh4: Mutex<bool>,
 }
 
 impl StubApi {
@@ -114,6 +117,19 @@ impl AppApi for StubApi {
             .output
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = enabled;
+    }
+    fn steam_fh4_mode(&self) -> bool {
+        *self
+            .steam_fh4
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn set_steam_fh4_mode(&self, enabled: bool) -> Result<bool, UserError> {
+        *self
+            .steam_fh4
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = enabled;
+        Ok(enabled)
     }
     fn get_tuning(&self, module: &str) -> TuningSettings {
         self.tunings
@@ -293,6 +309,50 @@ async fn assert_shifter_sensitivity_round_trip(client: &IpcClient) {
     );
 }
 
+/// v2.0.15: Steam FH4 wheel mode round-trip over the same socket —
+/// read (default off) → write on → read → write off → read.
+async fn assert_steam_fh4_round_trip(client: &IpcClient) {
+    let got = client
+        .call("steam_fh4_mode", serde_json::json!({}))
+        .await
+        .expect("steam_fh4_mode");
+    assert_eq!(
+        got.get("steam_fh4_mode")
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "default must be off"
+    );
+    let applied = client
+        .call("set_steam_fh4_mode", serde_json::json!({"enabled": true}))
+        .await
+        .expect("set_steam_fh4_mode on");
+    assert_eq!(
+        applied
+            .get("steam_fh4_mode")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    let got = client
+        .call("steam_fh4_mode", serde_json::json!({}))
+        .await
+        .expect("steam_fh4_mode after write");
+    assert_eq!(
+        got.get("steam_fh4_mode")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    let applied = client
+        .call("set_steam_fh4_mode", serde_json::json!({"enabled": false}))
+        .await
+        .expect("set_steam_fh4_mode off");
+    assert_eq!(
+        applied
+            .get("steam_fh4_mode")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+}
+
 /// v2.0.11: Wi-Fi scan + rejoin round-trip over the same socket —
 /// these three methods had no dispatch arm, so every call failed
 /// with `UnknownMethod` even though the UI sends them (the
@@ -353,6 +413,7 @@ async fn ipc_round_trip_ping_version_connection_and_event() {
         tunings: Mutex::new(BTreeMap::new()),
         dirty: Mutex::new(BTreeSet::new()),
         sensitivity: Mutex::new(Some(50)),
+        steam_fh4: Mutex::new(false),
     });
     let (event_tx, _rx) = broadcast::channel(64);
     let server = Arc::new(IpcServer::new(Arc::clone(&api), event_tx.clone()));
@@ -442,6 +503,9 @@ async fn ipc_round_trip_ping_version_connection_and_event() {
 
     // v2.0.11 Wi-Fi scan + rejoin round-trip over the same socket.
     assert_wifi_rejoin_round_trip(&client).await;
+
+    // v2.0.15 Steam FH4 wheel mode round-trip over the same socket.
+    assert_steam_fh4_round_trip(&client).await;
 
     serve.abort();
     let _ = std::fs::remove_dir_all(&dir);

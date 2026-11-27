@@ -107,6 +107,10 @@ struct LiveCache {
     autostart: Mutex<Option<bool>>,
     /// Last output backend name (also the `output_backend()` slot).
     backend: Mutex<Option<String>>,
+    /// Last Steam FH4 wheel mode flag (A2): the daemon's
+    /// `steam_fh4_mode`, default OFF. Refreshed by the slow
+    /// poller like `autostart` above.
+    steam_fh4_mode: Mutex<Option<bool>>,
     /// Module on/off by index: 0 handbrake, 1 shifter, 2 horn, 3 led
     /// (the same order [`module_index`] and the UI's `module_states`
     /// use).
@@ -160,6 +164,7 @@ impl Default for LiveCache {
             close_to_tray: Mutex::new(None),
             autostart: Mutex::new(None),
             backend: Mutex::new(None),
+            steam_fh4_mode: Mutex::new(None),
             modules: Mutex::new([None; 4]),
             tunings: Mutex::new(HashMap::new()),
             draft: Mutex::new(None),
@@ -389,6 +394,8 @@ pub struct LiveSeed {
     pub backend: String,
     /// Start-with-Windows flag.
     pub autostart: bool,
+    /// Steam FH4 wheel mode flag (A2).
+    pub steam_fh4_mode: bool,
     /// The session `connect` verdict (the wizard's Connect step
     /// follows it; a failure notifies instead of blocking).
     pub connect: Result<ConnectionInfo, UserError>,
@@ -409,6 +416,7 @@ impl LiveSeed {
         Self {
             backend: api.output_backend(),
             autostart: api.autostart(),
+            steam_fh4_mode: api.steam_fh4_mode(),
             connect,
             wifi: api.wifi_status(),
         }
@@ -743,6 +751,9 @@ impl IpcApi {
             *slot = None;
         }
         if let Ok(mut slot) = self.cache.backend.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.steam_fh4_mode.lock() {
             *slot = None;
         }
         if let Ok(mut slot) = self.cache.modules.lock() {
@@ -1160,6 +1171,21 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
                 }
             }
         }
+        // A2: `steam_fh4_mode` is not part of `SlowPollState`
+        // (that struct lives in `rsh-api`, owned by the backend
+        // team) — read it directly, best-effort, one extra
+        // round-trip per cycle. An old daemon without the method
+        // just keeps the last value (OFF while cold).
+        if let Ok(value) = client.call("steam_fh4_mode", serde_json::json!({})).await {
+            if let Some(enabled) = value
+                .get("steam_fh4_mode")
+                .and_then(serde_json::Value::as_bool)
+            {
+                if let Ok(mut slot) = cache.steam_fh4_mode.lock() {
+                    *slot = Some(enabled);
+                }
+            }
+        }
         cache.slow_filled.store(true, Ordering::Relaxed);
         bump_generation_if_changed(cache, epoch);
         return;
@@ -1256,6 +1282,9 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
     });
     fetch!("close_to_tray", close_to_tray, |v| {
         v.get("close_to_tray").and_then(serde_json::Value::as_bool)
+    });
+    fetch!("steam_fh4_mode", steam_fh4_mode, |v| {
+        v.get("steam_fh4_mode").and_then(serde_json::Value::as_bool)
     });
     // `list_bindings` / `knob_actions` nest their payloads under a
     // key, like their trait methods already parse them.
@@ -1400,6 +1429,7 @@ fn slow_content_hash(cache: &LiveCache) -> u64 {
     slot!(vjoy_status);
     slot!(auto_pause);
     slot!(close_to_tray);
+    slot!(steam_fh4_mode);
     slot!(bindings);
     slot!(knobs);
     slot!(modules);
@@ -1838,6 +1868,55 @@ impl AppApi for IpcApi {
                 Ok(new_state)
             }
             Err(_) => Err(Self::ipc_failed()),
+        }
+    }
+
+    /// Cached Steam FH4 wheel mode (A2): the slow poller refreshes
+    /// it ~1 Hz (direct `steam_fh4_mode` call in `refresh_slow` —
+    /// it is not part of `SlowPollState`), so this never touches
+    /// the socket. No cache yet means OFF (the plan's default,
+    /// and the pre-poller fallback).
+    fn steam_fh4_mode(&self) -> bool {
+        self.cache
+            .steam_fh4_mode
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .unwrap_or(false)
+    }
+
+    /// Set Steam FH4 wheel mode (A2): the `set_steam_fh4_mode`
+    /// IPC call, following the `set_close_to_tray` client pattern
+    /// — same `{"enabled": bool}` params, same
+    /// `{"steam_fh4_mode": bool}` reply, same cache update on
+    /// success. Failures keep the daemon's typed reason via
+    /// [`Self::api_error`] (`detailed_api_error` `code|reason`,
+    /// e.g. `steam_fh4_vjoy_only` on `HIDMaestro`) instead of
+    /// collapsing to the generic link failure (the
+    /// `set_autostart` shape).
+    fn set_steam_fh4_mode(&self, enabled: bool) -> Result<bool, UserError> {
+        let got: Result<bool, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async(
+                    "set_steam_fh4_mode",
+                    serde_json::json!({"enabled": enabled}),
+                )
+                .await?;
+            value
+                .get("steam_fh4_mode")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| {
+                    IpcError::Protocol("set_steam_fh4_mode has no steam_fh4_mode".to_string())
+                })
+        });
+        match got {
+            Ok(stored) => {
+                if let Ok(mut slot) = self.cache.steam_fh4_mode.lock() {
+                    *slot = Some(stored);
+                }
+                Ok(stored)
+            }
+            Err(e) => Err(Self::api_error(&e)),
         }
     }
 

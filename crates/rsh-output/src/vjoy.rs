@@ -91,6 +91,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::mem::{offset_of, size_of};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use libloading::{Library, Symbol};
 use rsh_engine::pipeline::{OutputState, PipelinePlan};
@@ -928,6 +929,51 @@ pub fn build_position(
     p
 }
 
+/// Steam FH4 mode hysteresis (FH4 fix, v2.0.15): when no live axis
+/// moved by [`STEAM_FH4_NOISE_COUNTS`] or more since `last`, copy
+/// every live axis (plus its V3 mirror) back to its last sent value,
+/// so the resulting position dedupes to "unchanged". When any axis
+/// moved by the threshold or more, `new` is left untouched — all
+/// axes go out with new values. Buttons and hats are never touched.
+///
+/// The live axes are the ones [`build_position`] ever moves off
+/// neutral: X (+ `w_steering` mirror), Y (+ `w_accelerator`), Z (+
+/// `w_brake`), Rx/clutch (+ `w_clutch`), and Slider/handbrake.
+/// Everything else in the struct is a neutral constant, so it is
+/// already equal between `new` and `last` whenever the live axes
+/// are.
+fn apply_axis_hysteresis(new: &mut JoystickPosition, last: &JoystickPosition) {
+    let moved = [
+        new.w_axis_x,
+        new.w_axis_y,
+        new.w_axis_z,
+        new.w_axis_x_rot,
+        new.w_slider,
+        new.w_clutch,
+    ]
+    .iter()
+    .zip([
+        last.w_axis_x,
+        last.w_axis_y,
+        last.w_axis_z,
+        last.w_axis_x_rot,
+        last.w_slider,
+        last.w_clutch,
+    ])
+    .any(|(a, b)| (a - b).abs() >= STEAM_FH4_NOISE_COUNTS);
+    if !moved {
+        new.w_axis_x = last.w_axis_x;
+        new.w_steering = last.w_steering;
+        new.w_axis_y = last.w_axis_y;
+        new.w_accelerator = last.w_accelerator;
+        new.w_axis_z = last.w_axis_z;
+        new.w_brake = last.w_brake;
+        new.w_axis_x_rot = last.w_axis_x_rot;
+        new.w_clutch = last.w_clutch;
+        new.w_slider = last.w_slider;
+    }
+}
+
 /// D9: validate a single physical button number for the 1–32
 /// `lButtons` word.
 ///
@@ -1408,7 +1454,45 @@ pub struct VJoyOutput {
     /// backend marks itself disconnected (status `Error`) instead of
     /// reporting success-then-failure forever on a lost device.
     consecutive_update_failures: u32,
+    /// Steam FH4 wheel mode (FH4 fix, v2.0.15 — see
+    /// [`IJoystickOutput::set_steam_fh4_mode`](crate::IJoystickOutput::set_steam_fh4_mode)):
+    /// when on, `update()` dedupes idle positions and hysteresis-filters
+    /// idle axis noise. Off by default; pushed in by `AppStateCore`
+    /// on connect and on toggle.
+    steam_fh4_mode: bool,
+    /// Last position actually sent to the driver (Steam FH4 mode
+    /// only): the dedupe / hysteresis reference. `None` until the
+    /// first sent update — reset on connect and disconnect, and
+    /// whenever the mode is (re-)enabled, so a stale reference can
+    /// never suppress a real move.
+    last_sent: Option<JoystickPosition>,
+    /// When `last_sent` was sent (Steam FH4 mode only): the
+    /// keepalive clock — an unchanged position is still re-sent
+    /// once the keepalive expires, so the device never looks idle
+    /// to a game.
+    last_sent_at: Instant,
 }
+
+/// Idle-update keepalive in Steam FH4 mode (FH4 fix, v2.0.15): an
+/// unchanged position is re-sent at most this often. 100 ms is 10 Hz
+/// of idle activity — the engine still ticks every 5 ms
+/// (`TICK_INTERVAL`, `rsh-engine`), and `send_engine_output` calls
+/// `update()` unconditionally on every tick, so the dedupe below is
+/// what turns 200 Hz of identical writes into a 10 Hz keepalive.
+/// The 250 ms board-frame watchdog (`STALE_THRESHOLD`,
+/// `rsh-engine::watchdog`) is a *board*-frame watchdog, not a
+/// vJoy/game watchdog — the keepalive is not claimed to satisfy it;
+/// it only keeps the game seeing a live device.
+pub const STEAM_FH4_KEEPALIVE: Duration = Duration::from_millis(100);
+
+/// Per-axis idle-noise hysteresis in Steam FH4 mode (FH4 fix,
+/// v2.0.15), in raw axis counts: a new axis value within this many
+/// counts of the last sent value keeps the old value. 32 counts is
+/// ~0.1% of the 32768-count range — above the ESP32 ADC's idle
+/// jitter (~±24 counts from ±3 LSB) and below any deliberate input,
+/// so idle noise is swallowed without dulling a real move. Buttons
+/// and hats never get hysteresis: a button press is never noise.
+pub const STEAM_FH4_NOISE_COUNTS: i32 = 32;
 
 /// Consecutive failed updates after which vJoy marks itself
 /// disconnected (M2). One or two failures are transient (the old
@@ -1433,6 +1517,9 @@ impl VJoyOutput {
             status: VJoyStatus::idle(),
             envelope_warnings: Vec::new(),
             consecutive_update_failures: 0,
+            steam_fh4_mode: false,
+            last_sent: None,
+            last_sent_at: Instant::now(),
         }
     }
 
@@ -1573,6 +1660,7 @@ impl VJoyOutput {
                 self.envelope_warnings = envelope_warnings;
                 self.connected = true;
                 self.consecutive_update_failures = 0;
+                self.last_sent = None;
                 self.status = VJoyStatus {
                     kind: VJoyStateKind::Ready,
                     message: format!(
@@ -1624,6 +1712,7 @@ impl VJoyOutput {
         }
         self.connected = false;
         self.consecutive_update_failures = 0;
+        self.last_sent = None;
         if let Some(dll) = self.dll.as_mut() {
             let neutral = neutral_position(self.device_id);
             let _ = dll.update_vjd(self.device_id, &neutral);
@@ -1746,6 +1835,15 @@ impl IJoystickOutput for VJoyOutput {
         self.status.driver_version.clone()
     }
 
+    /// Steam FH4 wheel mode (FH4 fix, v2.0.15): enabling resets
+    /// the dedupe reference, so the first update after the toggle
+    /// is always sent (a stale reference must never suppress a
+    /// real move the user made while the mode was off).
+    fn set_steam_fh4_mode(&mut self, enabled: bool) {
+        self.steam_fh4_mode = enabled;
+        self.last_sent = None;
+    }
+
     fn disconnect(&mut self) {
         self.disconnect_inner();
     }
@@ -1763,11 +1861,40 @@ impl IJoystickOutput for VJoyOutput {
         } else {
             VJoyCapabilities::unknown()
         };
-        let position = build_position(state, &caps, self.device_id);
+        let mut position = build_position(state, &caps, self.device_id);
+        if self.steam_fh4_mode {
+            // Fix 2 (FH4 fix, v2.0.15): idle-noise hysteresis — when
+            // NO live axis moved by STEAM_FH4_NOISE_COUNTS or more,
+            // keep every axis at its last sent value, so ADC jitter
+            // never reaches the driver. When ANY axis exceeds the
+            // threshold, ALL axes go out with their new values, so
+            // a real move loses no precision and gains no lag.
+            // Buttons and hats are never hysteresis-filtered.
+            if let Some(last) = self.last_sent {
+                apply_axis_hysteresis(&mut position, &last);
+            }
+            // Fix 1 (FH4 fix, v2.0.15): idle dedupe with keepalive
+            // — an unchanged position is not re-sent until the
+            // keepalive expires (10 Hz idle activity instead of
+            // 200 Hz of identical writes), so the game stops seeing
+            // a constantly-twitching controller in its menus.
+            if self
+                .last_sent
+                .as_ref()
+                .is_some_and(|last| last == &position)
+                && self.last_sent_at.elapsed() < STEAM_FH4_KEEPALIVE
+            {
+                return Ok(());
+            }
+        }
         let dll = self.dll.as_mut().expect("connected implies a DLL");
         let updated = dll.update_vjd(self.device_id, &position);
         if updated {
             self.consecutive_update_failures = 0;
+            if self.steam_fh4_mode {
+                self.last_sent = Some(position);
+                self.last_sent_at = Instant::now();
+            }
             Ok(())
         } else {
             // M2: N consecutive failures = the device is gone — mark
@@ -1809,6 +1936,13 @@ impl IJoystickOutput for VJoyOutput {
         // Best-effort by design (C# parity): a failed neutral send is
         // swallowed, never fatal — disconnect still relinquishes.
         let _ = dll.update_vjd(self.device_id, &neutral);
+        // Steam FH4 mode: the device IS neutral now, so the dedupe
+        // reference must be neutral too — otherwise the next real
+        // update compares against a stale pre-neutral position.
+        if self.steam_fh4_mode {
+            self.last_sent = Some(neutral);
+            self.last_sent_at = Instant::now();
+        }
         Ok(())
     }
 }
@@ -3123,6 +3257,146 @@ mod tests {
         assert_eq!(p.w_axis_y, 32768);
         assert_eq!(p.w_axis_z, 32768);
         assert_eq!(p.w_steering, 32768);
+    }
+
+    // ---- Steam FH4 mode (FH4 fix, v2.0.15) -------------------------
+
+    fn update_calls(handle: &MockHandle) -> usize {
+        handle
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, MockCall::Update(_)))
+            .count()
+    }
+
+    fn steam_mode_output() -> (VJoyOutput, MockHandle) {
+        let (mut out, handle) = connected_output();
+        out.set_steam_fh4_mode(true);
+        (out, handle)
+    }
+
+    #[test]
+    fn steam_fh4_constants_are_32_counts_and_100_ms() {
+        assert_eq!(STEAM_FH4_NOISE_COUNTS, 32);
+        assert_eq!(STEAM_FH4_KEEPALIVE, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn steam_fh4_mode_off_sends_every_update() {
+        // Default (mode off): the old behaviour — every update is sent.
+        let (mut out, handle) = connected_output();
+        let same = state(0.0, 0.0, 0.0);
+        out.update(&same).expect("update succeeds");
+        out.update(&same).expect("update succeeds");
+        assert_eq!(update_calls(&handle), 3); // connect neutral + 2 updates
+    }
+
+    #[test]
+    fn steam_fh4_mode_dedupes_unchanged_position() {
+        let (mut out, handle) = steam_mode_output();
+        let same = state(0.0, 0.0, 0.0);
+        out.update(&same).expect("first update sends");
+        assert_eq!(update_calls(&handle), 2); // connect neutral + first
+        out.update(&same).expect("dedupe is still Ok");
+        assert_eq!(
+            update_calls(&handle),
+            2,
+            "second identical update must not reach the driver"
+        );
+    }
+
+    #[test]
+    fn steam_fh4_mode_keepalive_resends_after_100_ms() {
+        let (mut out, handle) = steam_mode_output();
+        let same = state(0.0, 0.0, 0.0);
+        out.update(&same).expect("first update sends");
+        out.update(&same).expect("immediate repeat deduped");
+        assert_eq!(update_calls(&handle), 2);
+        std::thread::sleep(Duration::from_millis(110));
+        out.update(&same).expect("keepalive update sends");
+        assert_eq!(
+            update_calls(&handle),
+            3,
+            "same position after the keepalive must be re-sent"
+        );
+    }
+
+    #[test]
+    fn steam_fh4_mode_hysteresis_suppresses_sub_threshold_change() {
+        let (mut out, handle) = steam_mode_output();
+        out.update(&state(0.0, 0.0, 0.0))
+            .expect("first update sends");
+        // +10 counts of steering (16384 -> 16394): below the 32-count
+        // noise band, so the driver must never see it.
+        out.update(&state(10.0 / 16384.0, 0.0, 0.0))
+            .expect("suppressed update is still Ok");
+        assert_eq!(
+            update_calls(&handle),
+            2,
+            "sub-threshold change must not reach the driver"
+        );
+        assert_eq!(
+            handle
+                .positions()
+                .last()
+                .expect("a position was sent")
+                .w_axis_x,
+            16384,
+            "the last sent position still carries the old axis value"
+        );
+    }
+
+    #[test]
+    fn steam_fh4_mode_hysteresis_sends_over_threshold_change() {
+        let (mut out, handle) = steam_mode_output();
+        out.update(&state(0.0, 0.0, 0.0))
+            .expect("first update sends");
+        // +100 counts of steering (16384 -> 16484): over the threshold,
+        // so all axes go out with their new values.
+        out.update(&state(100.0 / 16384.0, 0.0, 0.0))
+            .expect("over-threshold update sends");
+        assert_eq!(update_calls(&handle), 3);
+        assert_eq!(
+            handle
+                .positions()
+                .last()
+                .expect("a position was sent")
+                .w_axis_x,
+            16484
+        );
+    }
+
+    #[test]
+    fn steam_fh4_mode_button_change_still_sends() {
+        // Buttons never get hysteresis or dedupe: a press is never noise.
+        let (mut out, handle) = steam_mode_output();
+        out.update(&state(0.0, 0.0, 0.0))
+            .expect("first update sends");
+        let mut pressed = state(0.0, 0.0, 0.0);
+        pressed.buttons = 1;
+        out.update(&pressed).expect("button press sends");
+        assert_eq!(update_calls(&handle), 3);
+        assert_eq!(
+            handle
+                .positions()
+                .last()
+                .expect("a position was sent")
+                .l_buttons,
+            1
+        );
+    }
+
+    #[test]
+    fn steam_fh4_mode_dedupe_resets_on_disconnect() {
+        let (mut out, handle) = steam_mode_output();
+        let same = state(0.0, 0.0, 0.0);
+        out.update(&same).expect("first update sends");
+        out.disconnect();
+        out.try_connect().expect("mock reconnect succeeds");
+        out.update(&same).expect("update after reconnect sends");
+        // Connect neutral + first update + disconnect neutral +
+        // reconnect neutral + post-reconnect update = 5 UpdateVJD calls.
+        assert_eq!(update_calls(&handle), 5);
     }
 
     #[test]

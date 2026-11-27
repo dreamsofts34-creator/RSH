@@ -8,6 +8,7 @@
 //! from [`AppStateCore`]: "Connected" is only ever reported when
 //! the session gate is open (C-02).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -91,6 +92,16 @@ pub struct DaemonApi {
     /// [`DaemonApi::slow_static`]. The lock is never held across a
     /// state read.
     slow_cache: Mutex<SlowStaticCache>,
+    /// Steam FH4 marker adoption guard (FH4 fix, v2.0.15): the
+    /// installer-marker adoption in [`AppApi::steam_fh4_mode`] may
+    /// only be attempted ONCE per daemon process. The UI reads the
+    /// getter on every slow cycle, and a declined UAC prompt must
+    /// not re-prompt on the next cycle (adoption failure falls
+    /// through silently) — the user re-arms it by toggling the
+    /// mode on manually in Settings, or by restarting the daemon.
+    /// A successful adoption flips the stored flag on, so later
+    /// reads short-circuit before reaching the guard anyway.
+    steam_fh4_adoption_attempted: AtomicBool,
 }
 
 impl DaemonApi {
@@ -101,6 +112,7 @@ impl DaemonApi {
             state,
             manager: Mutex::new(ConnectionManager::new()),
             slow_cache: Mutex::new(SlowStaticCache::default()),
+            steam_fh4_adoption_attempted: AtomicBool::new(false),
         })
     }
 
@@ -352,6 +364,19 @@ impl DaemonApi {
             seq: snap.seq,
         }
     }
+}
+
+/// Whether Steam FH4 wheel mode may be ENABLED on the named live
+/// backend (FH4 fix, v2.0.15 — A4): only vJoy (and no-backend /
+/// unknown names, which cannot be `HIDMaestro`) may be enabled.
+/// `HIDMaestro` is refused — the `OEMData` flag must never be
+/// written for the HID key. Pure, so the guard is unit-testable
+/// without a live backend. Disabling is always allowed and never
+/// consults this helper.
+#[must_use]
+fn steam_fh4_enable_allowed(backend_name: &str) -> bool {
+    rsh_output::selector::BackendKind::from_backend_name(backend_name)
+        .is_none_or(|kind| kind != rsh_output::selector::BackendKind::HidMaestro)
 }
 
 impl AppApi for DaemonApi {
@@ -844,6 +869,86 @@ impl AppApi for DaemonApi {
         self.state
             .set_close_to_tray(enabled)
             .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
+    }
+
+    fn steam_fh4_mode(&self) -> bool {
+        // Installer-marker adoption on read (FH4 fix, v2.0.15): the
+        // installer checkbox writes the HKLM marker
+        // (`SteamFh4OemData` = 1) instead of the config flag, so a
+        // first read after an install with the box ticked adopts it
+        // — full set path (persist + registry + live-backend push),
+        // so the flag is written, not just the config. Adoption
+        // failure (HID backend, declined UAC prompt) falls through
+        // to the stored flag — a read never fails loudly. Adoption
+        // deliberately does NOT run in `DaemonApi::new`: a startup
+        // adoption would pop a UAC prompt at login, before the user
+        // ever opened the app — the first UI read is the
+        // user-initiated moment for it.
+        // One adoption attempt per daemon process (see
+        // `steam_fh4_adoption_attempted`): a declined UAC prompt
+        // must not re-prompt on the next slow-cycle read.
+        if !self.state.steam_fh4_mode()
+            && rsh_output::steam_fh4_marker_present()
+            && !self
+                .steam_fh4_adoption_attempted
+                .swap(true, Ordering::SeqCst)
+            && let Ok(adopted) = self.set_steam_fh4_mode(true)
+        {
+            return adopted;
+        }
+        self.state.steam_fh4_mode()
+    }
+
+    fn set_steam_fh4_mode(&self, enabled: bool) -> Result<bool, UserError> {
+        // A4: enabling on HIDMaestro is refused BEFORE any persist
+        // or registry write — the OEMData flag is vJoy-only and must
+        // never be written for the HID key (VID_1209&PID_5253).
+        // Disabling always succeeds: cleanup is never blocked by
+        // the backend.
+        if enabled && !steam_fh4_enable_allowed(&self.state.backend_name()) {
+            return Err(UserError {
+                code: "steam_fh4_vjoy_only".to_string(),
+                title: "Steam FH4 wheel mode needs vJoy".to_string(),
+                what_happened: "Steam FH4 wheel mode only works with the vJoy backend — the current backend is HIDMaestro, and the wheel flag must never be written for it."
+                    .to_string(),
+                what_to_do: "Switch the output backend to vJoy first, then turn Steam FH4 wheel mode on."
+                    .to_string(),
+                detail: None,
+            });
+        }
+        #[cfg(windows)]
+        let before = self.state.steam_fh4_mode();
+        let stored = self
+            .state
+            .set_steam_fh4_mode(enabled)
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))?;
+        // Registry actuation (Windows only — off Windows there is
+        // no registry to write, and the persisted flag + the
+        // live-backend push in `AppStateCore::set_steam_fh4_mode`
+        // are the whole behaviour).
+        #[cfg(windows)]
+        {
+            let registry = if enabled {
+                rsh_output::set_wheel_flag(true)
+            } else {
+                // Toggle-off deletes the flag AND the installer
+                // marker (same elevated run, one UAC prompt), so the
+                // marker cannot re-adopt the mode on the next read.
+                rsh_output::set_wheel_flag_and_clear_marker(false)
+            };
+            if let Err(error) = registry {
+                // Roll the persisted flag back, like `set_autostart`
+                // does for the Run key — a failed registry write
+                // must not leave Settings showing ON with no flag
+                // written (or OFF with the flag still set).
+                let _ = self.state.set_steam_fh4_mode(before);
+                return Err(UserError::from_connection(
+                    ConnectionError::Unknown,
+                    error.to_string(),
+                ));
+            }
+        }
+        Ok(stored)
     }
 
     fn output_backend(&self) -> String {
@@ -1422,6 +1527,36 @@ mod tests {
             .activate_profile(&first.id)
             .expect("activate default profile");
         (DaemonApi::new(state), dir)
+    }
+
+    /// FH4 fix (v2.0.15): the mode defaults off and toggles through
+    /// the API (persisted flag + live-backend push; the registry
+    /// write is Windows-only, so on Linux the toggle is the whole
+    /// behaviour). The test backend is the `NullSink`, which is not
+    /// `HIDMaestro`, so enabling is allowed.
+    #[test]
+    fn steam_fh4_mode_defaults_off_and_toggles() {
+        let (api, _dir) = live_api();
+        assert!(!api.steam_fh4_mode(), "default must be off");
+        assert!(api.set_steam_fh4_mode(true).expect("enable"));
+        assert!(api.steam_fh4_mode());
+        assert!(!api.set_steam_fh4_mode(false).expect("disable"));
+        assert!(!api.steam_fh4_mode());
+    }
+
+    /// FH4 fix (v2.0.15 — A4): enabling is refused only on
+    /// `HIDMaestro`; `vJoy`, no backend, and unknown names may enable.
+    /// Disabling never consults this guard (it is enforced in
+    /// `set_steam_fh4_mode`, not here).
+    #[test]
+    fn steam_fh4_enable_allowed_only_refuses_hidmaestro() {
+        assert!(!steam_fh4_enable_allowed("HIDMaestro"));
+        assert!(!steam_fh4_enable_allowed("hidmaestro"));
+        assert!(steam_fh4_enable_allowed("vJoy"));
+        assert!(steam_fh4_enable_allowed("VJoy"));
+        assert!(steam_fh4_enable_allowed("NullSink"));
+        assert!(steam_fh4_enable_allowed("None"));
+        assert!(steam_fh4_enable_allowed("something-unknown"));
     }
 
     /// R2-46: `diag_stats` exports the per-method IPC latency —

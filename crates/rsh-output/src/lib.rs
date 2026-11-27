@@ -25,7 +25,11 @@ use rsh_engine::pipeline::{OutputState, PipelinePlan};
 pub use error::OutputError;
 pub use selector::{BackendFactories, BackendKind, SwitchOutcome, switch_backend};
 pub use vjoy::{EnvelopeCaps, VJoyError, VJoyOutput, VJoyStateKind, VJoyStatus, validate_envelope};
-pub use vjoy_config::{VJOY_FH4_DEVICE_ID, VJoyConfigError, vjoy_config_argv};
+pub use vjoy_config::{
+    STEAM_FH4_MARKER_VALUE, VJOY_FH4_DEVICE_ID, VJoyConfigError, WHEEL_FLAG_BYTES,
+    WHEEL_FLAG_OEM_SUBKEY, set_wheel_flag, set_wheel_flag_and_clear_marker,
+    steam_fh4_marker_present, vjoy_config_argv, wheel_flag_script,
+};
 pub use wheel_check::{WheelCheckResult, mapping_entries, run_wheel_check};
 
 /// The processed state the engine hands to an output backend.
@@ -126,4 +130,16 @@ pub trait IJoystickOutput: Send {
     /// storm's enabler). Only an explicit re-select calls this;
     /// ordinary attempts reuse the latched manager and fail fast.
     fn reset_fallback(&mut self) {}
+
+    /// Steam FH4 wheel mode (FH4 fix, v2.0.15): when on, the
+    /// backend dedupes idle updates (100 ms keepalive) and applies
+    /// a 32-count per-axis hysteresis to idle noise, so a wheel
+    /// game no longer sees a constantly-twitching controller. The
+    /// default is a no-op — only vJoy implements it (the feed that
+    /// needs quieting is the vJoy one); `HIDMaestro` ignores it.
+    /// `AppStateCore` pushes the persisted mode into the live
+    /// backend on every connect and on every toggle, so a backend
+    /// that (re)connects picks the current mode up without the
+    /// caller remembering to re-push it.
+    fn set_steam_fh4_mode(&mut self, _enabled: bool) {}
 }
