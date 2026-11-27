@@ -756,6 +756,9 @@ export component MainWindow inherits Window {
             conn-label: conn-label;
             conn-sub: conn-sub;
             send-to-game: send-to-game;
+            // v2.0.18: the send switch disables while its job runs
+            // (SettingsOp, busy-kind 14) — see `Sidebar.send-busy`.
+            send-busy: busy-kind == 14;
             nav(p) => { page = p; }
             toggled-send => { toggled-send(); }
             open-about => { page = 6; }
@@ -1325,7 +1328,7 @@ export component MainWindow inherits Window {
     // closes only via its own toggle button any more.
     if popover-open : Rectangle {
         x: 0px; y: 0px; width: parent.width; height: parent.height;
-        background: #000000; opacity: 0.35;
+        background: #000000; opacity: 0.4;
         TouchArea { width: parent.width; height: parent.height; clicked => { popover-closed(); } }
     }
     // Profile popover overlay (A8): under the top-bar profile
