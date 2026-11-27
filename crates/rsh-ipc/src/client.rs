@@ -87,7 +87,19 @@ pub fn timeout_for_method(method: &str) -> Duration {
         // wait) — a plain call() used to get 500 ms.
         | "launch_game"
         | "stop_game"
-        | "game_state" => Duration::from_secs(10),
+        | "game_state"
+        // v2.0.18 scan: `connect` / `disconnect` are session
+        // control, not cheap reads. `connect` can block up to ~5 s
+        // in `start_engine` (supervisor spawn + ready wait, and the
+        // re-await path when a previous spawn reported ready late),
+        // and `disconnect` runs an OS serial-port rescan
+        // (`rescan_board_port`) with no bound in code — both used
+        // to time out at 500 ms on the UI's plain `call_async`
+        // while the daemon kept connecting, so the UI reported a
+        // link failure for a connect that was actually proceeding.
+        // 10 s covers the 5 s ready wait with headroom.
+        | "connect"
+        | "disconnect" => Duration::from_secs(10),
         // Wi-Fi password set / rejoin (P1-3, v2.0.12 scan): the
         // daemon worst case is ≈150 s (netsh add ≤30 s + connect
         // ≤30 s + confirm ≤90 s, plus board round-trips and a
@@ -742,6 +754,12 @@ mod tests {
         // the static groups, so it gets 5 s, not the 500 ms
         // default.
         assert_eq!(timeout_for_method("slow_poll"), Duration::from_secs(5));
+        // v2.0.18 scan: `connect` can block up to ~5 s in
+        // `start_engine` (supervisor spawn + ready wait), so the
+        // 500 ms default timed out a connect that was proceeding;
+        // `disconnect` runs an unbounded OS port rescan.
+        assert_eq!(timeout_for_method("connect"), Duration::from_secs(10));
+        assert_eq!(timeout_for_method("disconnect"), Duration::from_secs(10));
         assert_eq!(
             timeout_for_method("unknown_method"),
             Duration::from_millis(500)
