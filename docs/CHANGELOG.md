@@ -1,10 +1,55 @@
 # Changelog — RSH (Real Sim Hub)
 
 All notable changes to the RSH app and firmware. Current versions:
-**app v2.0.17 · firmware v4.0.6 · protocol v2.2 (frozen)**.
+**app v2.0.18 · firmware v4.0.6 · protocol v2.2 (frozen)**.
 Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
+
+## [2.0.18] — 2026-11-28 (deep scan + polish: dead-button audit, false job timeouts, connect/disconnect timeout, tray popup game list)
+
+App 2.0.18 + firmware 4.0.6 unchanged (protocol v2.2 frozen — no wire-format
+change, no firmware code change in this release).
+
+**Deep scan: no dead buttons.** All 146 Slint callbacks and all 31
+`call_async` method names were traced end to end (UI → IPC dispatch →
+`DeferredApi` → `DaemonApi`); every control is wired to a real backend
+call with a visible result. The `DeferredApi` forwarding audit over all
+86 `rsh-api` trait methods found no backend gap (the FH4 toggle stays
+deliberately unforwarded per user decision; `cache_generation` is a
+trait default, not dispatched).
+
+**False job timeouts fixed (F1–F8).** The UI job timeout was shorter
+than the IPC bound, so the UI reported a failure and reverted the
+control while the daemon kept working: G29 spoof toggle (10 s vs
+390 s), send-to-game toggle (10 s vs 390 s; the shell switch also had
+no disable binding, so a second click was silently ignored), wizard
+Wi-Fi Join (10 s vs scan 45 s + rejoin 180 s — and the Join button
+stuck "Joining…" until the wizard reopened), Wi-Fi password
+set/forget, backup/restore, tuning/sensitivity pushes, firmware
+check/update. Per-call timeout overrides now exceed each IPC bound;
+the busy strip shows elapsed time for any job kind. Wi-Fi password
+set rejoins inline (worst case ~150 s), so its job bound is 200 s,
+above the 180 s IPC arm.
+
+**Connect/disconnect IPC timeout.** `connect`/`disconnect` had no
+timeout arm (500 ms default); a cold-engine first connect can block
+~5 s in `start_engine`, so the UI reported a link failure for a
+connect that was proceeding. Both now get 10 s.
+
+**Tray popup game list (P2-6).** The popup rendered three hardcoded
+game rows — a 4th game was invisible. It now renders the whole game
+list from the model (scrollable, preview order first) with a "GAMES ·
+N games" header, and the profile row shows the count ("Auto · 2 of
+5") instead of cycling blindly. (The ~2 s auto-hide still needs a
+user-PC repro and is unchanged.)
+
+**Not in this release.** D-pad input (needs a firmware protocol
+change, v2.2 frozen) and buttons 26–32 / encoder pulses 65–72
+overflow mapping (needs the user's mapping choice) remain follow-up
+decisions. Pre-install `set_output_enabled` is still a silent no-op
+(needs a trait-signature change); `scan_rsh_networks` still returns
+an empty list on failure (same reason).
 
 ## [2.0.17] — 2026-11-27 (G29 spoof fixes: toggle timeout, disable error, recreate race, pedal layout, handbrake button; D-pad + overflow documented as not carried)
 

@@ -17,6 +17,11 @@ export component Sidebar inherits Rectangle {
     in property <string> conn-label;
     in property <string> conn-sub;
     in property <bool> send-to-game;
+    // v2.0.18: the send switch disables while its SettingsOp job
+    // runs (busy-kind == 14) — the job now lasts up to 420 s (the
+    // full backend switch), and a second click in that window used
+    // to hit the duplicate-start guard and be silently ignored.
+    in property <bool> send-busy: false;
     callback nav(int);
     callback toggled-send();
     callback open-about();
@@ -109,6 +114,7 @@ export component Sidebar inherits Rectangle {
                 label: conn-label;
                 sub: conn-sub;
                 send-to-game: send-to-game;
+                send-busy: send-busy;
                 toggled-send => { toggled-send(); }
             }
             Text {

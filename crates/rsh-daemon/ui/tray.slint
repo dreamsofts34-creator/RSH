@@ -18,6 +18,17 @@ struct GameMenuItem {
     name: string,
 }
 
+// One row of the tray popup's game list (P2-6, v2.0.18): the
+// popup renders `popup-games` with a `for` loop instead of three
+// hardcoded rows.
+struct TrayPopupGame {
+    id: string,
+    name: string,
+    initials: string,
+    state: string,
+    can-launch: bool,
+}
+
 export component RshTray inherits SystemTrayIcon {
     icon: @image-url("../assets/tray.png");
     tooltip: "RSH — Real Sim Hub";
@@ -118,21 +129,11 @@ export component TrayPopup inherits Window {
     in property <string> clutch-text: "0%";
     in property <string> profile-name: "Default";
     in property <string> profile-sub: "Auto";
-    in property <string> game0-id: "";
-    in property <string> game0-name: "";
-    in property <string> game0-initials: "";
-    in property <string> game0-state: "";
-    in property <bool> game0-can-launch: false;
-    in property <string> game1-id: "";
-    in property <string> game1-name: "";
-    in property <string> game1-initials: "";
-    in property <string> game1-state: "";
-    in property <bool> game1-can-launch: false;
-    in property <string> game2-id: "";
-    in property <string> game2-name: "";
-    in property <string> game2-initials: "";
-    in property <string> game2-state: "";
-    in property <bool> game2-can-launch: false;
+    // P2-6 (v2.0.18): the game list renders from the model (all
+    // games, preview order first) instead of three hardcoded rows —
+    // a 4th game used to be invisible in the tray.
+    in property <[TrayPopupGame]> popup-games;
+    in property <string> games-header: "GAMES";
 
     callback toggled-send();
     callback open-main();
@@ -361,84 +362,43 @@ export component TrayPopup inherits Window {
                 }
             }
 
-            Text { text: "GAMES"; color: c-faint; font-size: 12px; font-weight: 600; letter-spacing: 1px; }
-            HorizontalLayout {
-                spacing: 10px;
-                height: 38px;
-                Rectangle {
-                    width: 24px;
-                    height: 24px;
-                    border-radius: 6px;
-                    background: c-panel2;
-                    Text { text: game0-initials; color: c-accent-text; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                }
-                Text { horizontal-stretch: 1; overflow: elide; text: game0-name; color: c-text; font-size: 13px; font-weight: 500; vertical-alignment: center; }
-                if game0-can-launch: Rectangle {
-                    width: 60px;
-                    height: 24px;
-                    border-radius: 6px;
-                    // DS-23: hover darkens the accent, mirroring Btn (A5).
-                    background: launch0-ta.has-hover ? c-accent-hover : #2f6bff;
-                    Text { text: "Launch"; color: #ffffff; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
-                    launch0-ta := TouchArea {
-                        width: parent.width;
-                        height: parent.height;
-                        clicked => { root.launch-game(game0-id); }
+            Text { text: games-header; color: c-faint; font-size: 12px; font-weight: 600; letter-spacing: 1px; }
+            // P2-6 (v2.0.18): the game list renders from the model
+            // (all games, preview order first). The viewport shows
+            // 3 rows (134px — the same height the three hardcoded
+            // rows took); more games scroll inside it.
+            Flickable {
+                width: 100%;
+                height: 134px;
+                VerticalLayout {
+                    spacing: 10px;
+                    for g in popup-games: HorizontalLayout {
+                        spacing: 10px;
+                        height: 38px;
+                        Rectangle {
+                            width: 24px;
+                            height: 24px;
+                            border-radius: 6px;
+                            background: c-panel2;
+                            Text { text: g.initials; color: c-accent-text; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        Text { horizontal-stretch: 1; overflow: elide; text: g.name; color: c-text; font-size: 13px; font-weight: 500; vertical-alignment: center; }
+                        if g.can-launch: Rectangle {
+                            width: 60px;
+                            height: 24px;
+                            border-radius: 6px;
+                            // DS-23: hover darkens the accent, mirroring Btn (A5).
+                            background: launch-ta.has-hover ? c-accent-hover : #2f6bff;
+                            Text { text: "Launch"; color: #ffffff; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                            launch-ta := TouchArea {
+                                width: parent.width;
+                                height: parent.height;
+                                clicked => { root.launch-game(g.id); }
+                            }
+                        }
+                        if !g.can-launch: Text { text: g.state; color: c-mute; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
                     }
                 }
-                if !game0-can-launch: Text { text: game0-state; color: c-mute; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
-            }
-            HorizontalLayout {
-                spacing: 10px;
-                height: 38px;
-                Rectangle {
-                    width: 24px;
-                    height: 24px;
-                    border-radius: 6px;
-                    background: c-panel2;
-                    Text { text: game1-initials; color: c-accent-text; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                }
-                Text { horizontal-stretch: 1; overflow: elide; text: game1-name; color: c-text; font-size: 13px; font-weight: 500; vertical-alignment: center; }
-                if game1-can-launch: Rectangle {
-                    width: 60px;
-                    height: 24px;
-                    border-radius: 6px;
-                    // DS-23: hover darkens the accent, mirroring Btn (A5).
-                    background: launch1-ta.has-hover ? c-accent-hover : #2f6bff;
-                    Text { text: "Launch"; color: #ffffff; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
-                    launch1-ta := TouchArea {
-                        width: parent.width;
-                        height: parent.height;
-                        clicked => { root.launch-game(game1-id); }
-                    }
-                }
-                if !game1-can-launch: Text { text: game1-state; color: c-mute; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
-            }
-            HorizontalLayout {
-                spacing: 10px;
-                height: 38px;
-                Rectangle {
-                    width: 24px;
-                    height: 24px;
-                    border-radius: 6px;
-                    background: c-panel2;
-                    Text { text: game2-initials; color: c-accent-text; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                }
-                Text { horizontal-stretch: 1; overflow: elide; text: game2-name; color: c-text; font-size: 13px; font-weight: 500; vertical-alignment: center; }
-                if game2-can-launch: Rectangle {
-                    width: 60px;
-                    height: 24px;
-                    border-radius: 6px;
-                    // DS-23: hover darkens the accent, mirroring Btn (A5).
-                    background: launch2-ta.has-hover ? c-accent-hover : #2f6bff;
-                    Text { text: "Launch"; color: #ffffff; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
-                    launch2-ta := TouchArea {
-                        width: parent.width;
-                        height: parent.height;
-                        clicked => { root.launch-game(game2-id); }
-                    }
-                }
-                if !game2-can-launch: Text { text: game2-state; color: c-mute; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
             }
 
             // Footer.

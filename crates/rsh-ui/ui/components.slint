@@ -493,6 +493,9 @@ export component StatusCard inherits Rectangle {
     in property <string> label;
     in property <string> sub;
     in property <bool> send-to-game;
+    // v2.0.18: disables the send switch while its job runs (see
+    // `Sidebar.send-busy`).
+    in property <bool> send-busy: false;
     callback toggled-send();
     border-radius: 10px;
     border-width: 1px;
@@ -537,7 +540,7 @@ export component StatusCard inherits Rectangle {
             cross-axis-alignment: center;
             Text { text: "Send to game"; font-size: Theme.fs-label; color: Theme.text; }
             Rectangle { horizontal-stretch: 1; }
-            Switch { accessible-name: "Send to game"; on: send-to-game; toggled => { toggled-send(); } }
+            Switch { accessible-name: "Send to game"; on: send-to-game; disabled: send-busy; toggled => { toggled-send(); } }
         }
     }
 }
