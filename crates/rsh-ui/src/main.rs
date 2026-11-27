@@ -1250,16 +1250,17 @@ const BACKEND_COOLDOWN: Duration = Duration::from_secs(30);
 ///   Backend job (420 s) > IPC (390 s) > daemon worst case (370 s).
 /// - Wi-Fi join: 300 s — scan (45 s IPC) + rejoin (180 s IPC) +
 ///   connect, run sequentially, worst case ≈ 230 s.
-/// - Wi-Fi password set/forget: 30 s — one board control session
-///   (HELLO retries 3 × 750 ms + command retries 3 × 250 ms, a
-///   couple of sessions ≈ 15 s worst case); the 180 s IPC arm is
-///   shared headroom with the netsh rejoin flow, not this call's
-///   own work.
+/// - Wi-Fi password set/forget: 200 s — `set_wifi_password`
+///   rejoins inline (D8: the WLAN profile update is part of the
+///   same call; worst case ≈150 s + a possible rollback), so the
+///   job bound must exceed the 180 s IPC arm. `clear_wifi_password`
+///   is fast (keystore clear + profile forget) but shares the
+///   constant; the bound is a ceiling, not a wait.
 /// - Backup/restore: 40 s — the IPC arm is 30 s (file copies).
 const LONG_JOB_TIMEOUT_SPOOF: Duration = Duration::from_secs(420);
 const LONG_JOB_TIMEOUT_SEND: Duration = Duration::from_secs(420);
 const LONG_JOB_TIMEOUT_WIFI_JOIN: Duration = Duration::from_secs(300);
-const LONG_JOB_TIMEOUT_WIFI_PASSWORD: Duration = Duration::from_secs(30);
+const LONG_JOB_TIMEOUT_WIFI_PASSWORD: Duration = Duration::from_secs(200);
 const LONG_JOB_TIMEOUT_BACKUP: Duration = Duration::from_secs(40);
 
 /// F12 (v2.0.3): a burst count older than this is stale — a much
@@ -17821,6 +17822,14 @@ mod tests {
                     + timeout_for_method("rejoin_wifi_open")
                     + timeout_for_method("connect"),
             "Wi-Fi join job must outlast scan + rejoin + connect, run in sequence"
+        );
+        assert!(
+            LONG_JOB_TIMEOUT_WIFI_PASSWORD > timeout_for_method("set_wifi_password"),
+            "Wi-Fi password set job must outlast the set_wifi_password IPC bound (set rejoins inline, worst case ~150 s)"
+        );
+        assert!(
+            LONG_JOB_TIMEOUT_WIFI_PASSWORD > timeout_for_method("clear_wifi_password"),
+            "Wi-Fi password forget job must outlast the clear_wifi_password IPC bound"
         );
         assert!(
             LONG_JOB_TIMEOUT_BACKUP > timeout_for_method("backup_now"),

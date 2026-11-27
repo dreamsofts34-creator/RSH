@@ -637,7 +637,9 @@ pub struct TrayPopupData {
     pub profile_name: String,
     /// Profile sub-line (`Auto · Assetto Corsa` / game slug).
     pub profile_sub: String,
-    /// Game rows (at most 3).
+    /// Game rows (all games, preview order first — P2-6, v2.0.18:
+    /// the popup renders the whole list instead of hiding the
+    /// 4th game behind a 3-row cap).
     pub games: Vec<PopupGame>,
 }
 
@@ -650,12 +652,24 @@ impl TrayPopupData {
         let conn = api.connection();
         let snap = api.snapshot();
         let active = profiles.iter().find(|profile| profile.active);
+        // P2-6 (v2.0.18): the tray profile row shows the count
+        // ("Auto · Assetto Corsa · 2 of 5") — it used to cycle
+        // blindly with no indication of how many profiles exist.
+        let count_suffix = if profiles.is_empty() {
+            String::new()
+        } else {
+            let index = profiles
+                .iter()
+                .position(|profile| profile.active)
+                .map_or(1, |i| i + 1);
+            format!(" · {index} of {}", profiles.len())
+        };
         let (profile_name, profile_sub) = match active {
             Some(profile) => (
                 profile.name.clone(),
                 match &profile.game {
-                    Some(game) => format!("Auto · {game}"),
-                    None => "Auto".to_string(),
+                    Some(game) => format!("Auto · {game}{count_suffix}"),
+                    None => format!("Auto{count_suffix}"),
                 },
             ),
             None => ("Default".to_string(), "Auto".to_string()),
@@ -669,8 +683,9 @@ impl TrayPopupData {
         } else {
             format!("{transport_label} · {}", conn.address)
         };
-        // Preview order first (AC, ACC, iRacing), then any others,
-        // capped at 3 rows.
+        // Preview order first (AC, ACC, iRacing), then any others —
+        // P2-6 (v2.0.18): no cap; the popup renders the whole list
+        // (scrollable) instead of hiding the 4th game.
         let mut ordered: Vec<&GameInfo> = Vec::new();
         for wanted in PREFERRED_GAME_IDS {
             if let Some(game) = games.iter().find(|game| game.id == wanted) {
@@ -678,9 +693,6 @@ impl TrayPopupData {
             }
         }
         for game in games {
-            if ordered.len() >= 3 {
-                break;
-            }
             if !ordered.iter().any(|g| g.id == game.id) {
                 ordered.push(game);
             }
@@ -1006,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_prefers_preview_game_order_and_caps_at_three() {
+    fn collect_prefers_preview_game_order_and_keeps_all_games() {
         let api = FakeApi {
             label: "Disconnected",
             snap: SnapshotInfo::default(),
@@ -1022,12 +1034,37 @@ mod tests {
                 game("assetto_corsa_competizione", "AC Competizione", true, false),
             ],
         );
-        assert_eq!(data.games.len(), 3);
+        // P2-6 (v2.0.18): no 3-row cap — the 4th game is kept
+        // (preview order first, then the rest in input order).
+        assert_eq!(data.games.len(), 4);
         assert_eq!(data.games[0].id, "assetto_corsa");
         assert_eq!(data.games[1].id, "assetto_corsa_competizione");
         assert_eq!(data.games[2].id, "iracing");
         assert_eq!(data.games[2].state_text, "Running");
+        assert_eq!(data.games[3].id, "dirt_rally_2");
         assert_eq!(data.profile_name, "Default");
+    }
+
+    #[test]
+    fn collect_shows_profile_count_in_sub() {
+        // P2-6 (v2.0.18): the tray profile row shows the count so
+        // cycling is no longer blind.
+        let api = FakeApi {
+            label: "Disconnected",
+            snap: SnapshotInfo::default(),
+            send: false,
+        };
+        let data = TrayPopupData::collect(
+            &api,
+            &[
+                profile("p1", "A", false),
+                profile("p2", "B", true),
+                profile("p3", "C", false),
+            ],
+            &[],
+        );
+        assert_eq!(data.profile_name, "B");
+        assert_eq!(data.profile_sub, "Auto · assetto_corsa · 2 of 3");
     }
 
     #[test]

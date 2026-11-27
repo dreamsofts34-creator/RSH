@@ -68,9 +68,8 @@ use daemon_api::{DaemonApi, connection_changed_event};
 
 use single_instance::{AcquireOutcome, acquire};
 use tray_popup::{
-    POPUP_ACTIVATION_TIMEOUT, POPUP_HEIGHT, POPUP_WIDTH, PopupDismissPoll, PopupGame,
-    PopupRefreshCache, Rect, TrayPopupData, TrayToggleGuard, anchor_popup, next_profile,
-    popup_is_light,
+    POPUP_ACTIVATION_TIMEOUT, POPUP_HEIGHT, POPUP_WIDTH, PopupDismissPoll, PopupRefreshCache, Rect,
+    TrayPopupData, TrayToggleGuard, anchor_popup, next_profile, popup_is_light,
 };
 
 slint::include_modules!();
@@ -2558,47 +2557,30 @@ impl PopupHandle {
         self.popup.set_clutch_text(data.clutch_text.into());
         self.popup.set_profile_name(data.profile_name.into());
         self.popup.set_profile_sub(data.profile_sub.into());
-        self.set_game_row(0, data.games.first());
-        self.set_game_row(1, data.games.get(1));
-        self.set_game_row(2, data.games.get(2));
-    }
-
-    /// One game row (empty strings when the daemon knows fewer than
-    /// `index + 1` games — the row renders blank).
-    fn set_game_row(&self, index: usize, game: Option<&PopupGame>) {
-        let (id, name, initials, state, can_launch) = match game {
-            Some(game) => (
-                game.id.as_str(),
-                game.name.as_str(),
-                game.initials.as_str(),
-                game.state_text.as_str(),
-                game.can_launch,
-            ),
-            None => ("", "", "", "", false),
-        };
-        match index {
-            0 => {
-                self.popup.set_game0_id(id.into());
-                self.popup.set_game0_name(name.into());
-                self.popup.set_game0_initials(initials.into());
-                self.popup.set_game0_state(state.into());
-                self.popup.set_game0_can_launch(can_launch);
-            }
-            1 => {
-                self.popup.set_game1_id(id.into());
-                self.popup.set_game1_name(name.into());
-                self.popup.set_game1_initials(initials.into());
-                self.popup.set_game1_state(state.into());
-                self.popup.set_game1_can_launch(can_launch);
-            }
-            _ => {
-                self.popup.set_game2_id(id.into());
-                self.popup.set_game2_name(name.into());
-                self.popup.set_game2_initials(initials.into());
-                self.popup.set_game2_state(state.into());
-                self.popup.set_game2_can_launch(can_launch);
-            }
-        }
+        // P2-6 (v2.0.18): the popup renders the whole game list
+        // from the model (scrollable) — no 3-row cap, no hardcoded
+        // slots.
+        self.popup
+            .set_popup_games(slint::ModelRc::new(slint::VecModel::from(
+                data.games
+                    .iter()
+                    .map(|game| TrayPopupGame {
+                        id: game.id.clone().into(),
+                        name: game.name.clone().into(),
+                        initials: game.initials.clone().into(),
+                        state: game.state_text.clone().into(),
+                        can_launch: game.can_launch,
+                    })
+                    .collect::<Vec<_>>(),
+            )));
+        self.popup.set_games_header(
+            format!(
+                "GAMES · {} game{}",
+                data.games.len(),
+                if data.games.len() == 1 { "" } else { "s" }
+            )
+            .into(),
+        );
     }
 
     /// Show the popup next to the tray icon (or docked bottom-right
