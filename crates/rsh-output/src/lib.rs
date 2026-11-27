@@ -158,4 +158,20 @@ pub trait IJoystickOutput: Send {
     /// hobby use); FH4 end-to-end is unproven — do not promise
     /// auto-recognition.
     fn set_g29_spoof_mode(&mut self, _enabled: bool) {}
+
+    /// G29 pedal layout (v2.0.17): `"hidmaestro"` (Z = accelerator,
+    /// Rz = brake, Y = clutch) or `"pcgamingwiki"` (Y = accelerator,
+    /// Rz = brake, Z = clutch — Z carries clutch because the G29
+    /// descriptor has no Slider axis). The default is a no-op — only
+    /// `HIDMaestro` implements it. Applied live (consulted on the
+    /// next tick) and at connect/recreate time from the persisted
+    /// `g29_pedal_layout` setting.
+    fn set_g29_pedal_layout(&mut self, _layout: &str) {}
+
+    /// G29 handbrake button (v2.0.17): which G29 button (1–25) the
+    /// handbrake drives (default 8). The default is a no-op — only
+    /// `HIDMaestro` implements it. Applied live (consulted on the
+    /// next tick) and at connect/recreate time from the persisted
+    /// `g29_handbrake_button` setting.
+    fn set_g29_handbrake_button(&mut self, _button: u8) {}
 }

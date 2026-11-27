@@ -1,10 +1,60 @@
 # Changelog — RSH (Real Sim Hub)
 
 All notable changes to the RSH app and firmware. Current versions:
-**app v2.0.16 · firmware v4.0.6 · protocol v2.2 (frozen)**.
+**app v2.0.17 · firmware v4.0.6 · protocol v2.2 (frozen)**.
 Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
+
+## [2.0.17] — 2026-11-27 (G29 spoof fixes: toggle timeout, disable error, recreate race, pedal layout, handbrake button; D-pad + overflow documented as not carried)
+
+App 2.0.17 + firmware 4.0.6 unchanged (protocol v2.2 frozen — no wire-format
+change, no firmware code change in this release).
+
+**Bug 1 — G29 toggle UI timeout.** `set_g29_spoof_mode` now gets the 390 s
+IPC bound like `set_output_backend`: enabling the toggle recreates the HID
+backend (sidecar respawn + UAC dwell), and at the 500 ms default the UI timed
+out, errored, and flipped the toggle back while the daemon was still working.
+
+**Bug 2 — Disable failure silently passed.** Disabling G29 spoof when the
+backend recreate fails now errors (the backend is left disconnected and the
+mode off) instead of returning Ok with a dead backend. The enable path is
+unchanged (flag rolled back on failure).
+
+**Bug 3 — Backend slot overwrite race.** The G29 recreate only swaps its
+handle back while the slot still holds the placeholder it installed; a
+concurrent switch/fallback during the (possibly minutes-long, UAC) recreate
+now survives instead of being overwritten and dropped.
+
+**Bug 4 — G29 spoof toggle now notes it applies when the HID backend
+connects.** (Settings UI note.)
+
+**Pedal roles as a runtime setting.** The G29 pedal assignment is no longer
+hardcoded: Settings → Game Controller → `g29_pedal_layout` picks the
+HIDMaestro layout (default; Z = accelerator, Rz = brake, Y = clutch) or the
+PCGamingWiki layout (Y = accelerator, Rz = brake, Z = clutch — Z carries
+clutch because the G29 descriptor has no Slider axis). Applies live to a
+connected HID backend (next tick) and on backend recreate / reconnect.
+
+**D-pad / hat: no D-pad input exists to map.** The G29 hat stays neutral
+(0x08) — not because a D-pad is mapped and centred, but because there is
+no D-pad signal anywhere in the RSH input path: no firmware packet field,
+no pipeline field, no vJoy feed. The v2.0.14 GameInput `RacingWheel\DPad*`
+entries are Windows-side mapping declarations for switch 0, not a fed
+input. A real D-pad would need a firmware protocol change (protocol v2.2
+is frozen) plus a pipeline field, so it is not built in this release.
+
+**Handbrake button configurable.** The handbrake no longer always ORs onto
+button 8: Settings → Game Controller → `g29_handbrake_button` (1–25,
+default 8) picks which G29 button the handbrake drives, so it no longer
+collides with a physical button 8. Applies live to a connected HID
+backend (next tick) and on backend recreate / reconnect.
+
+**Not carried in G29 mode.** RSH buttons 26–32 and encoder pulses 65–72
+cannot be carried: all 25 G29 buttons are already used by RSH buttons 1–25
+and the G29 profile has no free button slots (no overflow mapping exists —
+see `G29PedalMap` docs in `mapping.rs`). They are dropped, not silently
+remapped.
 
 ## [2.0.16] — 2026-11-27 (HIDMaestro G29 spoof mode)
 

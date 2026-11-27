@@ -31,6 +31,12 @@ struct StubApi {
     /// In-memory G29 spoof mode (default off, like the real daemon —
     /// no backend recreate in the stub).
     g29_spoof: Mutex<bool>,
+    /// In-memory G29 pedal layout (default `"hidmaestro"`, like the
+    /// real daemon — no backend push in the stub).
+    g29_pedal_layout: Mutex<String>,
+    /// In-memory G29 handbrake button (default 8, like the real
+    /// daemon — no backend push in the stub).
+    g29_handbrake_button: Mutex<u32>,
 }
 
 impl StubApi {
@@ -146,6 +152,44 @@ impl AppApi for StubApi {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = enabled;
         Ok(enabled)
+    }
+    fn g29_pedal_layout(&self) -> String {
+        self.g29_pedal_layout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    fn set_g29_pedal_layout(&self, layout: &str) -> Result<String, UserError> {
+        if !matches!(layout, "hidmaestro" | "pcgamingwiki") {
+            return Err(UserError::from_connection(
+                rsh_api::ConnectionError::Unknown,
+                "unknown G29 pedal layout",
+            ));
+        }
+        *self
+            .g29_pedal_layout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = layout.to_string();
+        Ok(layout.to_string())
+    }
+    fn g29_handbrake_button(&self) -> u32 {
+        *self
+            .g29_handbrake_button
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn set_g29_handbrake_button(&self, button: u32) -> Result<u32, UserError> {
+        if !(1..=25).contains(&button) {
+            return Err(UserError::from_connection(
+                rsh_api::ConnectionError::Unknown,
+                "G29 handbrake button must be 1..=25",
+            ));
+        }
+        *self
+            .g29_handbrake_button
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = button;
+        Ok(button)
     }
     fn get_tuning(&self, module: &str) -> TuningSettings {
         self.tunings
@@ -369,6 +413,88 @@ async fn assert_steam_fh4_round_trip(client: &IpcClient) {
     );
 }
 
+/// v2.0.17: G29 pedal layout + handbrake button round-trip over
+/// the same socket — read defaults → write → read → invalid write
+/// rejected → read unchanged.
+async fn assert_g29_settings_round_trip(client: &IpcClient) {
+    let got = client
+        .call("g29_pedal_layout", serde_json::json!({}))
+        .await
+        .expect("g29_pedal_layout");
+    assert_eq!(
+        got.get("g29_pedal_layout")
+            .and_then(serde_json::Value::as_str),
+        Some("hidmaestro"),
+        "default layout must be hidmaestro"
+    );
+    let got = client
+        .call("g29_handbrake_button", serde_json::json!({}))
+        .await
+        .expect("g29_handbrake_button");
+    assert_eq!(
+        got.get("g29_handbrake_button")
+            .and_then(serde_json::Value::as_u64),
+        Some(8),
+        "default handbrake button must be 8"
+    );
+    let applied = client
+        .call(
+            "set_g29_pedal_layout",
+            serde_json::json!({"layout": "pcgamingwiki"}),
+        )
+        .await
+        .expect("set_g29_pedal_layout");
+    assert_eq!(
+        applied
+            .get("g29_pedal_layout")
+            .and_then(serde_json::Value::as_str),
+        Some("pcgamingwiki")
+    );
+    let applied = client
+        .call(
+            "set_g29_handbrake_button",
+            serde_json::json!({"button": 12}),
+        )
+        .await
+        .expect("set_g29_handbrake_button");
+    assert_eq!(
+        applied
+            .get("g29_handbrake_button")
+            .and_then(serde_json::Value::as_u64),
+        Some(12)
+    );
+    // Invalid values are rejected and change nothing.
+    assert!(
+        client
+            .call(
+                "set_g29_pedal_layout",
+                serde_json::json!({"layout": "banana"}),
+            )
+            .await
+            .is_err(),
+        "unknown layout must error"
+    );
+    assert!(
+        client
+            .call(
+                "set_g29_handbrake_button",
+                serde_json::json!({"button": 26})
+            )
+            .await
+            .is_err(),
+        "button 26 must error"
+    );
+    let got = client
+        .call("g29_pedal_layout", serde_json::json!({}))
+        .await
+        .expect("g29_pedal_layout after rejected writes");
+    assert_eq!(
+        got.get("g29_pedal_layout")
+            .and_then(serde_json::Value::as_str),
+        Some("pcgamingwiki")
+    );
+}
+
 /// v2.0.16: G29 spoof mode round-trip over the same socket —
 /// read (default off) → write on → read → write off → read.
 async fn assert_g29_spoof_round_trip(client: &IpcClient) {
@@ -475,6 +601,8 @@ async fn ipc_round_trip_ping_version_connection_and_event() {
         sensitivity: Mutex::new(Some(50)),
         steam_fh4: Mutex::new(false),
         g29_spoof: Mutex::new(false),
+        g29_pedal_layout: Mutex::new("hidmaestro".to_string()),
+        g29_handbrake_button: Mutex::new(8),
     });
     let (event_tx, _rx) = broadcast::channel(64);
     let server = Arc::new(IpcServer::new(Arc::clone(&api), event_tx.clone()));
@@ -570,6 +698,10 @@ async fn ipc_round_trip_ping_version_connection_and_event() {
 
     // v2.0.16 G29 spoof mode round-trip over the same socket.
     assert_g29_spoof_round_trip(&client).await;
+
+    // v2.0.17 G29 pedal layout + handbrake button round-trip over
+    // the same socket.
+    assert_g29_settings_round_trip(&client).await;
 
     serve.abort();
     let _ = std::fs::remove_dir_all(&dir);

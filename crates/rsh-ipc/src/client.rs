@@ -57,7 +57,14 @@ pub fn timeout_for_method(method: &str) -> Duration {
         // rides the same arm (CORE-P1-2, polish round): it can run
         // the full backend switch inline, so the UI no longer
         // times out at 500 ms while the daemon keeps switching.
-        "set_output_backend" | "set_output_enabled" => Duration::from_secs(390),
+        // `set_g29_spoof_mode` rides it too (Bug 1, v2.0.17): it
+        // recreates the HID backend (sidecar respawn + UAC dwell),
+        // which the daemon says "can take as long as a backend
+        // switch" — at 500 ms the UI timed out, errored, and
+        // flipped the toggle back while the daemon kept working.
+        "set_output_backend" | "set_output_enabled" | "set_g29_spoof_mode" => {
+            Duration::from_secs(390)
+        }
         // Game writes: atomic file write + process refresh, which
         // can pass 500 ms on Windows under an AV scan (the UI's
         // `GAME_WRITE_TIMEOUT`). Board control round-trip (LED test
@@ -686,6 +693,14 @@ mod tests {
         // not the stale 75 s.
         assert_eq!(
             timeout_for_method("set_output_backend"),
+            Duration::from_secs(390)
+        );
+        // Bug 1 (v2.0.17): the G29 toggle recreates the HID backend
+        // (sidecar respawn + UAC dwell), so it needs the 390 s arm
+        // too — at the 500 ms default the UI timed out while the
+        // daemon was still switching.
+        assert_eq!(
+            timeout_for_method("set_g29_spoof_mode"),
             Duration::from_secs(390)
         );
         assert_eq!(timeout_for_method("add_game"), Duration::from_secs(10));

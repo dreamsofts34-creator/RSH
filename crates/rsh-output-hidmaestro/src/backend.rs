@@ -21,8 +21,9 @@ use rsh_output::{IJoystickOutput, ProcessedState};
 use crate::error::HidMaestroError;
 use crate::manager::{CreateInfo, HelloInfo, SidecarConfig, SidecarManager};
 use crate::mapping::{
-    CUSTOM_RAW_REPORT_SIZE, G29_RAW_REPORT_SIZE, G29PedalMap, HidMaestroCapabilities,
-    build_g29_raw_report, build_gamepad_frame, build_raw_report, validate_capabilities_for_profile,
+    CUSTOM_RAW_REPORT_SIZE, G29_HANDBRAKE_BUTTON, G29_RAW_REPORT_SIZE, G29PedalMap,
+    HidMaestroCapabilities, build_g29_raw_report, build_gamepad_frame, build_raw_report,
+    validate_capabilities_for_profile,
 };
 use crate::{G29_PROFILE_ID, IDENTITY_KEY, PINNED_VERSION, PROFILE_ID};
 
@@ -52,6 +53,19 @@ pub struct HidMaestroConfig {
     /// persisted `g29_spoof_mode` setting by the app-core factory;
     /// toggled live via [`IJoystickOutput::set_g29_spoof_mode`].
     pub g29_spoof: bool,
+    /// G29 pedal layout (v2.0.17): which descriptor axes carry the
+    /// pedals, from the persisted `g29_pedal_layout` setting
+    /// (`"hidmaestro"` default | `"pcgamingwiki"` — see
+    /// [`G29PedalMap::from_layout`]). Set from settings by the
+    /// app-core factory; changed live via
+    /// [`IJoystickOutput::set_g29_pedal_layout`].
+    pub g29_pedal_map: G29PedalMap,
+    /// G29 handbrake button (v2.0.17): which G29 button (1–25) the
+    /// handbrake drives, from the persisted `g29_handbrake_button`
+    /// setting (default 8 — [`G29_HANDBRAKE_BUTTON`]). Set from
+    /// settings by the app-core factory; changed live via
+    /// [`IJoystickOutput::set_g29_handbrake_button`].
+    pub g29_handbrake_button: u8,
 }
 
 impl Default for HidMaestroConfig {
@@ -60,6 +74,8 @@ impl Default for HidMaestroConfig {
             sidecar: SidecarConfig::default(),
             use_raw_report: true,
             g29_spoof: false,
+            g29_pedal_map: G29PedalMap::PROFILE,
+            g29_handbrake_button: G29_HANDBRAKE_BUTTON,
         }
     }
 }
@@ -72,6 +88,8 @@ impl HidMaestroConfig {
             sidecar: SidecarConfig::with_path(path),
             use_raw_report: true,
             g29_spoof: false,
+            g29_pedal_map: G29PedalMap::PROFILE,
+            g29_handbrake_button: G29_HANDBRAKE_BUTTON,
         }
     }
 
@@ -79,6 +97,23 @@ impl HidMaestroConfig {
     #[must_use]
     pub fn with_g29_spoof(mut self, enabled: bool) -> Self {
         self.g29_spoof = enabled;
+        self
+    }
+
+    /// Configuration with a G29 pedal layout (tests, factories):
+    /// the map itself, parsed from the persisted setting by the
+    /// caller (see [`G29PedalMap::from_layout`]).
+    #[must_use]
+    pub fn with_g29_pedal_map(mut self, map: G29PedalMap) -> Self {
+        self.g29_pedal_map = map;
+        self
+    }
+
+    /// Configuration with a G29 handbrake button (tests,
+    /// factories): clamped to 1–25, the G29 profile's button range.
+    #[must_use]
+    pub fn with_g29_handbrake_button(mut self, button: u8) -> Self {
+        self.g29_handbrake_button = button.clamp(1, 25);
         self
     }
 }
@@ -178,6 +213,14 @@ pub struct HidMaestroOutput {
     /// `set_g29_spoof_mode`). When true the active profile is
     /// `logitech-g29` and every submit is a 12-byte raw report.
     g29_spoof: bool,
+    /// G29 pedal map in effect (mirrors `config.g29_pedal_map`;
+    /// changed live via `set_g29_pedal_layout`). Consulted on every
+    /// G29 tick — a layout change needs no restart.
+    g29_pedal_map: G29PedalMap,
+    /// G29 handbrake button in effect (mirrors
+    /// `config.g29_handbrake_button`; changed live via
+    /// `set_g29_handbrake_button`). Consulted on every G29 tick.
+    g29_handbrake_button: u8,
     /// 12-byte G29 raw report buffer (separate from the 15-byte
     /// custom buffer — the sizes must never be confused).
     raw_report_g29: [u8; G29_RAW_REPORT_SIZE],
@@ -198,6 +241,8 @@ impl HidMaestroOutput {
     pub fn with_config(config: HidMaestroConfig) -> Self {
         let manager = SidecarManager::new(config.sidecar.clone());
         let g29_spoof = config.g29_spoof;
+        let g29_pedal_map = config.g29_pedal_map;
+        let g29_handbrake_button = config.g29_handbrake_button;
         Self {
             config,
             manager,
@@ -208,6 +253,8 @@ impl HidMaestroOutput {
             last_error: None,
             raw_report: [0u8; CUSTOM_RAW_REPORT_SIZE],
             g29_spoof,
+            g29_pedal_map,
+            g29_handbrake_button,
             raw_report_g29: [0u8; G29_RAW_REPORT_SIZE],
         }
     }
@@ -216,6 +263,19 @@ impl HidMaestroOutput {
     #[must_use]
     pub const fn g29_spoof(&self) -> bool {
         self.g29_spoof
+    }
+
+    /// G29 pedal map in effect (which descriptor axes carry the
+    /// pedals — see [`G29PedalMap`]).
+    #[must_use]
+    pub const fn g29_pedal_map(&self) -> G29PedalMap {
+        self.g29_pedal_map
+    }
+
+    /// G29 handbrake button in effect (1–25).
+    #[must_use]
+    pub const fn g29_handbrake_button(&self) -> u8 {
+        self.g29_handbrake_button
     }
 
     /// Profile id this backend will create on connect
@@ -525,6 +585,26 @@ impl IJoystickOutput for HidMaestroOutput {
         }
     }
 
+    /// G29 pedal layout, live (v2.0.17): the map is consulted on
+    /// the next tick — no restart. An unknown layout string keeps
+    /// the current map (the settings layer canonicalizes unknowns
+    /// back to the default before they get here).
+    fn set_g29_pedal_layout(&mut self, layout: &str) {
+        if let Some(map) = G29PedalMap::from_layout(layout) {
+            self.g29_pedal_map = map;
+            self.config.g29_pedal_map = map;
+        }
+    }
+
+    /// G29 handbrake button, live (v2.0.17): consulted on the next
+    /// tick — no restart. Out-of-range buttons are clamped to
+    /// 1–25, the G29 profile's button range.
+    fn set_g29_handbrake_button(&mut self, button: u8) {
+        let button = button.clamp(1, 25);
+        self.g29_handbrake_button = button;
+        self.config.g29_handbrake_button = button;
+    }
+
     fn is_connected(&self) -> bool {
         self.connected
     }
@@ -575,7 +655,8 @@ impl IJoystickOutput for HidMaestroOutput {
             build_g29_raw_report(
                 state,
                 &self.current_caps(),
-                G29PedalMap::PROFILE,
+                self.g29_pedal_map,
+                self.g29_handbrake_button,
                 &mut self.raw_report_g29,
             );
             let report = self.raw_report_g29;

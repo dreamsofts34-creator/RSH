@@ -120,14 +120,17 @@ pub const G29_BUTTON_COUNT: i32 = 25;
 /// reply the same way.
 pub const G29_DESCRIPTOR_HEX: &str = "05010904a1010939150025073500463b0165147504950181420509190129196500250145017501951981027501950381030501093027ffff000047ffff000075109501810209320935093126ff0046ff007508950381020600ff0901950281020600ff0901950181020600ff090226ff0046ff00951075089102c0";
 /// G29 handbrake mapping: the G29 has no handbrake axis, so the
-/// handbrake is a BUTTON — button 8 (L2) — pressed when the handbrake
-/// value exceeds [`G29_HANDBRAKE_THRESHOLD`]. WHY L2: the face
-/// buttons (1–4) are menu buttons, R1/L1 (5–6) are the shift paddles,
-/// and buttons 13–19 are the H-pattern gears + reverse — L2 is the
-/// least-loaded trigger-style button, and a handbrake IS a trigger
-/// pull in shape. If the PC test shows a conflict, change this one
-/// constant (and the tests) — the mapping is a single documented
-/// choice, not a rewrite.
+/// handbrake is a BUTTON — button 8 (L2) by default — pressed when
+/// the handbrake value exceeds [`G29_HANDBRAKE_THRESHOLD`]. WHY L2:
+/// the face buttons (1–4) are menu buttons, R1/L1 (5–6) are the
+/// shift paddles, and buttons 13–19 are the H-pattern gears +
+/// reverse — L2 is the least-loaded trigger-style button, and a
+/// handbrake IS a trigger pull in shape. The button is configurable
+/// at runtime via the persisted `g29_handbrake_button` setting
+/// (1–25, default 8 — this constant); [`build_g29_raw_report`]
+/// takes the live button as a parameter, and a physical button 8
+/// held at the same time still reports (the OR is the collision
+/// the setting exists to avoid).
 pub const G29_HANDBRAKE_BUTTON: u8 = 8;
 /// Handbrake value above which the G29 handbrake button is pressed.
 pub const G29_HANDBRAKE_THRESHOLD: f32 = 0.5;
@@ -149,10 +152,15 @@ pub enum G29PedalAxis {
 /// profile layout says Z = accelerator, Rz = brake, Y = clutch;
 /// `PCGamingWiki` says Y = accelerator (with Rz = brake). The
 /// descriptor order (X, Z, Rz, Y) is agreed; the roles are NOT.
-/// The assignment is therefore a swappable constant, not hardcoded
-/// logic: the PC test (`joy.cpl` — move each pedal, watch which axis
-/// moves) decides, and swapping is a one-constant change
-/// ([`G29PedalMap::PROFILE`] ↔ [`G29PedalMap::ACCEL_CLUTCH_SWAPPED`]).
+/// The assignment is therefore a runtime setting, not hardcoded
+/// logic: the persisted `g29_pedal_layout` setting
+/// (`"hidmaestro"` | `"pcgamingwiki"`, see
+/// [`G29PedalMap::from_layout`]) picks the map, and the PC test
+/// (`joy.cpl` — move each pedal, watch which axis moves) decides
+/// which layout is right for a given game. Z carries clutch in the
+/// `PCGamingWiki` layout because the G29 descriptor has no Slider
+/// axis — there is no fourth pedal slot, so clutch takes Z and
+/// nothing is left unassigned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct G29PedalMap {
     /// Accelerator axis.
@@ -164,6 +172,11 @@ pub struct G29PedalMap {
 }
 
 impl G29PedalMap {
+    /// Persisted layout value for the `HIDMaestro` profile layout.
+    pub const LAYOUT_HIDMAESTRO: &'static str = "hidmaestro";
+    /// Persisted layout value for the `PCGamingWiki` layout.
+    pub const LAYOUT_PCGAMINGWIKI: &'static str = "pcgamingwiki";
+
     /// The `HIDMaestro` profile layout: Z = accelerator, Rz = brake,
     /// Y = clutch. Default until the PC test proves otherwise.
     pub const PROFILE: Self = Self {
@@ -178,6 +191,20 @@ impl G29PedalMap {
         brake: G29PedalAxis::Rz,
         clutch: G29PedalAxis::Z,
     };
+
+    /// Parse a persisted `g29_pedal_layout` value (case-insensitive,
+    /// surrounding whitespace ignored). `None` for anything else —
+    /// the settings layer canonicalizes unknown values back to the
+    /// default instead of guessing, and the backend keeps its
+    /// current map when a live push carries an unknown value.
+    #[must_use]
+    pub fn from_layout(layout: &str) -> Option<Self> {
+        match layout.trim().to_ascii_lowercase().as_str() {
+            Self::LAYOUT_HIDMAESTRO => Some(Self::PROFILE),
+            Self::LAYOUT_PCGAMINGWIKI => Some(Self::ACCEL_CLUTCH_SWAPPED),
+            _ => None,
+        }
+    }
 }
 
 /// A device's capabilities, read from the created profile (connect
@@ -617,24 +644,40 @@ pub fn neutral_raw_report(caps: &HidMaestroCapabilities, out: &mut [u8; CUSTOM_R
 /// `SubmitState` frame layout does not match this profile and must
 /// never be used for it, enforced on both sides). Layout, in
 /// descriptor order:
-/// Bytes 0–3: hat (low 4 bits, always [`HAT_NEUTRAL_RAW`] — RSH has
-/// no hat input) + buttons 1–25 (bits 4–28, bit 0 of the field =
+/// Bytes 0–3: hat (low 4 bits, always [`HAT_NEUTRAL_RAW`] — see
+/// below) + buttons 1–25 (bits 4–28, bit 0 of the field =
 /// button 1) + 3 pad bits. Bytes 4–5: X steering u16 LE (0–65535,
 /// centre 32768). Bytes 6–8: Z, Rz, Y pedals u8 (roles per `map` —
 /// see [`G29PedalMap`]). Bytes 9–10: vendor 0xFF00 input (2 bytes,
 /// neutral 0). Byte 11: vendor input (1 byte, neutral 0).
 ///
-/// Handbrake: no axis — mapped to button [`G29_HANDBRAKE_BUTTON`]
-/// (L2) when `state.handbrake` exceeds [`G29_HANDBRAKE_THRESHOLD`].
+/// Hat: there is NO D-pad signal anywhere in the RSH input path —
+/// the firmware stream packet, the pipeline [`OutputState`], and
+/// the vJoy feed all carry no hat/D-pad input (the v2.0.14
+/// `GameInput` `RacingWheel\DPad*` entries are Windows-side mapping
+/// declarations for switch 0, not a fed input), so the hat is
+/// always neutral (0x08). A real D-pad would need a firmware
+/// protocol change (protocol v2.2 is frozen) plus a pipeline field,
+/// so it is not built here — the neutral hat is the honest report,
+/// not a dropped input.
+///
+/// Handbrake: no axis — mapped to button `handbrake_button`
+/// (default [`G29_HANDBRAKE_BUTTON`], L2) when `state.handbrake`
+/// exceeds [`G29_HANDBRAKE_THRESHOLD`].
 ///
 /// Buttons 26–32, `buttons_ex` (33–64) and encoder pulses (65–72)
 /// have no wire slot on the 25-button G29 profile and are dropped —
-/// documented, not silently folded anywhere. Buttons are masked by
+/// documented, not silently folded anywhere. All 25 G29 buttons
+/// are already used by RSH buttons 1–25, so there is no free slot
+/// to overflow into: no overflow mapping exists, and adding one
+/// would need a user-facing choice of which G29 button to steal
+/// (a new mapping UI), not a silent remap. Buttons are masked by
 /// the device's button count (25 on a G29).
 pub fn build_g29_raw_report(
     state: &OutputState,
     caps: &HidMaestroCapabilities,
     map: G29PedalMap,
+    handbrake_button: u8,
     out: &mut [u8; G29_RAW_REPORT_SIZE],
 ) {
     out.fill(0);
@@ -643,8 +686,10 @@ pub fn build_g29_raw_report(
     // 25-bit mask (buttons 1–25) — reused here, same width.
     let mut word: u32 = u32::from(HAT_NEUTRAL_RAW);
     word |= (state.buttons & SUBMIT_STATE_BUTTON_MASK & caps.button_mask()) << 4;
-    if state.handbrake > G29_HANDBRAKE_THRESHOLD {
-        word |= 1u32 << (4 + u32::from(G29_HANDBRAKE_BUTTON) - 1);
+    if state.handbrake > G29_HANDBRAKE_THRESHOLD
+        && (1..=G29_BUTTON_COUNT).contains(&i32::from(handbrake_button))
+    {
+        word |= 1u32 << (4 + u32::from(handbrake_button) - 1);
     }
     out[0..4].copy_from_slice(&word.to_le_bytes());
     let x = if caps.has_axis_x {
@@ -667,7 +712,13 @@ pub fn build_g29_raw_report(
 /// Neutral 12-byte G29 raw report (watchdog / shutdown): steering
 /// centred (32768), pedals released, no buttons, hat neutral.
 pub fn neutral_g29_raw_report(caps: &HidMaestroCapabilities, out: &mut [u8; G29_RAW_REPORT_SIZE]) {
-    build_g29_raw_report(&OutputState::neutral(), caps, G29PedalMap::PROFILE, out);
+    build_g29_raw_report(
+        &OutputState::neutral(),
+        caps,
+        G29PedalMap::PROFILE,
+        G29_HANDBRAKE_BUTTON,
+        out,
+    );
 }
 
 /// True when G29 wheel button `button` (1–25) is pressed in a G29
@@ -1098,6 +1149,7 @@ mod tests {
             &full_state(),
             &HidMaestroCapabilities::g29_wheel(),
             G29PedalMap::PROFILE,
+            G29_HANDBRAKE_BUTTON,
             &mut out,
         );
         assert_eq!(read_g29_steering(&out), 65535);
@@ -1124,6 +1176,7 @@ mod tests {
                 &s,
                 &HidMaestroCapabilities::g29_wheel(),
                 G29PedalMap::PROFILE,
+                G29_HANDBRAKE_BUTTON,
                 &mut out,
             );
             assert!(
@@ -1142,11 +1195,14 @@ mod tests {
         let mut s = OutputState::neutral();
         s.buttons = 1u32 << 25 | 1u32 << 31; // buttons 26 and 32
         s.buttons_ex = u32::MAX;
+        // Encoder pulses 65–72 (all 8 bits) — also no wire slot.
+        s.encoder_buttons = rsh_engine::encoder::EncoderButtons(u8::MAX);
         let mut out = [0u8; G29_RAW_REPORT_SIZE];
         build_g29_raw_report(
             &s,
             &HidMaestroCapabilities::g29_wheel(),
             G29PedalMap::PROFILE,
+            G29_HANDBRAKE_BUTTON,
             &mut out,
         );
         assert_eq!(out[0..4], [0x08, 0, 0, 0]);
@@ -1156,11 +1212,17 @@ mod tests {
 
     #[test]
     fn g29_hat_always_neutral() {
+        // v2.0.17: the hat is neutral because there is NO D-pad
+        // signal in the RSH input path (no firmware packet field,
+        // no pipeline field) — not because a D-pad is mapped and
+        // centred. A real D-pad needs a protocol change (v2.2 is
+        // frozen), so this stays neutral by construction.
         let mut out = [0u8; G29_RAW_REPORT_SIZE];
         build_g29_raw_report(
             &full_state(),
             &HidMaestroCapabilities::g29_wheel(),
             G29PedalMap::PROFILE,
+            G29_HANDBRAKE_BUTTON,
             &mut out,
         );
         assert_eq!(out[0] & 0x0F, 0x08);
@@ -1174,7 +1236,13 @@ mod tests {
             let mut s = OutputState::neutral();
             s.handbrake = value;
             let mut out = [0u8; G29_RAW_REPORT_SIZE];
-            build_g29_raw_report(&s, &caps, G29PedalMap::PROFILE, &mut out);
+            build_g29_raw_report(
+                &s,
+                &caps,
+                G29PedalMap::PROFILE,
+                G29_HANDBRAKE_BUTTON,
+                &mut out,
+            );
             assert!(
                 !is_g29_button_pressed(&out, G29_HANDBRAKE_BUTTON),
                 "handbrake {value} must not press L2"
@@ -1184,7 +1252,13 @@ mod tests {
         let mut s = OutputState::neutral();
         s.handbrake = 0.51;
         let mut out = [0u8; G29_RAW_REPORT_SIZE];
-        build_g29_raw_report(&s, &caps, G29PedalMap::PROFILE, &mut out);
+        build_g29_raw_report(
+            &s,
+            &caps,
+            G29PedalMap::PROFILE,
+            G29_HANDBRAKE_BUTTON,
+            &mut out,
+        );
         assert!(is_g29_button_pressed(&out, G29_HANDBRAKE_BUTTON));
         let word = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
         assert_eq!(word, 0x08 | (1u32 << (4 + 8 - 1)));
@@ -1197,10 +1271,118 @@ mod tests {
         s.clutch = 0.0;
         let caps = HidMaestroCapabilities::g29_wheel();
         let mut out = [0u8; G29_RAW_REPORT_SIZE];
-        build_g29_raw_report(&s, &caps, G29PedalMap::PROFILE, &mut out);
+        build_g29_raw_report(
+            &s,
+            &caps,
+            G29PedalMap::PROFILE,
+            G29_HANDBRAKE_BUTTON,
+            &mut out,
+        );
         assert_eq!((out[6], out[7], out[8]), (255, 0, 0)); // Z = accel
-        build_g29_raw_report(&s, &caps, G29PedalMap::ACCEL_CLUTCH_SWAPPED, &mut out);
+        build_g29_raw_report(
+            &s,
+            &caps,
+            G29PedalMap::ACCEL_CLUTCH_SWAPPED,
+            G29_HANDBRAKE_BUTTON,
+            &mut out,
+        );
         assert_eq!((out[6], out[7], out[8]), (0, 0, 255)); // Y = accel
+    }
+
+    #[test]
+    fn g29_pedal_layout_from_layout_parses_both_layouts() {
+        // v2.0.17: the persisted `g29_pedal_layout` string selects
+        // the map — case-insensitive, surrounding whitespace
+        // ignored; anything else is rejected (no guessing).
+        assert_eq!(
+            G29PedalMap::from_layout("hidmaestro"),
+            Some(G29PedalMap::PROFILE)
+        );
+        assert_eq!(
+            G29PedalMap::from_layout("PCGamingWiki"),
+            Some(G29PedalMap::ACCEL_CLUTCH_SWAPPED)
+        );
+        assert_eq!(
+            G29PedalMap::from_layout("  pcgamingwiki  "),
+            Some(G29PedalMap::ACCEL_CLUTCH_SWAPPED)
+        );
+        assert_eq!(G29PedalMap::from_layout(""), None);
+        assert_eq!(G29PedalMap::from_layout("logitech"), None);
+        assert_eq!(G29PedalMap::from_layout("hidmaestro2"), None);
+    }
+
+    #[test]
+    fn g29_pedal_layout_string_drives_pedal_bytes() {
+        // v2.0.17: the layout string alone decides which descriptor
+        // byte carries the accelerator — one pedal pressed, so the
+        // other two bytes must stay 0 (the all-pressed test above
+        // cannot tell a swapped map from a duplicated one).
+        let mut s = OutputState::neutral();
+        s.accelerator = 1.0;
+        let caps = HidMaestroCapabilities::g29_wheel();
+        let mut out = [0u8; G29_RAW_REPORT_SIZE];
+        let map = G29PedalMap::from_layout("hidmaestro").expect("hidmaestro parses");
+        build_g29_raw_report(&s, &caps, map, G29_HANDBRAKE_BUTTON, &mut out);
+        assert_eq!((out[6], out[7], out[8]), (255, 0, 0)); // Z = accel
+        let map = G29PedalMap::from_layout("pcgamingwiki").expect("pcgamingwiki parses");
+        build_g29_raw_report(&s, &caps, map, G29_HANDBRAKE_BUTTON, &mut out);
+        assert_eq!((out[6], out[7], out[8]), (0, 0, 255)); // Y = accel
+        // And the clutch goes to the other end in each layout.
+        let mut s = OutputState::neutral();
+        s.clutch = 1.0;
+        let map = G29PedalMap::from_layout("hidmaestro").expect("hidmaestro parses");
+        build_g29_raw_report(&s, &caps, map, G29_HANDBRAKE_BUTTON, &mut out);
+        assert_eq!((out[6], out[7], out[8]), (0, 0, 255)); // Y = clutch
+        let map = G29PedalMap::from_layout("pcgamingwiki").expect("pcgamingwiki parses");
+        build_g29_raw_report(&s, &caps, map, G29_HANDBRAKE_BUTTON, &mut out);
+        assert_eq!((out[6], out[7], out[8]), (255, 0, 0)); // Z = clutch
+    }
+
+    #[test]
+    fn g29_handbrake_on_configured_button_does_not_touch_button_8() {
+        // v2.0.17: the handbrake button is configurable (default 8);
+        // on button 12 the handbrake must press 12 and leave 8
+        // alone — the collision the setting exists to avoid.
+        let caps = HidMaestroCapabilities::g29_wheel();
+        let mut s = OutputState::neutral();
+        s.handbrake = 1.0;
+        let mut out = [0u8; G29_RAW_REPORT_SIZE];
+        build_g29_raw_report(&s, &caps, G29PedalMap::PROFILE, 12, &mut out);
+        assert!(is_g29_button_pressed(&out, 12));
+        assert!(!is_g29_button_pressed(&out, 8));
+        // A physical button 8 held at the same time still reports
+        // on 8 (the two sources OR onto different bits now).
+        s.buttons = 1u32 << 7; // physical button 8
+        build_g29_raw_report(&s, &caps, G29PedalMap::PROFILE, 12, &mut out);
+        assert!(is_g29_button_pressed(&out, 8));
+        assert!(is_g29_button_pressed(&out, 12));
+        // Default 8 behaviour unchanged: handbrake alone presses 8.
+        let mut s = OutputState::neutral();
+        s.handbrake = 1.0;
+        build_g29_raw_report(
+            &s,
+            &caps,
+            G29PedalMap::PROFILE,
+            G29_HANDBRAKE_BUTTON,
+            &mut out,
+        );
+        assert!(is_g29_button_pressed(&out, 8));
+        assert!(!is_g29_button_pressed(&out, 12));
+    }
+
+    #[test]
+    fn g29_handbrake_out_of_range_button_presses_nothing() {
+        // v2.0.17: a handbrake button outside 1–25 has no wire slot
+        // — it must press nothing, never wrap onto button 1 or 25.
+        let caps = HidMaestroCapabilities::g29_wheel();
+        let mut s = OutputState::neutral();
+        s.handbrake = 1.0;
+        for button in [0u8, 26, 255] {
+            let mut out = [0u8; G29_RAW_REPORT_SIZE];
+            build_g29_raw_report(&s, &caps, G29PedalMap::PROFILE, button, &mut out);
+            let word = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+            assert_eq!(word, 0x08, "button {button} must press nothing");
+        }
     }
 
     #[test]

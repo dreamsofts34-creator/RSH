@@ -115,6 +115,14 @@ struct LiveCache {
     /// default OFF. Refreshed by the slow poller like
     /// `steam_fh4_mode` above.
     g29_spoof_mode: Mutex<Option<bool>>,
+    /// Last G29 pedal layout: the daemon's `g29_pedal_layout`
+    /// ("hidmaestro" default, "pcgamingwiki" alternate).
+    /// Refreshed by the slow poller like `g29_spoof_mode` above.
+    g29_pedal_layout: Mutex<Option<String>>,
+    /// Last G29 handbrake button: the daemon's
+    /// `g29_handbrake_button` (1–25, default 8). Refreshed by
+    /// the slow poller like `g29_spoof_mode` above.
+    g29_handbrake_button: Mutex<Option<u32>>,
     /// Module on/off by index: 0 handbrake, 1 shifter, 2 horn, 3 led
     /// (the same order [`module_index`] and the UI's `module_states`
     /// use).
@@ -170,6 +178,8 @@ impl Default for LiveCache {
             backend: Mutex::new(None),
             steam_fh4_mode: Mutex::new(None),
             g29_spoof_mode: Mutex::new(None),
+            g29_pedal_layout: Mutex::new(None),
+            g29_handbrake_button: Mutex::new(None),
             modules: Mutex::new([None; 4]),
             tunings: Mutex::new(HashMap::new()),
             draft: Mutex::new(None),
@@ -403,6 +413,10 @@ pub struct LiveSeed {
     pub steam_fh4_mode: bool,
     /// G29 spoof mode flag.
     pub g29_spoof_mode: bool,
+    /// G29 pedal layout ("hidmaestro" default).
+    pub g29_pedal_layout: String,
+    /// G29 handbrake button (1–25, default 8).
+    pub g29_handbrake_button: u32,
     /// The session `connect` verdict (the wizard's Connect step
     /// follows it; a failure notifies instead of blocking).
     pub connect: Result<ConnectionInfo, UserError>,
@@ -425,6 +439,8 @@ impl LiveSeed {
             autostart: api.autostart(),
             steam_fh4_mode: api.steam_fh4_mode(),
             g29_spoof_mode: api.g29_spoof_mode(),
+            g29_pedal_layout: api.g29_pedal_layout(),
+            g29_handbrake_button: api.g29_handbrake_button(),
             connect,
             wifi: api.wifi_status(),
         }
@@ -765,6 +781,12 @@ impl IpcApi {
             *slot = None;
         }
         if let Ok(mut slot) = self.cache.g29_spoof_mode.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.g29_pedal_layout.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.g29_handbrake_button.lock() {
             *slot = None;
         }
         if let Ok(mut slot) = self.cache.modules.lock() {
@@ -1211,6 +1233,36 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
                 }
             }
         }
+        // G29 pedal layout: same shape as `g29_spoof_mode` above.
+        // An old daemon without the method just keeps the last
+        // value ("hidmaestro" while cold).
+        if let Ok(value) = client.call("g29_pedal_layout", serde_json::json!({})).await {
+            if let Some(layout) = value
+                .get("g29_pedal_layout")
+                .and_then(serde_json::Value::as_str)
+            {
+                if let Ok(mut slot) = cache.g29_pedal_layout.lock() {
+                    *slot = Some(layout.to_string());
+                }
+            }
+        }
+        // G29 handbrake button: same shape as `g29_spoof_mode`
+        // above. An old daemon without the method just keeps the
+        // last value (8 while cold).
+        if let Ok(value) = client
+            .call("g29_handbrake_button", serde_json::json!({}))
+            .await
+        {
+            if let Some(button) = value
+                .get("g29_handbrake_button")
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|n| u32::try_from(n).ok())
+            {
+                if let Ok(mut slot) = cache.g29_handbrake_button.lock() {
+                    *slot = Some(button);
+                }
+            }
+        }
         cache.slow_filled.store(true, Ordering::Relaxed);
         bump_generation_if_changed(cache, epoch);
         return;
@@ -1313,6 +1365,16 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
     });
     fetch!("g29_spoof_mode", g29_spoof_mode, |v| {
         v.get("g29_spoof_mode").and_then(serde_json::Value::as_bool)
+    });
+    fetch!("g29_pedal_layout", g29_pedal_layout, |v| {
+        v.get("g29_pedal_layout")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    });
+    fetch!("g29_handbrake_button", g29_handbrake_button, |v| {
+        v.get("g29_handbrake_button")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|n| u32::try_from(n).ok())
     });
     // `list_bindings` / `knob_actions` nest their payloads under a
     // key, like their trait methods already parse them.
@@ -1459,6 +1521,8 @@ fn slow_content_hash(cache: &LiveCache) -> u64 {
     slot!(close_to_tray);
     slot!(steam_fh4_mode);
     slot!(g29_spoof_mode);
+    slot!(g29_pedal_layout);
+    slot!(g29_handbrake_button);
     slot!(bindings);
     slot!(knobs);
     slot!(modules);
@@ -1989,6 +2053,112 @@ impl AppApi for IpcApi {
         match got {
             Ok(stored) => {
                 if let Ok(mut slot) = self.cache.g29_spoof_mode.lock() {
+                    *slot = Some(stored);
+                }
+                Ok(stored)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
+    }
+
+    /// Cached G29 pedal layout: the slow poller refreshes it ~1 Hz
+    /// (direct `g29_pedal_layout` call in `refresh_slow` — it is
+    /// not part of `SlowPollState`), so this never touches the
+    /// socket. No cache yet means "hidmaestro" (the default, and
+    /// the pre-poller fallback). An unknown stored value normalizes
+    /// to "hidmaestro", so the radios never show neither option.
+    fn g29_pedal_layout(&self) -> String {
+        self.cache
+            .g29_pedal_layout
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .map_or_else(
+                || "hidmaestro".to_string(),
+                |layout| crate::normalize_g29_pedal_layout(&layout).to_string(),
+            )
+    }
+
+    /// Set G29 pedal layout: the `set_g29_pedal_layout` IPC call,
+    /// following the `set_g29_spoof_mode` pattern — same
+    /// `{"layout": string}` params, same
+    /// `{"g29_pedal_layout": string}` reply, same cache update on
+    /// success. Failures keep the daemon's typed reason via
+    /// [`Self::api_error`] instead of collapsing to the generic
+    /// link failure.
+    fn set_g29_pedal_layout(&self, layout: &str) -> Result<String, UserError> {
+        let layout = crate::normalize_g29_pedal_layout(layout).to_string();
+        let got: Result<String, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async(
+                    "set_g29_pedal_layout",
+                    serde_json::json!({"layout": layout}),
+                )
+                .await?;
+            value
+                .get("g29_pedal_layout")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    IpcError::Protocol("set_g29_pedal_layout has no g29_pedal_layout".to_string())
+                })
+        });
+        match got {
+            Ok(stored) => {
+                let stored = crate::normalize_g29_pedal_layout(&stored).to_string();
+                if let Ok(mut slot) = self.cache.g29_pedal_layout.lock() {
+                    *slot = Some(stored.clone());
+                }
+                Ok(stored)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
+    }
+
+    /// Cached G29 handbrake button: the slow poller refreshes it
+    /// ~1 Hz (direct `g29_handbrake_button` call in
+    /// `refresh_slow` — it is not part of `SlowPollState`), so
+    /// this never touches the socket. No cache yet means 8 (the
+    /// default, and the pre-poller fallback).
+    fn g29_handbrake_button(&self) -> u32 {
+        self.cache
+            .g29_handbrake_button
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .map_or(8, |button| button.clamp(1, 25))
+    }
+
+    /// Set G29 handbrake button: the `set_g29_handbrake_button`
+    /// IPC call, following the `set_g29_spoof_mode` pattern —
+    /// same `{"button": int}` params, same
+    /// `{"g29_handbrake_button": int}` reply, same cache update
+    /// on success. Failures keep the daemon's typed reason via
+    /// [`Self::api_error`] instead of collapsing to the generic
+    /// link failure.
+    fn set_g29_handbrake_button(&self, button: u32) -> Result<u32, UserError> {
+        let button = button.clamp(1, 25);
+        let got: Result<u32, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async(
+                    "set_g29_handbrake_button",
+                    serde_json::json!({"button": button}),
+                )
+                .await?;
+            value
+                .get("g29_handbrake_button")
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| {
+                    IpcError::Protocol(
+                        "set_g29_handbrake_button has no g29_handbrake_button".to_string(),
+                    )
+                })
+        });
+        match got {
+            Ok(stored) => {
+                let stored = stored.clamp(1, 25);
+                if let Ok(mut slot) = self.cache.g29_handbrake_button.lock() {
                     *slot = Some(stored);
                 }
                 Ok(stored)

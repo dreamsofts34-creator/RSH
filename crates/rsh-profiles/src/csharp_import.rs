@@ -513,6 +513,20 @@ pub struct AppSettings {
     /// FH4, so this mode promises no auto-recognition.
     #[serde(default)]
     pub g29_spoof_mode: bool,
+    /// G29 pedal layout (v2.0.17): which descriptor axes carry the
+    /// pedals in G29 mode — `"hidmaestro"` (default; Z =
+    /// accelerator, Rz = brake, Y = clutch) or `"pcgamingwiki"` (Y
+    /// = accelerator, Rz = brake, Z = clutch — Z carries clutch
+    /// because the G29 descriptor has no Slider axis). Unknown
+    /// values canonicalize back to the default on load (see
+    /// [`sanitize_settings`]).
+    #[serde(default = "default_g29_pedal_layout")]
+    pub g29_pedal_layout: String,
+    /// G29 handbrake button (v2.0.17): which G29 button (1–25)
+    /// the handbrake drives in G29 mode. Default 8 (L2); out of
+    /// range values clamp to 1–25 on load (see [`sanitize_settings`]).
+    #[serde(default = "default_g29_handbrake_button")]
+    pub g29_handbrake_button: u32,
     /// Per-module on/off switches, keyed by canonical module id
     /// (`"steering"`, `"accelerator"`, `"brake"`, `"clutch"`,
     /// `"handbrake"`, `"shifter"`, `"horn"`, `"buttons"`,
@@ -581,6 +595,14 @@ fn default_output_backend() -> String {
 
 fn default_log_level() -> String {
     "Warning".to_owned()
+}
+
+fn default_g29_pedal_layout() -> String {
+    G29_PEDAL_LAYOUT_HIDMAESTRO.to_owned()
+}
+
+fn default_g29_handbrake_button() -> u32 {
+    DEFAULT_G29_HANDBRAKE_BUTTON
 }
 
 /// Manual `Default` impls (Phase F): the derived `Default` gave all-zero
@@ -698,6 +720,8 @@ impl Default for AppSettings {
             auto_switch_paused: false,
             steam_fh4_mode: false,
             g29_spoof_mode: false,
+            g29_pedal_layout: default_g29_pedal_layout(),
+            g29_handbrake_button: default_g29_handbrake_button(),
             modules: default_modules(),
         }
     }
@@ -770,6 +794,28 @@ pub fn canonical_theme(value: &str) -> Option<&'static str> {
     }
 }
 
+/// Persisted `g29_pedal_layout` value for the `HIDMaestro` profile
+/// layout (v2.0.17): Z = accelerator, Rz = brake, Y = clutch.
+/// The default — see `G29PedalMap` in `rsh-output-hidmaestro`.
+pub const G29_PEDAL_LAYOUT_HIDMAESTRO: &str = "hidmaestro";
+/// Persisted `g29_pedal_layout` value for the `PCGamingWiki`
+/// layout (v2.0.17): Y = accelerator, Rz = brake, Z = clutch.
+pub const G29_PEDAL_LAYOUT_PCGAMINGWIKI: &str = "pcgamingwiki";
+/// Default G29 handbrake button (v2.0.17): 8 (L2).
+pub const DEFAULT_G29_HANDBRAKE_BUTTON: u32 = 8;
+
+/// Canonicalize a `g29_pedal_layout` value (v2.0.17): the two known
+/// layouts, case-insensitive; `None` for anything else (the caller
+/// falls back to the default instead of guessing).
+#[must_use]
+pub fn canonical_g29_pedal_layout(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        G29_PEDAL_LAYOUT_HIDMAESTRO => Some(G29_PEDAL_LAYOUT_HIDMAESTRO),
+        G29_PEDAL_LAYOUT_PCGAMINGWIKI => Some(G29_PEDAL_LAYOUT_PCGAMINGWIKI),
+        _ => None,
+    }
+}
+
 /// A partial settings update (C-SET-1, PATCH semantics): only the
 /// fields that are `Some` overwrite the stored settings; absent fields
 /// keep their existing values. This is what the `set_settings` Tauri
@@ -814,6 +860,12 @@ pub struct AppSettingsPatch {
     pub steam_fh4_mode: Option<bool>,
     /// G29 spoof mode (default off — see [`AppSettings::g29_spoof_mode`]).
     pub g29_spoof_mode: Option<bool>,
+    /// G29 pedal layout (default `"hidmaestro"` — see
+    /// [`AppSettings::g29_pedal_layout`]).
+    pub g29_pedal_layout: Option<String>,
+    /// G29 handbrake button (default 8 — see
+    /// [`AppSettings::g29_handbrake_button`]).
+    pub g29_handbrake_button: Option<u32>,
     /// Per-module switches, merged per key.
     pub modules: Option<HashMap<String, bool>>,
 }
@@ -874,6 +926,12 @@ impl AppSettings {
         }
         if let Some(g29_spoof_mode) = patch.g29_spoof_mode {
             self.g29_spoof_mode = g29_spoof_mode;
+        }
+        if let Some(g29_pedal_layout) = patch.g29_pedal_layout {
+            self.g29_pedal_layout = g29_pedal_layout;
+        }
+        if let Some(g29_handbrake_button) = patch.g29_handbrake_button {
+            self.g29_handbrake_button = g29_handbrake_button;
         }
         if let Some(modules) = patch.modules {
             for (module, enabled) in modules {
@@ -1003,6 +1061,19 @@ pub fn sanitize_settings(settings: &mut AppSettings) {
         settings.esp_ip = default_esp_ip();
     }
     settings.vjoy_device_id = settings.vjoy_device_id.clamp(1, 16);
+    // G29 settings (v2.0.17): an unknown pedal layout falls back
+    // to the default (hand-edited settings must never select a
+    // map that does not exist); a handbrake button of 0 (absent
+    // in old settings files, or hand-edited) means the default 8,
+    // anything else clamps to the 25-button G29 range.
+    settings.g29_pedal_layout = canonical_g29_pedal_layout(&settings.g29_pedal_layout)
+        .unwrap_or(G29_PEDAL_LAYOUT_HIDMAESTRO)
+        .to_string();
+    if settings.g29_handbrake_button == 0 {
+        settings.g29_handbrake_button = DEFAULT_G29_HANDBRAKE_BUTTON;
+    } else {
+        settings.g29_handbrake_button = settings.g29_handbrake_button.clamp(1, 25);
+    }
     if !matches!(
         settings.output_backend.as_str(),
         "VJoy" | "HIDMaestro" | "None"
@@ -1305,6 +1376,45 @@ mod tests {
         }"#;
         let settings = parse_csharp_settings(json).expect("G29SpoofMode false parses");
         assert!(!settings.g29_spoof_mode);
+    }
+
+    #[test]
+    fn parses_g29_pedal_layout_and_handbrake_button_when_present() {
+        // G29 settings (v2.0.17): PascalCase keys normalize like the
+        // rest; absent in old settings → layout default, button 8.
+        let settings = parse_csharp_settings(SAMPLE_SETTINGS_JSON).expect("sample settings parse");
+        assert_eq!(settings.g29_pedal_layout, "hidmaestro");
+        assert_eq!(settings.g29_handbrake_button, 8);
+        let json = r#"{
+          "G29PedalLayout": "pcgamingwiki",
+          "G29HandbrakeButton": 12
+        }"#;
+        let settings = parse_csharp_settings(json).expect("G29 settings parse");
+        assert_eq!(settings.g29_pedal_layout, "pcgamingwiki");
+        assert_eq!(settings.g29_handbrake_button, 12);
+    }
+
+    #[test]
+    fn sanitizes_g29_settings_to_defaults() {
+        // G29 settings (v2.0.17): unknown layout → default; 0 → 8;
+        // out of range clamps to the 25-button G29 range; the
+        // canonical layout spelling survives sanitize.
+        let json = r#"{
+          "G29PedalLayout": "Banana",
+          "G29HandbrakeButton": 0
+        }"#;
+        let settings = parse_csharp_settings(json).expect("bad G29 settings parse");
+        assert_eq!(settings.g29_pedal_layout, "hidmaestro");
+        assert_eq!(settings.g29_handbrake_button, 8);
+        let json = r#"{
+          "G29PedalLayout": "PCGamingWiki",
+          "G29HandbrakeButton": 99
+        }"#;
+        let settings = parse_csharp_settings(json).expect("clamped G29 settings parse");
+        assert_eq!(settings.g29_pedal_layout, "pcgamingwiki");
+        assert_eq!(settings.g29_handbrake_button, 25);
+        assert_eq!(canonical_g29_pedal_layout("HIDMAESTRO"), Some("hidmaestro"));
+        assert_eq!(canonical_g29_pedal_layout("nope"), None);
     }
 
     #[test]

@@ -917,6 +917,52 @@ pub trait AppApi: Send + Sync {
         ))
     }
 
+    /// G29 pedal layout (v2.0.17): `"hidmaestro"` (default; Z =
+    /// accelerator, Rz = brake, Y = clutch) or `"pcgamingwiki"` (Y
+    /// = accelerator, Rz = brake, Z = clutch). Default:
+    /// `"hidmaestro"` — only the daemon overrides it.
+    fn g29_pedal_layout(&self) -> String {
+        "hidmaestro".to_string()
+    }
+
+    /// Set the G29 pedal layout; returns the stored value. Applied
+    /// live to a connected `HIDMaestro` backend (next tick) and at
+    /// connect/recreate time from the persisted setting.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the layout is unknown or the setting
+    /// cannot be persisted.
+    fn set_g29_pedal_layout(&self, _layout: &str) -> Result<String, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "G29 pedal layout is not supported by this API",
+        ))
+    }
+
+    /// G29 handbrake button (v2.0.17): which G29 button (1–25)
+    /// the handbrake drives. Default: 8 — only the daemon
+    /// overrides it.
+    fn g29_handbrake_button(&self) -> u32 {
+        8
+    }
+
+    /// Set the G29 handbrake button; returns the stored value.
+    /// Applied live to a connected `HIDMaestro` backend (next
+    /// tick) and at connect/recreate time from the persisted
+    /// setting.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the button is outside 1–25 or the
+    /// setting cannot be persisted.
+    fn set_g29_handbrake_button(&self, _button: u32) -> Result<u32, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "G29 handbrake button is not supported by this API",
+        ))
+    }
+
     /// Current tuning for one module (stored value, or the neutral
     /// default when nothing is stored).
     fn get_tuning(&self, module: &str) -> TuningSettings;
@@ -1679,7 +1725,7 @@ mod tests {
     /// Slint default copy too.
     #[test]
     fn app_version_matches_release_tag() {
-        assert_eq!(app_version(), "2.0.16");
+        assert_eq!(app_version(), "2.0.17");
     }
 
     /// L-4: a stub whose state flips between two reads — the
