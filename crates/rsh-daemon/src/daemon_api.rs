@@ -994,19 +994,50 @@ impl AppApi for DaemonApi {
             .state
             .set_g29_spoof_mode(enabled)
             .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))?;
-        if enabled && was_connected && !self.state.output_state().connected {
-            // Recreate failed: roll the persisted flag back, like
-            // `set_steam_fh4_mode` does for a failed registry write
-            // — Settings must not show ON with the custom profile
-            // still live (and disconnected). The backend's own status
-            // carries the failure reason for the Output page.
-            let _ = self.state.set_g29_spoof_mode(false);
+        if was_connected && !self.state.output_state().connected {
+            // Recreate failed: the backend is disconnected after the
+            // toggle. On ENABLE the persisted flag is rolled back,
+            // like `set_steam_fh4_mode` does for a failed registry
+            // write — Settings must not show ON with the custom
+            // profile still live (and disconnected). On DISABLE
+            // (Bug 2, v2.0.17) the flag is already stored off, so no
+            // rollback is needed — but the failure must still surface
+            // instead of returning Ok with a dead backend. The
+            // backend's own status carries the failure reason for the
+            // Output page.
+            if enabled {
+                let _ = self.state.set_g29_spoof_mode(false);
+                return Err(UserError::from_connection(
+                    ConnectionError::Unknown,
+                    "G29 spoof could not recreate the HIDMaestro controller with the G29 profile — the backend is disconnected; the mode was left off.",
+                ));
+            }
             return Err(UserError::from_connection(
                 ConnectionError::Unknown,
-                "G29 spoof could not recreate the HIDMaestro controller with the G29 profile — the backend is disconnected; the mode was left off.",
+                "G29 spoof could not recreate the HIDMaestro controller with the custom profile — the backend is disconnected; the mode was left off.",
             ));
         }
         Ok(stored)
+    }
+
+    fn g29_pedal_layout(&self) -> String {
+        self.state.g29_pedal_layout()
+    }
+
+    fn set_g29_pedal_layout(&self, layout: &str) -> Result<String, UserError> {
+        self.state
+            .set_g29_pedal_layout(layout)
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
+    }
+
+    fn g29_handbrake_button(&self) -> u32 {
+        self.state.g29_handbrake_button()
+    }
+
+    fn set_g29_handbrake_button(&self, button: u32) -> Result<u32, UserError> {
+        self.state
+            .set_g29_handbrake_button(button)
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
     }
 
     fn output_backend(&self) -> String {
@@ -1551,6 +1582,9 @@ pub fn connection_changed_event(api: &DaemonApi) -> AppEvent {
 mod tests {
     use super::*;
 
+    use rsh_app_core::system::NullSink;
+    use rsh_output::{BackendFactories, IJoystickOutput, ProcessedState, VJoyError};
+
     fn temp_dir(name: &str) -> std::path::PathBuf {
         // Unique per call: several tests share `live_api()` and
         // used to wipe the SAME dir (`remove_dir_all` in here)
@@ -1650,6 +1684,162 @@ mod tests {
         assert!(!g29_spoof_enable_allowed("NullSink"));
         assert!(!g29_spoof_enable_allowed("None"));
         assert!(!g29_spoof_enable_allowed("something-unknown"));
+    }
+
+    /// Test-only `HIDMaestro` stand-in (Bug 2, v2.0.17): models the
+    /// real `HidMaestroOutput::set_g29_spoof_mode` restart — a mode
+    /// change while connected disconnects, records the flag, and
+    /// reconnects; a reconnect that fails (flipped on with
+    /// `set_fail_connect`) leaves it disconnected. All clones share
+    /// the one state, so the factory can hand out a fresh box per
+    /// build and the test still observes the installed instance.
+    #[derive(Clone)]
+    struct FailingG29Backend {
+        connected: Arc<Mutex<bool>>,
+        g29_spoof: Arc<Mutex<bool>>,
+        fail_connect: Arc<AtomicBool>,
+    }
+
+    impl FailingG29Backend {
+        fn new() -> Self {
+            Self {
+                connected: Arc::new(Mutex::new(false)),
+                g29_spoof: Arc::new(Mutex::new(false)),
+                fail_connect: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn set_fail_connect(&self, fail: bool) {
+            self.fail_connect.store(fail, Ordering::SeqCst);
+        }
+
+        fn factories(&self) -> BackendFactories {
+            let hidmaestro = self.clone();
+            BackendFactories {
+                hidmaestro: Some(Box::new(move || {
+                    Box::new(hidmaestro.clone()) as Box<dyn IJoystickOutput>
+                })),
+                vjoy: None,
+                none: Box::new(|| Box::new(NullSink) as Box<dyn IJoystickOutput>),
+            }
+        }
+    }
+
+    impl IJoystickOutput for FailingG29Backend {
+        fn name(&self) -> &'static str {
+            "HIDMaestro"
+        }
+
+        fn is_connected(&self) -> bool {
+            *self.connected.lock().expect("connected lock poisoned")
+        }
+
+        fn try_connect(&mut self) -> Result<(), VJoyError> {
+            if self.fail_connect.load(Ordering::SeqCst) {
+                return Err(VJoyError::DriverNotFound(
+                    "mock sidecar failed to start.".to_string(),
+                ));
+            }
+            *self.connected.lock().expect("connected lock poisoned") = true;
+            Ok(())
+        }
+
+        fn disconnect(&mut self) {
+            *self.connected.lock().expect("connected lock poisoned") = false;
+        }
+
+        fn update(&mut self, _state: &ProcessedState) -> Result<(), VJoyError> {
+            if !self.is_connected() {
+                return Err(VJoyError::NotConnected);
+            }
+            Ok(())
+        }
+
+        fn send_neutral(&mut self) -> Result<(), VJoyError> {
+            Ok(())
+        }
+
+        fn set_g29_spoof_mode(&mut self, enabled: bool) {
+            // Real `HidMaestroOutput` restart semantics: a mode
+            // change while connected disposes + reconnects with the
+            // other profile; a failed reconnect leaves it
+            // disconnected (the daemon reads that as the failure).
+            if enabled == *self.g29_spoof.lock().expect("g29 lock poisoned") {
+                return;
+            }
+            let was_connected = self.is_connected();
+            if was_connected {
+                self.disconnect();
+            }
+            *self.g29_spoof.lock().expect("g29 lock poisoned") = enabled;
+            if was_connected {
+                let _ = self.try_connect();
+            }
+        }
+    }
+
+    /// Bug 2 (v2.0.17): disabling G29 spoof when the recreate fails
+    /// must ERROR, not return Ok with a dead backend. Setup: a
+    /// connected mock `HIDMaestro` whose reconnect fails after the
+    /// mode is on; disable → the daemon sees `was_connected &&
+    /// !connected` and errors, the flag stays off (already stored
+    /// off — no rollback), and the backend stays disconnected.
+    #[test]
+    fn g29_spoof_disable_with_failed_recreate_errors() {
+        let (api, _dir) = live_api();
+        let backend = FailingG29Backend::new();
+        let factories = backend.factories();
+        api.state
+            .set_output_backend_with_factories("HIDMaestro", &factories)
+            .expect("HIDMaestro switch succeeds");
+        assert!(
+            api.state.output_state().connected,
+            "mock HIDMaestro is connected"
+        );
+        assert!(api.set_g29_spoof_mode(true).expect("enable succeeds"));
+        assert!(api.g29_spoof_mode());
+        assert!(
+            api.state.output_state().connected,
+            "enable recreate reconnected"
+        );
+
+        backend.set_fail_connect(true);
+        let err = api
+            .set_g29_spoof_mode(false)
+            .expect_err("disable with a failed recreate must error");
+        assert!(
+            err.detail.as_deref().unwrap_or("").contains("disconnected"),
+            "error names the dead backend: {err:?}"
+        );
+        assert!(!api.g29_spoof_mode(), "flag stays off");
+        assert!(
+            !api.state.output_state().connected,
+            "backend stays disconnected"
+        );
+    }
+
+    /// G29 settings (v2.0.17): pedal layout + handbrake button
+    /// round-trip through the daemon API (persist + getter). The
+    /// test backend is the `NullSink`, so no live push happens.
+    /// Validation errors change nothing.
+    #[test]
+    fn g29_settings_round_trip_through_daemon_api() {
+        let (api, _dir) = live_api();
+        assert_eq!(api.g29_pedal_layout(), "hidmaestro");
+        assert_eq!(api.g29_handbrake_button(), 8);
+        assert_eq!(
+            api.set_g29_pedal_layout("pcgamingwiki")
+                .expect("set layout"),
+            "pcgamingwiki"
+        );
+        assert_eq!(api.g29_pedal_layout(), "pcgamingwiki");
+        assert_eq!(api.set_g29_handbrake_button(12).expect("set button"), 12);
+        assert_eq!(api.g29_handbrake_button(), 12);
+        assert!(api.set_g29_pedal_layout("banana").is_err());
+        assert_eq!(api.g29_pedal_layout(), "pcgamingwiki");
+        assert!(api.set_g29_handbrake_button(0).is_err());
+        assert!(api.set_g29_handbrake_button(26).is_err());
+        assert_eq!(api.g29_handbrake_button(), 12);
     }
 
     /// R2-46: `diag_stats` exports the per-method IPC latency —

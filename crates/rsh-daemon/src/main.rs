@@ -1650,6 +1650,10 @@ impl AppApi for DeferredApi {
     // `starting_error`, like every other forwarded method.
     fwd!(value g29_spoof_mode() -> bool = false);
     fwd!(result set_g29_spoof_mode(enabled: bool) -> bool);
+    fwd!(value g29_pedal_layout() -> String = "hidmaestro".to_string());
+    fwd!(result set_g29_pedal_layout(layout: &str) -> String);
+    fwd!(value g29_handbrake_button() -> u32 = 8);
+    fwd!(result set_g29_handbrake_button(button: u32) -> u32);
     fwd!(result backup_now() -> String);
     fwd!(value list_profiles() -> Vec<ProfileSummary> = Vec::new());
     fwd!(result activate_profile(id: &str) -> String);
@@ -3993,6 +3997,119 @@ mod tests {
         assert!(
             !body.contains("not supported by this API"),
             "the trait default must never surface through the dispatch, got: {body}"
+        );
+    }
+
+    /// G29 settings (v2.0.17) — the EXACT UI call path, end to
+    /// end: Settings → `IpcClient` → IPC dispatch → `DeferredApi`
+    /// → `DaemonApi` → persisted settings. Same shape as the
+    /// spoof-mode test above (the v2.0.15 lesson: a method that is
+    /// never forwarded falls through to the trait default
+    /// forever). Defaults read back, valid writes apply, invalid
+    /// writes error and change nothing — never the trait default.
+    #[test]
+    fn deferred_api_g29_settings_through_ipc_dispatch() {
+        fn call(
+            api: &Arc<dyn AppApi>,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, rsh_ipc::IpcError> {
+            rsh_ipc::dispatch(
+                api,
+                &rsh_ipc::IpcRequest {
+                    v: rsh_ipc::IPC_PROTOCOL_VERSION,
+                    id: 1,
+                    method: method.to_string(),
+                    params,
+                },
+            )
+        }
+
+        let dir = temp_dir("deferred-g29-settings-ipc");
+        let state =
+            Arc::new(AppStateCore::open_with_null_sink(&dir).expect("open state with null sink"));
+        let live = Arc::new(DaemonApi::new(state));
+        let deferred = Arc::new(DeferredApi::new());
+        deferred.install(Arc::clone(&live));
+        let api: Arc<dyn AppApi> = deferred;
+
+        let got = call(&api, "g29_pedal_layout", serde_json::json!({})).expect("g29_pedal_layout");
+        assert_eq!(
+            got.get("g29_pedal_layout")
+                .and_then(serde_json::Value::as_str),
+            Some("hidmaestro"),
+            "default layout must be hidmaestro through the dispatch"
+        );
+        let got = call(&api, "g29_handbrake_button", serde_json::json!({}))
+            .expect("g29_handbrake_button");
+        assert_eq!(
+            got.get("g29_handbrake_button")
+                .and_then(serde_json::Value::as_u64),
+            Some(8),
+            "default handbrake button must be 8 through the dispatch"
+        );
+
+        let applied = call(
+            &api,
+            "set_g29_pedal_layout",
+            serde_json::json!({"layout": "pcgamingwiki"}),
+        )
+        .expect("set_g29_pedal_layout dispatch");
+        assert_eq!(
+            applied
+                .get("g29_pedal_layout")
+                .and_then(serde_json::Value::as_str),
+            Some("pcgamingwiki")
+        );
+        let applied = call(
+            &api,
+            "set_g29_handbrake_button",
+            serde_json::json!({"button": 12}),
+        )
+        .expect("set_g29_handbrake_button dispatch");
+        assert_eq!(
+            applied
+                .get("g29_handbrake_button")
+                .and_then(serde_json::Value::as_u64),
+            Some(12)
+        );
+
+        let err = call(
+            &api,
+            "set_g29_pedal_layout",
+            serde_json::json!({"layout": "banana"}),
+        )
+        .expect_err("unknown layout must be refused through the dispatch");
+        let body = match &err {
+            rsh_ipc::IpcError::Api(body) => body.clone(),
+            other => panic!("expected IpcError::Api, got: {other:?}"),
+        };
+        assert!(
+            !body.contains("not supported by this API"),
+            "the trait default must never surface through the dispatch, got: {body}"
+        );
+        let err = call(
+            &api,
+            "set_g29_handbrake_button",
+            serde_json::json!({"button": 26}),
+        )
+        .expect_err("button 26 must be refused through the dispatch");
+        let body = match &err {
+            rsh_ipc::IpcError::Api(body) => body.clone(),
+            other => panic!("expected IpcError::Api, got: {other:?}"),
+        };
+        assert!(
+            !body.contains("not supported by this API"),
+            "the trait default must never surface through the dispatch, got: {body}"
+        );
+
+        let got = call(&api, "g29_pedal_layout", serde_json::json!({}))
+            .expect("g29_pedal_layout after refused writes");
+        assert_eq!(
+            got.get("g29_pedal_layout")
+                .and_then(serde_json::Value::as_str),
+            Some("pcgamingwiki"),
+            "refused writes must change nothing"
         );
     }
 }

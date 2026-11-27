@@ -182,7 +182,7 @@ use rsh_output::vjoy_config::configure_device_1_envelope_and_mappings;
 use rsh_output::{IJoystickOutput, ProcessedState, VJoyError};
 use rsh_output_hidmaestro::backend::UAC_NOTE;
 use rsh_output_hidmaestro::manager::resolve_sidecar_path;
-use rsh_output_hidmaestro::{HidMaestroConfig, HidMaestroOutput};
+use rsh_output_hidmaestro::{G29PedalMap, HidMaestroConfig, HidMaestroOutput};
 use rsh_profiles::bindings::{BindingError, BindingStore, is_app_action};
 use rsh_profiles::csharp_import::{
     GameId, KNOWN_MODULES, PedalCalibration, PerModuleTuning, SteeringCalibration, WheelProfile,
@@ -3457,7 +3457,12 @@ impl AppStateCore {
     #[must_use]
     pub fn set_output_enabled(&self, enabled: bool) -> CommandOutputState {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
-        let factories = real_backend_factories(vjoy_device_id, self.settings().g29_spoof_mode);
+        let factories = real_backend_factories(
+            vjoy_device_id,
+            self.settings().g29_spoof_mode,
+            &self.settings().g29_pedal_layout,
+            self.settings().g29_handbrake_button,
+        );
         self.set_output_enabled_with_factories(enabled, &factories)
     }
 
@@ -3643,7 +3648,10 @@ impl AppStateCore {
             // connect would be too late (the profile is chosen at
             // create). The handle is extracted (no slot lock held),
             // so a live recreate here cannot stall engine ticks.
-            lock(&backend).set_g29_spoof_mode(self.settings().g29_spoof_mode);
+            // The persisted pedal layout + handbrake button go in
+            // with the mode (v2.0.17), so a (re)connected backend
+            // reports with the current settings from its first tick.
+            Self::push_g29_settings_to_backend(&mut **lock(&backend), &self.settings());
             let connected = lock(&backend).try_connect();
             // P1-1 (v2.0.12 scan): the flag is set from the connect
             // outcome, not from the request — a failed connect
@@ -3748,7 +3756,9 @@ impl AppStateCore {
         // already-connected backend this recreates it when the mode
         // differs (the test-only path holds the handle lock here —
         // the production path extracts the handle first, above).
-        backend.set_g29_spoof_mode(self.settings().g29_spoof_mode);
+        // The persisted pedal layout + handbrake button go in with
+        // the mode (v2.0.17).
+        Self::push_g29_settings_to_backend(&mut **backend, &self.settings());
         match backend.try_connect() {
             Ok(()) => {
                 if kind == Some(BackendKind::HidMaestro) {
@@ -3828,7 +3838,12 @@ impl AppStateCore {
     /// fails, or the requested backend could not connect.
     pub fn set_output_backend(&self, name: &str) -> Result<CommandOutputState, String> {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
-        let factories = real_backend_factories(vjoy_device_id, self.settings().g29_spoof_mode);
+        let factories = real_backend_factories(
+            vjoy_device_id,
+            self.settings().g29_spoof_mode,
+            &self.settings().g29_pedal_layout,
+            self.settings().g29_handbrake_button,
+        );
         self.set_output_backend_with_factories(name, &factories)
     }
 
@@ -4243,7 +4258,12 @@ impl AppStateCore {
     #[must_use]
     pub fn activate_startup_backend(&self) -> StartupBackendOutcome {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
-        let factories = real_backend_factories(vjoy_device_id, self.settings().g29_spoof_mode);
+        let factories = real_backend_factories(
+            vjoy_device_id,
+            self.settings().g29_spoof_mode,
+            &self.settings().g29_pedal_layout,
+            self.settings().g29_handbrake_button,
+        );
         self.activate_startup_backend_with_factories(&factories)
     }
 
@@ -5751,7 +5771,12 @@ impl AppStateCore {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
         self.try_mid_session_fallback_with_factories(
             output,
-            &real_backend_factories(vjoy_device_id, self.settings().g29_spoof_mode),
+            &real_backend_factories(
+                vjoy_device_id,
+                self.settings().g29_spoof_mode,
+                &self.settings().g29_pedal_layout,
+                self.settings().g29_handbrake_button,
+            ),
         )
     }
 
@@ -6323,22 +6348,91 @@ impl AppStateCore {
     /// just records the flag when not — and the handle is swapped
     /// back. A failed recreate leaves the backend disconnected with
     /// the failure in its status; the daemon sees that and rolls the
-    /// persisted flag back.
+    /// persisted flag back. Bug 3 (v2.0.17): the swap-back is
+    /// conditional — the mode apply can dwell minutes on a UAC
+    /// prompt, and if a concurrent switch/fallback installed a newer
+    /// backend meanwhile, the stale handle must be dropped, not
+    /// written back over the newer backend. The token is the
+    /// placeholder's INNER box address, not the slot Arc:
+    /// `apply_backend_switch` extracts the slot Arc and writes the
+    /// SAME Arc back with a different backend inside it, so an
+    /// `Arc::ptr_eq` on the slot would pass even after the slot's
+    /// backend changed (the first version of this guard had exactly
+    /// that hole — the race test caught it). The new backend is
+    /// built before the old box is dropped, so the placeholder's
+    /// address cannot be recycled into the new backend. The two
+    /// checks (inner box, then Arc under the slot lock) are not
+    /// atomic — a switch landing between them is a microseconds
+    /// window, vs the minutes-long UAC dwell this guards; the slot
+    /// lock is never held across a handle lock in this codebase
+    /// (R2-09), so the check cannot be made atomic here.
     fn recreate_live_backend_for_g29(&self, enabled: bool) {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
-        let factories = real_backend_factories(vjoy_device_id, enabled);
+        // Only the `None` placeholder is built from these factories
+        // here — the extracted live backend is reused, so its pedal
+        // map / handbrake button come from the live push (see
+        // `push_g29_pedal_layout_to_backend` /
+        // `push_g29_handbrake_button_to_backend`), not from a fresh
+        // build. Fresh builds (connect, backend switch) read the
+        // current settings through `real_backend_factories`.
+        let factories = real_backend_factories(
+            vjoy_device_id,
+            enabled,
+            &self.settings().g29_pedal_layout,
+            self.settings().g29_handbrake_button,
+        );
         if let Some(placeholder) = factories.build(BackendKind::None) {
+            // Capture the placeholder's identity BEFORE installing
+            // it: the `Box` itself does not move when it is placed
+            // in the `Arc<Mutex<…>>`, so this address names the
+            // placeholder instance for the rest of the call. The
+            // address is only ever COMPARED (`ptr::eq` — never
+            // dereferenced), so it stays a valid token even after
+            // a concurrent switch drops the box.
+            let placeholder_ptr = {
+                let raw: &dyn IJoystickOutput = &*placeholder;
+                std::ptr::from_ref(raw)
+            };
+            let placeholder_handle = Arc::new(Mutex::new(placeholder));
             let handle = {
                 let mut slot = lock(&self.backend);
-                std::mem::replace(&mut *slot, Arc::new(Mutex::new(placeholder)))
+                std::mem::replace(&mut *slot, Arc::clone(&placeholder_handle))
             };
             lock(&handle).set_g29_spoof_mode(enabled);
-            *lock(&self.backend) = handle;
+            // Only swap back while the slot still holds OUR
+            // placeholder instance (same inner box): a concurrent
+            // switch installed a newer backend, and a blind
+            // write-back would overwrite + drop it. Dropping the
+            // stale handle here keeps the newer backend live.
+            let slot_handle = lock(&self.backend).clone();
+            let still_placeholder = {
+                let current = lock(&slot_handle);
+                std::ptr::eq(std::ptr::from_ref(&**current), placeholder_ptr)
+            };
+            if still_placeholder {
+                let mut slot = lock(&self.backend);
+                if Arc::ptr_eq(&*slot, &placeholder_handle) {
+                    *slot = handle;
+                }
+            }
         } else {
             // No sink factory (test-only path): push on the live
             // handle directly — test backends are no-ops here.
             self.push_g29_spoof_mode_to_backend();
         }
+    }
+
+    /// Push the persisted G29 mode + pedal layout + handbrake
+    /// button into a backend (v2.0.17) — the connect paths call
+    /// this BEFORE connect, so a fresh instance creates the right
+    /// profile and reports with the current settings from its first
+    /// tick. The mode push can recreate an already-connected
+    /// backend (see `set_g29_spoof_mode`); the layout/button pushes
+    /// are live field updates (next tick, no restart).
+    fn push_g29_settings_to_backend(backend: &mut dyn IJoystickOutput, settings: &AppSettings) {
+        backend.set_g29_spoof_mode(settings.g29_spoof_mode);
+        backend.set_g29_pedal_layout(&settings.g29_pedal_layout);
+        backend.set_g29_handbrake_button(u8::try_from(settings.g29_handbrake_button).unwrap_or(8));
     }
 
     /// Push the persisted G29 spoof mode into the live backend
@@ -6352,6 +6446,93 @@ impl AppStateCore {
         let enabled = self.settings().g29_spoof_mode;
         let handle = self.backend_handle();
         lock(&handle).set_g29_spoof_mode(enabled);
+    }
+
+    /// G29 pedal layout (v2.0.17): the persisted
+    /// `g29_pedal_layout` setting (`"hidmaestro"` default |
+    /// `"pcgamingwiki"`).
+    #[must_use]
+    pub fn g29_pedal_layout(&self) -> String {
+        self.settings().g29_pedal_layout
+    }
+
+    /// Persist the G29 pedal layout (v2.0.17) and push it live to
+    /// a `HIDMaestro` backend, so the next tick already reports
+    /// with the new map — no restart, no recreate. A disconnected
+    /// backend just records the setting (its next connect builds /
+    /// pushes with it). Returns the stored value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the layout is unknown or the
+    /// settings save fails.
+    pub fn set_g29_pedal_layout(self: &Arc<Self>, layout: &str) -> Result<String, String> {
+        let layout =
+            rsh_profiles::csharp_import::canonical_g29_pedal_layout(layout).ok_or_else(|| {
+                format!("unknown G29 pedal layout '{layout}' (expected hidmaestro or pcgamingwiki)")
+            })?;
+        let merged = self.set_settings_patch(AppSettingsPatch {
+            g29_pedal_layout: Some(layout.to_string()),
+            ..Default::default()
+        })?;
+        // Only a HIDMaestro live backend has a G29 map to push to
+        // (other backends ignore the trait default no-op, but the
+        // name check keeps the intent explicit — same guard as the
+        // spoof-mode recreate).
+        if self.backend_name() == "HIDMaestro" {
+            self.push_g29_pedal_layout_to_backend();
+        }
+        Ok(merged.g29_pedal_layout)
+    }
+
+    /// Push the persisted G29 pedal layout into the live backend
+    /// (v2.0.17). Non-HID backends ignore it (trait default
+    /// no-op). Never call while the backend handle's own lock is
+    /// already held.
+    fn push_g29_pedal_layout_to_backend(&self) {
+        let layout = self.settings().g29_pedal_layout;
+        let handle = self.backend_handle();
+        lock(&handle).set_g29_pedal_layout(&layout);
+    }
+
+    /// G29 handbrake button (v2.0.17): the persisted
+    /// `g29_handbrake_button` setting (1–25, default 8).
+    #[must_use]
+    pub fn g29_handbrake_button(&self) -> u32 {
+        self.settings().g29_handbrake_button
+    }
+
+    /// Persist the G29 handbrake button (v2.0.17) and push it live
+    /// to a `HIDMaestro` backend, so the next tick already drives
+    /// the new button — no restart, no recreate. A disconnected
+    /// backend just records the setting. Returns the stored value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the button is outside 1–25 or the
+    /// settings save fails.
+    pub fn set_g29_handbrake_button(self: &Arc<Self>, button: u32) -> Result<u32, String> {
+        if !(1..=25).contains(&button) {
+            return Err(format!("G29 handbrake button must be 1..=25, got {button}"));
+        }
+        let merged = self.set_settings_patch(AppSettingsPatch {
+            g29_handbrake_button: Some(button),
+            ..Default::default()
+        })?;
+        if self.backend_name() == "HIDMaestro" {
+            self.push_g29_handbrake_button_to_backend();
+        }
+        Ok(merged.g29_handbrake_button)
+    }
+
+    /// Push the persisted G29 handbrake button into the live
+    /// backend (v2.0.17). Non-HID backends ignore it (trait
+    /// default no-op). Never call while the backend handle's own
+    /// lock is already held.
+    fn push_g29_handbrake_button_to_backend(&self) {
+        let button = u8::try_from(self.settings().g29_handbrake_button).unwrap_or(8);
+        let handle = self.backend_handle();
+        lock(&handle).set_g29_handbrake_button(button);
     }
 
     /// Restore the newest present profiles backup (M7): `bak1` first,
@@ -8659,11 +8840,24 @@ fn run_vjoy_install_inner() -> Result<(), String> {
 /// profile when it is on (see `HidMaestroConfig::g29_spoof`) — the
 /// live toggle path recreates the installed instance instead, so the
 /// two paths never disagree about which profile is live.
-fn real_backend_factories(vjoy_device_id: u32, g29_spoof: bool) -> BackendFactories {
+fn real_backend_factories(
+    vjoy_device_id: u32,
+    g29_spoof: bool,
+    g29_pedal_layout: &str,
+    g29_handbrake_button: u32,
+) -> BackendFactories {
+    let g29_pedal_map = G29PedalMap::from_layout(g29_pedal_layout).unwrap_or(G29PedalMap::PROFILE);
+    // Settings sanitize clamps to 1–25; the clamp here is the
+    // backstop for a hand-built value, and the `u8` cast cannot
+    // fail after it.
+    let g29_handbrake_button = u8::try_from(g29_handbrake_button.clamp(1, 25)).unwrap_or(8);
     BackendFactories {
         hidmaestro: Some(Box::new(move || {
             Box::new(HidMaestroOutput::with_config(
-                HidMaestroConfig::default().with_g29_spoof(g29_spoof),
+                HidMaestroConfig::default()
+                    .with_g29_spoof(g29_spoof)
+                    .with_g29_pedal_map(g29_pedal_map)
+                    .with_g29_handbrake_button(g29_handbrake_button),
             )) as Box<dyn IJoystickOutput>
         })),
         vjoy: Some(Box::new(move || {
@@ -10680,6 +10874,20 @@ mod tests {
         /// Reported by `name()`; the failover test needs a backend
         /// that reports `"HIDMaestro"` / `"vJoy"`.
         name: &'static str,
+        /// Recorded `G29` mode (Bug 3, v2.0.17): the mock now models
+        /// the real `HidMaestroOutput::set_g29_spoof_mode` restart
+        /// (disconnect + reconnect on a mode change while
+        /// connected), so G29 toggle tests see a real recreate.
+        g29_spoof: Arc<Mutex<bool>>,
+        /// Optional block hook for the G29 recreate race test (Bug
+        /// 3, v2.0.17): when armed, `set_g29_spoof_mode` signals
+        /// `entered` and waits on `release` (bounded), so the test
+        /// can run a concurrent backend switch mid-recreate.
+        g29_block: Arc<Mutex<Option<(FlagPair, FlagPair)>>>,
+        /// Last G29 pedal layout pushed to this mock (v2.0.17).
+        g29_pedal_layout: Arc<Mutex<String>>,
+        /// Last G29 handbrake button pushed to this mock (v2.0.17).
+        g29_handbrake_button: Arc<Mutex<u8>>,
     }
 
     impl RecordingBackend {
@@ -10708,6 +10916,10 @@ mod tests {
                     fail_connect_message: Arc::new(Mutex::new("mock connect failed".to_string())),
                     latched: Arc::new(Mutex::new(false)),
                     name,
+                    g29_spoof: Arc::new(Mutex::new(false)),
+                    g29_block: Arc::new(Mutex::new(None)),
+                    g29_pedal_layout: Arc::new(Mutex::new("hidmaestro".to_string())),
+                    g29_handbrake_button: Arc::new(Mutex::new(8)),
                 },
                 sent,
                 fail,
@@ -10743,6 +10955,29 @@ mod tests {
         /// automatic re-attempt).
         fn is_latched(&self) -> bool {
             *self.latched.lock().expect("latched lock poisoned")
+        }
+
+        /// Arms the G29 block hook (Bug 3, v2.0.17): the next
+        /// `set_g29_spoof_mode` signals `entered` and waits on
+        /// `release`, so the test can switch backends mid-recreate.
+        fn arm_g29_block(&self, entered: FlagPair, release: FlagPair) {
+            *self.g29_block.lock().expect("g29_block lock poisoned") = Some((entered, release));
+        }
+
+        /// Last G29 pedal layout pushed to this mock (v2.0.17).
+        fn g29_pedal_layout(&self) -> String {
+            self.g29_pedal_layout
+                .lock()
+                .expect("g29_pedal_layout lock poisoned")
+                .clone()
+        }
+
+        /// Last G29 handbrake button pushed to this mock (v2.0.17).
+        fn g29_handbrake_button(&self) -> u8 {
+            *self
+                .g29_handbrake_button
+                .lock()
+                .expect("g29_handbrake_button lock poisoned")
         }
     }
 
@@ -10813,6 +11048,59 @@ mod tests {
                 .expect("sent lock poisoned")
                 .push(PipelineOutputState::neutral());
             Ok(())
+        }
+
+        /// G29 restart semantics (Bug 3, v2.0.17): models the real
+        /// `HidMaestroOutput::set_g29_spoof_mode` — a mode change
+        /// while connected disconnects, records the flag, and
+        /// reconnects (a failing reconnect leaves it disconnected,
+        /// which is how the daemon detects a failed recreate); a
+        /// disconnected backend just records the flag. When the
+        /// block hook is armed, the mode apply first signals
+        /// `entered` and waits on `release` (bounded, so a test
+        /// that never releases fails instead of hanging).
+        fn set_g29_spoof_mode(&mut self, enabled: bool) {
+            if let Some((entered, release)) = self
+                .g29_block
+                .lock()
+                .expect("g29_block lock poisoned")
+                .clone()
+            {
+                BlockingBackend::set_flag(&entered);
+                assert!(
+                    BlockingBackend::wait_flag(&release, Duration::from_secs(10)),
+                    "g29 block release timed out — the race test never released the recreate"
+                );
+            }
+            if enabled == *self.g29_spoof.lock().expect("g29_spoof lock poisoned") {
+                return;
+            }
+            let was_connected = self.is_connected();
+            if was_connected {
+                self.disconnect();
+            }
+            *self.g29_spoof.lock().expect("g29_spoof lock poisoned") = enabled;
+            if was_connected {
+                let _ = self.try_connect();
+            }
+        }
+
+        /// Records the pushed layout (v2.0.17): the mock has no map
+        /// to apply, so the recorded value IS the assertion surface
+        /// for the core setter push.
+        fn set_g29_pedal_layout(&mut self, layout: &str) {
+            *self
+                .g29_pedal_layout
+                .lock()
+                .expect("g29_pedal_layout lock poisoned") = layout.to_string();
+        }
+
+        /// Records the pushed handbrake button (v2.0.17).
+        fn set_g29_handbrake_button(&mut self, button: u8) {
+            *self
+                .g29_handbrake_button
+                .lock()
+                .expect("g29_handbrake_button lock poisoned") = button;
         }
     }
 
@@ -11047,6 +11335,142 @@ mod tests {
         assert!(state.settings().g29_spoof_mode);
         assert!(!state.set_g29_spoof_mode(false).expect("persist off"));
         assert!(!state.g29_spoof_mode());
+    }
+
+    /// G29 settings (v2.0.17): defaults are the `HIDMaestro`
+    /// layout and button 8, and both round-trip through
+    /// settings.json. The test backend is the `NullSink` (not
+    /// `HIDMaestro`), so no live push happens — the persist itself
+    /// is what this asserts. Validation errors change nothing.
+    #[test]
+    fn g29_settings_default_and_persist() {
+        let (state, _dir) = test_state();
+        assert_eq!(state.g29_pedal_layout(), "hidmaestro");
+        assert_eq!(state.g29_handbrake_button(), 8);
+        assert_eq!(state.settings().g29_pedal_layout, "hidmaestro");
+        assert_eq!(state.settings().g29_handbrake_button, 8);
+        assert_eq!(
+            state
+                .set_g29_pedal_layout("pcgamingwiki")
+                .expect("persist layout"),
+            "pcgamingwiki"
+        );
+        assert_eq!(state.g29_pedal_layout(), "pcgamingwiki");
+        assert_eq!(
+            state.set_g29_handbrake_button(12).expect("persist button"),
+            12
+        );
+        assert_eq!(state.g29_handbrake_button(), 12);
+        assert!(state.set_g29_pedal_layout("banana").is_err());
+        assert_eq!(state.g29_pedal_layout(), "pcgamingwiki");
+        assert!(state.set_g29_handbrake_button(0).is_err());
+        assert!(state.set_g29_handbrake_button(26).is_err());
+        assert_eq!(state.g29_handbrake_button(), 12);
+    }
+
+    /// G29 settings (v2.0.17): on a live `HIDMaestro` backend the
+    /// setters push the new values at once (next tick), so no
+    /// restart is needed for a layout/button change.
+    #[test]
+    fn g29_settings_push_live_to_hidmaestro_backend() {
+        let (factories, hm) = hidmaestro_mock_factories();
+        let (state, _dir) = test_state();
+        state
+            .set_output_backend_with_factories("HIDMaestro", &factories)
+            .expect("HIDMaestro switch succeeds");
+        assert!(state.output_state().connected);
+        assert_eq!(hm.g29_pedal_layout(), "hidmaestro");
+        assert_eq!(hm.g29_handbrake_button(), 8);
+        assert_eq!(
+            state
+                .set_g29_pedal_layout("pcgamingwiki")
+                .expect("set layout"),
+            "pcgamingwiki"
+        );
+        assert_eq!(hm.g29_pedal_layout(), "pcgamingwiki");
+        assert_eq!(state.set_g29_handbrake_button(12).expect("set button"), 12);
+        assert_eq!(hm.g29_handbrake_button(), 12);
+    }
+
+    /// Bug 3 (v2.0.17): a backend switch that lands WHILE a G29
+    /// recreate is mid-flight (blocked here in the mock's
+    /// `set_g29_spoof_mode`, modelling the minutes-long UAC dwell)
+    /// must survive the recreate — the stale handle is dropped,
+    /// not written back over the newer backend. The mock's block
+    /// hook is the closest faithful equivalent of the real race:
+    /// the mock cannot itself swap the slot (it holds no state
+    /// reference), so the test thread drives the recreate while
+    /// the main thread performs the concurrent switch, exactly as
+    /// a second user switch / fallback would. What it proves: the
+    /// inner-box guard keeps the newer backend — and it caught the
+    /// first guard version, which compared only the slot `Arc`
+    /// (`Arc::ptr_eq`): the switch path recycles the extracted Arc
+    /// and writes it back with the new backend inside, so the Arc
+    /// check passed while the backend had changed. What it does
+    /// NOT prove: a real UAC dwell (no sidecar here), a fallback
+    /// racing from the engine thread, or a switch landing in the
+    /// microseconds between the guard's two checks (see the
+    /// `recreate_live_backend_for_g29` docs).
+    #[test]
+    fn g29_recreate_keeps_newer_backend_after_concurrent_switch() {
+        let (hm, _hm_sent, _hm_fail) = RecordingBackend::new_named("HIDMaestro");
+        let (vj, _vj_sent, _vj_fail) = RecordingBackend::new_named("vJoy");
+        let hm_factory = hm.clone();
+        let vj_factory = vj.clone();
+        let factories = BackendFactories {
+            hidmaestro: Some(Box::new(move || {
+                Box::new(hm_factory.clone()) as Box<dyn IJoystickOutput>
+            })),
+            vjoy: Some(Box::new(move || {
+                Box::new(vj_factory.clone()) as Box<dyn IJoystickOutput>
+            })),
+            none: Box::new(|| Box::new(NullSink) as Box<dyn IJoystickOutput>),
+        };
+        let (state, _dir) = test_state();
+        state
+            .set_output_backend_with_factories("HIDMaestro", &factories)
+            .expect("HIDMaestro switch succeeds");
+        assert!(state.output_state().connected);
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        hm.arm_g29_block(Arc::clone(&entered), Arc::clone(&release));
+        let state_for_thread = Arc::clone(&state);
+        let toggled = std::thread::spawn(move || state_for_thread.set_g29_spoof_mode(true));
+        assert!(
+            BlockingBackend::wait_flag(&entered, Duration::from_secs(10)),
+            "recreate entered the mock G29 apply"
+        );
+        // Concurrent switch mid-recreate (a second user switch /
+        // fallback during the UAC dwell).
+        state
+            .set_output_backend_with_factories("vJoy", &factories)
+            .expect("concurrent vJoy switch succeeds");
+        assert_eq!(state.backend_name(), "vJoy");
+        assert!(state.output_state().connected, "vJoy is connected");
+        let vjoy_handle = state.backend_handle();
+        BlockingBackend::set_flag(&release);
+        let stored = toggled
+            .join()
+            .expect("toggle thread joins")
+            .expect("toggle persists");
+        assert!(stored, "the toggle itself still persists on");
+        assert_eq!(
+            state.backend_name(),
+            "vJoy",
+            "stale HIDMaestro handle must not overwrite the newer vJoy backend"
+        );
+        // `backend_name()` is a separate string — the slot itself
+        // must hold the vJoy backend, not just report its name.
+        let live = state.backend_handle();
+        assert_eq!(
+            lock(&live).name(),
+            "vJoy",
+            "the slot's live backend is vJoy, not the stale HIDMaestro handle"
+        );
+        assert!(
+            Arc::ptr_eq(&state.backend_handle(), &vjoy_handle),
+            "the slot still holds the newer vJoy handle"
+        );
     }
 
     #[test]

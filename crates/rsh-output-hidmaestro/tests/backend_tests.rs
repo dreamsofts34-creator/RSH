@@ -496,6 +496,33 @@ fn g29_toggle_is_noop_when_already_in_that_mode() {
 }
 
 #[test]
+fn g29_pedal_layout_and_handbrake_button_from_config_and_live_push() {
+    use rsh_output::IJoystickOutput;
+    use rsh_output_hidmaestro::G29PedalMap;
+    // v2.0.17: config seeds the live map/button (via the
+    // builders the app-core factory uses); the trait pushes
+    // change them live (next tick, no restart).
+    let cfg = config(&[])
+        .with_g29_spoof(true)
+        .with_g29_pedal_map(G29PedalMap::ACCEL_CLUTCH_SWAPPED)
+        .with_g29_handbrake_button(12);
+    let mut b = HidMaestroOutput::with_config(cfg);
+    assert_eq!(b.g29_pedal_map(), G29PedalMap::ACCEL_CLUTCH_SWAPPED);
+    assert_eq!(b.g29_handbrake_button(), 12);
+    b.set_g29_pedal_layout("hidmaestro");
+    assert_eq!(b.g29_pedal_map(), G29PedalMap::PROFILE);
+    b.set_g29_handbrake_button(8);
+    assert_eq!(b.g29_handbrake_button(), 8);
+    // Unknown layout keeps the current map; out-of-range button clamps.
+    b.set_g29_pedal_layout("banana");
+    assert_eq!(b.g29_pedal_map(), G29PedalMap::PROFILE);
+    b.set_g29_handbrake_button(0);
+    assert_eq!(b.g29_handbrake_button(), 1);
+    b.set_g29_handbrake_button(255);
+    assert_eq!(b.g29_handbrake_button(), 25);
+}
+
+#[test]
 fn g29_plan_validation_allows_handbrake_without_slider() {
     use rsh_engine::pipeline::PipelinePlan;
     let mut b = g29_backend(&[]);

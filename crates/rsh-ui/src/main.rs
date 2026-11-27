@@ -1350,6 +1350,23 @@ fn set_if_changed<T: PartialEq>(current: T, next: T, set: impl FnOnce(T)) {
     }
 }
 
+/// Canonical G29 pedal layout (v2.0.17): only "pcgamingwiki" is
+/// kept — anything else (including an old or unknown stored
+/// value) falls back to the "hidmaestro" default, so the radios
+/// never show neither option selected.
+fn normalize_g29_pedal_layout(layout: &str) -> &'static str {
+    if layout == "pcgamingwiki" {
+        "pcgamingwiki"
+    } else {
+        "hidmaestro"
+    }
+}
+
+/// Clamp the G29 handbrake button to its 1–25 range (v2.0.17).
+fn clamp_g29_handbrake_button(button: i32) -> i32 {
+    button.clamp(1, 25)
+}
+
 /// Background-job completions (A9/B5): a job thread sends exactly one
 /// of these on `job_tx`; the frame timer drains them on the UI thread
 /// and applies the result (notify / revert / re-sync). The payloads
@@ -2507,6 +2524,8 @@ impl Ctx {
         self.sync_keep_in_tray(win);
         self.sync_steam_fh4_mode(win);
         self.sync_g29_spoof_mode(win);
+        self.sync_g29_pedal_layout(win);
+        self.sync_g29_handbrake_button(win);
         self.sync_vjoy(win);
     }
 
@@ -4092,6 +4111,43 @@ impl Ctx {
         });
     }
 
+    /// Seed the G29 pedal layout from the API: change-guarded,
+    /// like [`Self::sync_g29_spoof_mode`] — the 1 Hz
+    /// `resync_from_cache` keeps it honest when the daemon-side
+    /// value moves. Skipped while a `SettingsOp` job is in flight,
+    /// so an unrelated generation bump cannot revert the
+    /// optimistic pick before the change job answers (the job's
+    /// own apply, or the timeout path below, owns the revert).
+    /// The sim's trait default is "hidmaestro".
+    fn sync_g29_pedal_layout(&self, win: &MainWindow) {
+        if self.busy_jobs.borrow().contains_key(&JobKind::SettingsOp) {
+            return;
+        }
+        let layout = normalize_g29_pedal_layout(&self.api().g29_pedal_layout());
+        set_if_changed(
+            win.get_g29_pedal_layout().to_string(),
+            layout.to_string(),
+            |v| win.set_g29_pedal_layout(v.into()),
+        );
+    }
+
+    /// Seed the G29 handbrake button from the API: change-guarded,
+    /// like [`Self::sync_g29_spoof_mode`]. The API carries a
+    /// `u32`; the window prop is a Slint `int` (`i32`), so the
+    /// value crosses with a fall-back-to-8 conversion. The sim's
+    /// trait default is 8.
+    fn sync_g29_handbrake_button(&self, win: &MainWindow) {
+        if self.busy_jobs.borrow().contains_key(&JobKind::SettingsOp) {
+            return;
+        }
+        let button = clamp_g29_handbrake_button(
+            i32::try_from(self.api().g29_handbrake_button()).unwrap_or(8),
+        );
+        set_if_changed(win.get_g29_handbrake_button(), button, |v| {
+            win.set_g29_handbrake_button(v);
+        });
+    }
+
     /// Start a background job (A9/B5): the work runs on its own
     /// thread — the UI thread never blocks on IPC, a spawn, or a
     /// flash. The busy label is recorded immediately (feedback in
@@ -4757,6 +4813,11 @@ impl Ctx {
                 // toggle above — a timed-out toggle reverts to the
                 // cached (pre-toggle) value.
                 self.sync_g29_spoof_mode(win);
+                // G29 pedal layout + handbrake button: same revert
+                // as the toggle above — a timed-out change reverts
+                // to the cached value.
+                self.sync_g29_pedal_layout(win);
+                self.sync_g29_handbrake_button(win);
             }
             // R2-18: a timed-out tuning push reverts its slider to
             // the stored value — the UI must not keep showing a
@@ -5804,6 +5865,113 @@ impl Ctx {
         );
     }
 
+    /// Apply a G29 pedal layout change, mirroring
+    /// [`Self::apply_g29_spoof_mode`]: a `SettingsOp` job (10 s
+    /// bound, busy strip = loading state, timeout reverts via
+    /// `check_job_timeouts`), so the radios are disabled while any
+    /// `SettingsOp` runs and a duplicate start cannot leave a
+    /// pick with no apply. Success confirms the authoritative
+    /// value and toasts it; failure re-syncs from the daemon
+    /// (the source of truth — the radios must not keep showing a
+    /// layout the daemon never stored) and explains. The daemon
+    /// recreates the live HID backend with the new map when
+    /// connected; while disconnected the change applies when the
+    /// HID backend connects (the Bug 4 note above the radios
+    /// says so).
+    fn apply_g29_pedal_layout(&self, win: &MainWindow, layout: &str) {
+        let layout = normalize_g29_pedal_layout(layout).to_string();
+        self.run_generic_job(
+            win,
+            JobKind::SettingsOp,
+            "Saving…",
+            move |api| JobResult::Text(api.set_g29_pedal_layout(&layout)),
+            move |ctx, w, result| {
+                let JobResult::Text(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(new_layout) => {
+                        let new_layout = normalize_g29_pedal_layout(&new_layout);
+                        w.set_g29_pedal_layout(new_layout.into());
+                        ctx.notify_success(
+                            w,
+                            "Settings",
+                            "Pedal layout saved",
+                            if new_layout == "pcgamingwiki" {
+                                "PCGamingWiki layout: Y accel · Rz brake · Z clutch."
+                            } else {
+                                "HIDMaestro layout: Z accel · Rz brake · Y clutch."
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        ctx.sync_g29_pedal_layout(w);
+                        ctx.notify_error(w, "Settings", &e);
+                        ui_log!(
+                            "RSH-UI set_g29_pedal_layout failed: {} ({})",
+                            e.code,
+                            e.title
+                        );
+                    }
+                }
+            },
+        );
+    }
+
+    /// Apply a G29 handbrake button change, mirroring
+    /// [`Self::apply_g29_pedal_layout`]: one `SettingsOp` job per
+    /// stepper tap (the value is clamped to 1–25 before it is
+    /// sent). Success confirms the authoritative value and toasts
+    /// it; failure re-syncs from the daemon and explains. The
+    /// daemon recreates the live HID backend with the new button
+    /// when connected; while disconnected the change applies when
+    /// the HID backend connects.
+    fn apply_g29_handbrake_button(&self, win: &MainWindow, button: i32) {
+        let button = clamp_g29_handbrake_button(button);
+        // The API carries a `u32`; the clamp above already proved
+        // 1–25, so this conversion cannot fail (8 is the fallback).
+        let button_u32 = u32::try_from(button).unwrap_or(8);
+        self.run_generic_job(
+            win,
+            JobKind::SettingsOp,
+            "Saving…",
+            move |api| {
+                JobResult::Text(
+                    api.set_g29_handbrake_button(button_u32)
+                        .map(|stored| stored.to_string()),
+                )
+            },
+            move |ctx, w, result| {
+                let JobResult::Text(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(new_button) => {
+                        let new_button = new_button
+                            .parse::<i32>()
+                            .map_or(button, clamp_g29_handbrake_button);
+                        w.set_g29_handbrake_button(new_button);
+                        ctx.notify_success(
+                            w,
+                            "Settings",
+                            "Handbrake button saved",
+                            &format!("Handbrake now presses G29 button {new_button}."),
+                        );
+                    }
+                    Err(e) => {
+                        ctx.sync_g29_handbrake_button(w);
+                        ctx.notify_error(w, "Settings", &e);
+                        ui_log!(
+                            "RSH-UI set_g29_handbrake_button failed: {} ({})",
+                            e.code,
+                            e.title
+                        );
+                    }
+                }
+            },
+        );
+    }
+
     /// Open the setup wizard at Step 0 (Connect, D16): the user
     /// joins the wheel's Wi-Fi or plugs in USB there — no Begin,
     /// no pairing. A reopen starts from a clean wizard slate (no
@@ -6077,6 +6245,11 @@ impl Ctx {
         win.set_autostart_enabled(seed.autostart);
         win.set_steam_fh4_mode(seed.steam_fh4_mode);
         win.set_g29_spoof_mode(seed.g29_spoof_mode);
+        win.set_g29_pedal_layout(seed.g29_pedal_layout.clone().into());
+        // The seed carries a `u32`; the window prop is a Slint
+        // `int` (`i32`) — same fall-back-to-8 conversion as the
+        // sync above.
+        win.set_g29_handbrake_button(i32::try_from(seed.g29_handbrake_button).unwrap_or(8));
         // D19: the seed carries the fresh Wi-Fi state — sync the
         // Settings password card + the wizard's SSID from it (the
         // 1 Hz tick re-syncs from the cache afterwards).
@@ -12598,6 +12771,24 @@ fn wire_transport(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         let win = win.as_weak();
         let ctx = ctx.clone();
+        win.unwrap().on_g29_pedal_layout_chosen(move |layout| {
+            if let Some(w) = win.upgrade() {
+                ctx.apply_g29_pedal_layout(&w, layout.as_str());
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_g29_handbrake_button_chosen(move |button| {
+            if let Some(w) = win.upgrade() {
+                ctx.apply_g29_handbrake_button(&w, button);
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
         win.unwrap().on_run_setup_again(move || {
             if let Some(w) = win.upgrade() {
                 // A18: delete the marker and open the wizard at step 0.
@@ -14352,6 +14543,24 @@ mod tests {
     }
 
     #[test]
+    fn g29_pedal_layout_normalizes_to_known_values() {
+        assert_eq!(normalize_g29_pedal_layout("hidmaestro"), "hidmaestro");
+        assert_eq!(normalize_g29_pedal_layout("pcgamingwiki"), "pcgamingwiki");
+        assert_eq!(normalize_g29_pedal_layout(""), "hidmaestro");
+        assert_eq!(normalize_g29_pedal_layout("PCGamingWiki"), "hidmaestro");
+    }
+
+    #[test]
+    fn g29_handbrake_button_clamps_to_1_to_25() {
+        assert_eq!(clamp_g29_handbrake_button(8), 8);
+        assert_eq!(clamp_g29_handbrake_button(1), 1);
+        assert_eq!(clamp_g29_handbrake_button(25), 25);
+        assert_eq!(clamp_g29_handbrake_button(0), 1);
+        assert_eq!(clamp_g29_handbrake_button(-3), 1);
+        assert_eq!(clamp_g29_handbrake_button(26), 25);
+    }
+
+    #[test]
     fn mv_text_dash_for_no_reading() {
         assert_eq!(mv_text(0.0), "—");
         assert_eq!(mv_text(410.0), "410 mV");
@@ -15774,6 +15983,8 @@ mod tests {
             autostart: true,
             steam_fh4_mode: false,
             g29_spoof_mode: false,
+            g29_pedal_layout: "hidmaestro".to_string(),
+            g29_handbrake_button: 8,
             connect,
             wifi: WifiStatus {
                 ssid: None,
@@ -15894,6 +16105,8 @@ mod tests {
             autostart: true,
             steam_fh4_mode: false,
             g29_spoof_mode: false,
+            g29_pedal_layout: "hidmaestro".to_string(),
+            g29_handbrake_button: 8,
             connect,
             wifi: WifiStatus {
                 ssid: None,
@@ -17169,6 +17382,8 @@ mod tests {
             autostart: true,
             steam_fh4_mode: false,
             g29_spoof_mode: false,
+            g29_pedal_layout: "hidmaestro".to_string(),
+            g29_handbrake_button: 8,
             connect,
             wifi: WifiStatus {
                 ssid: None,
