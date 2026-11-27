@@ -48,8 +48,8 @@ SetCompressor /SOLID lzma
   !define VERSIONMINOR 0
 !endif
 ; ---- Modern UI 2 (MUI2) -------------------------------------
-; MUI2 wizard (welcome / license / directory / install /
-; finish) + branding. Silent installs (/S) skip ALL pages,
+; MUI2 wizard (welcome / license / directory / components /
+; install / finish) + branding. Silent installs (/S) skip ALL pages,
 ; so the headless smoke test is structurally unaffected.
 ; License file is the repo-root MIT LICENSE — makensis
 ; fails closed if it is missing. Bitmaps are the RSH brand
@@ -83,6 +83,10 @@ BrandingText "RSH ${VERSION}"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "..\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
+; FH4 Steam mode (v2.0.15, Part A3): the components page carries
+; the optional "Steam FH4 wheel mode" section (off by default).
+; The main RSH section is required (SectionIn RO).
+!insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -570,7 +574,10 @@ Function ConfigureVJoyDevice1
   ${EndIf}
 FunctionEnd
 
-Section "RSH"
+Section "RSH" SEC_RSH
+  ; Required: the app itself is never optional (the components
+  ; page only exists for the Steam FH4 wheel-mode section below).
+  SectionIn RO
   SetOutPath "$INSTDIR"
   Call KillRSHProcesses
   ; P2-2: file copies go through RSH_File (below) — one
@@ -702,6 +709,36 @@ Section "RSH"
   ; Non-elevated via explorer.exe (P4, v2.0.11).
     Exec '"$WINDIR\explorer.exe" "$INSTDIR\rsh-daemon.exe"'
 SectionEnd
+
+; FH4 Steam mode (v2.0.15, Part A3): optional, OFF by default.
+; Writes the OEMData wheel flag (REG_BINARY 40 00 00 00 00 00
+; 00 00) for vJoy device 1 (VID_1234&PID_BEAD) so the Steam
+; version of Forza Horizon 4 shows the Wheel tab — the user's
+; own PC-tested fix (v2.0.14's GameInput mapping alone did not
+; do it for the Steam build). Only HKLM is written here: the
+; installer runs elevated, and on a standard-user install its
+; HKCU would be the admin's hive, not the user's (P1-4
+; precedent — the installer never writes HKCU). The daemon
+; writes the HKCU half on first start (marker adoption — see
+; crates/rsh-output/src/vjoy_config.rs). The marker below
+; (HKLM\Software\RSH "SteamFh4OemData" = 1, native 64-bit
+; view — the daemon is 64-bit, so SetRegView 64 is load-bearing
+; here, same as the GameInput keys) is how the uninstaller
+; knows RSH wrote the flag: it deletes OEMData only when the
+; marker is present. Only the VALUE is ever written/deleted —
+; never the OEM key (it is vJoy's). Silent installs (/S) never
+; install an /o section, so a default install has no OEMData.
+; The in-app toggle (Settings) is the primary control; this
+; checkbox is the install-time shortcut. Needs a PC restart
+; (and a vJoy disable/enable) to take effect — the app says so
+; when the toggle changes.
+Section /o "Steam FH4 wheel mode (Steam version of Forza Horizon 4)" SEC_STEAM_FH4
+  SetRegView 64
+  WriteRegBin HKLM "SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_1234&PID_BEAD" "OEMData" 4000000000000000
+  WriteRegDWORD HKLM "Software\RSH" "SteamFh4OemData" 1
+  SetRegView 32
+SectionEnd
+
 Section "Uninstall"
   ; DS-10: stop the running app FIRST (UI first, then daemon —
   ; DS-68: the UI respawns a dead daemon, so daemon-first
@@ -755,6 +792,25 @@ Section "Uninstall"
   DeleteRegKey HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004"
   ; FH4 fix #2 (v2.0.13): same for the HIDMaestro mapping.
   DeleteRegKey HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004"
+  ; FH4 Steam mode (v2.0.15, Part A3): remove the OEMData wheel
+  ; flag, but ONLY if RSH wrote it — marker HKLM\Software\RSH
+  ; "SteamFh4OemData" == 1 (written by the installer checkbox
+  ; above or the in-app toggle). Only the VALUE is deleted,
+  ; never the OEM key (it is vJoy's). The marker is deleted too
+  ; (the whole Software\RSH key is removed below anyway). The
+  ; HKCU delete is best-effort in the same-user context only:
+  ; an elevated uninstaller cannot reach a standard user's hive
+  ; (P1-4), so a standard-user install's HKCU value is removed
+  ; by toggling the mode off in the app instead — the CHANGELOG
+  ; says so. A missing value is fine (DeleteRegValue on an
+  ; absent value is a no-op for our purposes).
+  ReadRegDWORD $R0 HKLM "Software\RSH" "SteamFh4OemData"
+  ${If} $R0 == 1
+    DeleteRegValue HKLM "SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_1234&PID_BEAD" "OEMData"
+    DeleteRegValue HKCU "SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_1234&PID_BEAD" "OEMData"
+    DeleteRegValue HKLM "Software\RSH" "SteamFh4OemData"
+  ${EndIf}
+  ClearErrors
   SetRegView 32
   Delete "$INSTDIR\rsh-daemon.exe"
   Delete "$INSTDIR\rsh-ui.exe"
@@ -812,3 +868,12 @@ Section "Uninstall"
   ; The same KEEP decision is stated in the release notes.
   DetailPrint "DS-69: your RSH data (profiles, settings, logs) and crash dumps were kept — delete %APPDATA%\RSH and %ProgramData%\RSH\dumps manually for a fully clean start."
 SectionEnd
+
+; Components-page descriptions (MUI2): shown when a section is
+; selected on the components page. The Steam FH4 text states the
+; restart requirement up front — the flag only takes effect
+; after a PC restart (and a vJoy disable/enable).
+!insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
+  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_RSH} "RSH — the wheel app, daemon, and firmware."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_STEAM_FH4} "Steam FH4 wheel mode — writes the OEMData wheel flag for vJoy device 1 so the Steam version of Forza Horizon 4 shows the Wheel tab. Off by default. Needs a PC restart (and a vJoy disable/enable) to take effect. You can also turn it on later in RSH Settings."
+!insertmacro MUI_FUNCTION_DESCRIPTION_END

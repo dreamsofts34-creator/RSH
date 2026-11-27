@@ -744,6 +744,17 @@ jobs:
       # (headless runner): the window actually painting — process +
       # IPC + rule is the strongest launch evidence available in CI;
       # real paint is a human gate (see the human gates in this workflow's header).
+      # OEMData (v2.0.15, Part A3): the default (silent) install
+      # must NOT write the Steam FH4 OEMData flag — it lives only
+      # in the optional installer section, off by default — so
+      # Assert-NoOem runs after the first install, after the
+      # update install, and after the uninstall, under BOTH hives
+      # (HKLM written by the installer, HKCU by the daemon). The
+      # "present after toggle on" check is deliberately NOT here:
+      # toggling needs the app/daemon UI path and cannot run
+      # headless; it stays a user-PC proof item. ($null.GetValue()
+      # is $null in PowerShell, so a missing OEM key needs no
+      # guard in the helper.)
       # Every process wait here is timeout-bounded via
       # Start-WaitOrFail: run 44047919933 hung SILENTLY for 13+ min
       # in a bare `Start-Process -Wait` on the second install (the
@@ -779,6 +790,7 @@ jobs:
             chk "Labels\Buttons" "Button0" "LetterA"; chk "Labels\Buttons" "Button1" "LetterB"; chk "Labels\Buttons" "Button2" "LetterX"; chk "Labels\Buttons" "Button3" "LetterY"; chk "Labels\Buttons" "Button6" "Menu"; chk "Labels\Buttons" "Button7" "View"; chk "Labels\Buttons" "Button8" "RightStickButton"; chk "Labels\Buttons" "Button9" "LeftStickButton"
             chk "Labels\Switches" "Switch0Up" "Up"; chk "Labels\Switches" "Switch0Right" "Right"; chk "Labels\Switches" "Switch0Down" "Down"; chk "Labels\Switches" "Switch0Left" "Left"
           }
+          function Assert-NoOem { $o = "SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_1234&PID_BEAD"; foreach ($h in $reg64, [Microsoft.Win32.Registry]::CurrentUser) { if ($null -ne $h.OpenSubKey($o).GetValue("OEMData")) { Write-Error "Smoke test: OEMData present."; exit 1 } } }
           $installer = (Get-ChildItem release-staging/*-setup.exe).FullName
           $installDir = "C:\rsh-smoke-test"
           if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
@@ -807,6 +819,7 @@ jobs:
           Assert-GameInput "1234BEAD00010004" "RSH Wheel (vJoy)" 3 6
           Assert-GameInput "1209525300010004" "RSH Wheel (HIDMaestro)" 3 4
           Write-Host "GameInput RacingWheel mapping complete for vJoy + HID (axes, gears, buttons, DPad, Labels)."
+          Assert-NoOem
           # vJoy descriptor: only when Device01 exists (the runner has
           # no vJoy installed — assert size, else skip).
           $dev1 = $reg64.OpenSubKey("SYSTEM\CurrentControlSet\Services\vjoy\Parameters\Device01")
@@ -862,6 +875,7 @@ jobs:
           Assert-GameInput "1234BEAD00010004" "RSH Wheel (vJoy)" 3 6
           Assert-GameInput "1209525300010004" "RSH Wheel (HIDMaestro)" 3 4
           Write-Host "GameInput RacingWheel mapping complete after the update install."
+          Assert-NoOem
           Start-Sleep -Seconds 3
           $daemonProc = Get-Process rsh-daemon -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $daemonProc) { Write-Error "Smoke test: daemon was NOT restarted by the update install (no rsh-daemon process)."; exit 1 }
@@ -997,6 +1011,7 @@ jobs:
           }
           if (Get-ScheduledTask -TaskName "RSH Daemon" -ErrorAction SilentlyContinue) { Write-Error "Smoke test: legacy scheduled task 'RSH Daemon' still registered after uninstall (the uninstaller must remove it)."; exit 1 }
           Write-Host "Smoke test PASS: uninstall removed the WER keys (and no legacy scheduled task remains)."
+          Assert-NoOem
           # The data dir may never exist on Windows — only remove
           # it when it exists.
           if (Test-Path $dataDir) { Remove-Item $dataDir -Recurse -Force }

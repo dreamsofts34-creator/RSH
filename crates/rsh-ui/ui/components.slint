@@ -147,6 +147,10 @@ export component Modal inherits Rectangle {
 // ---------------------------------------------------------------- switch (§6: 34x20 cards/top bar, 40x22 tray)
 export component Switch inherits Rectangle {
     in property <bool> on;
+    // A2 (Steam FH4 wheel mode): a disabled switch never fires
+    // `toggled` (click or keyboard) and renders dimmed — the
+    // caller shows the short reason next to it (vJoy-only on HID).
+    in property <bool> disabled: false;
     in property <string> accessible-name: "Toggle";
     accessible-label: accessible-name;
     accessible-role: switch;
@@ -156,6 +160,7 @@ export component Switch inherits Rectangle {
     width: sw-w;
     height: sw-h;
     border-radius: sw-h / 2;
+    opacity: disabled ? 0.45 : 1;
     background: on ? Theme.accent : (ta.has-hover ? Theme.hover-bg : Theme.switch-off);
     // FIX-4: accent border while keyboard-focused.
     border-width: fs.has-focus || ta.has-hover ? 1px : 0px;
@@ -166,7 +171,7 @@ export component Switch inherits Rectangle {
         height: 100%;
         key-pressed(event) => {
             if (event.text == Key.Return || event.text == Key.Space) {
-                toggled();
+                if (!disabled) { toggled(); }
                 return accept;
             }
             return reject;
@@ -195,7 +200,7 @@ export component Switch inherits Rectangle {
     }
     // P2-5: the hit target extends 2px past the visual on every
     // side (20px -> 24px tall) — the visual is unchanged.
-    ta := TouchArea { x: -2px; y: -2px; width: parent.width + 4px; height: parent.height + 4px; mouse-cursor: pointer; clicked => { toggled(); } }
+    ta := TouchArea { x: -2px; y: -2px; width: parent.width + 4px; height: parent.height + 4px; mouse-cursor: disabled ? MouseCursor.default : MouseCursor.pointer; clicked => { if (!disabled) { toggled(); } } }
 }
 
 // ---------------------------------------------------------------- pill (§6: Ok / warn / neutral / accent)

@@ -492,6 +492,14 @@ pub struct AppSettings {
     /// is on. Default `false` (not paused).
     #[serde(default)]
     pub auto_switch_paused: bool,
+    /// Steam FH4 wheel mode (FH4 fix, v2.0.15): when on, the vJoy
+    /// device-1 `OEMData` flag (`40 00 00 00 00 00 00 00`) is
+    /// written so Steam Forza Horizon 4 shows the Wheel tab, and
+    /// the vJoy feed dedupes + hysteresis-filters idle output.
+    /// Default `false` (off) — never on for a fresh install, and
+    /// never applied to the HID backend.
+    #[serde(default)]
+    pub steam_fh4_mode: bool,
     /// Per-module on/off switches, keyed by canonical module id
     /// (`"steering"`, `"accelerator"`, `"brake"`, `"clutch"`,
     /// `"handbrake"`, `"shifter"`, `"horn"`, `"buttons"`,
@@ -675,6 +683,7 @@ impl Default for AppSettings {
             first_run_done: false,
             auto_switch_profiles: true,
             auto_switch_paused: false,
+            steam_fh4_mode: false,
             modules: default_modules(),
         }
     }
@@ -787,6 +796,8 @@ pub struct AppSettingsPatch {
     pub auto_switch_profiles: Option<bool>,
     /// Whether auto-switching is paused (M6, v2.0.2).
     pub auto_switch_paused: Option<bool>,
+    /// Steam FH4 wheel mode (default off — see [`AppSettings::steam_fh4_mode`]).
+    pub steam_fh4_mode: Option<bool>,
     /// Per-module switches, merged per key.
     pub modules: Option<HashMap<String, bool>>,
 }
@@ -841,6 +852,9 @@ impl AppSettings {
         }
         if let Some(auto_switch_paused) = patch.auto_switch_paused {
             self.auto_switch_paused = auto_switch_paused;
+        }
+        if let Some(steam_fh4_mode) = patch.steam_fh4_mode {
+            self.steam_fh4_mode = steam_fh4_mode;
         }
         if let Some(modules) = patch.modules {
             for (module, enabled) in modules {
@@ -1237,6 +1251,23 @@ mod tests {
         assert_eq!(settings.output_backend, "HIDMaestro");
         assert!(settings.close_to_tray);
         assert!(settings.auto_switch_profiles);
+        // FH4 fix (v2.0.15): absent in the old sample → default off.
+        assert!(!settings.steam_fh4_mode);
+    }
+
+    #[test]
+    fn parses_steam_fh4_mode_when_present() {
+        // FH4 fix (v2.0.15): PascalCase key normalizes like the rest.
+        let json = r#"{
+          "SteamFh4Mode": true
+        }"#;
+        let settings = parse_csharp_settings(json).expect("SteamFh4Mode parses");
+        assert!(settings.steam_fh4_mode);
+        let json = r#"{
+          "SteamFh4Mode": false
+        }"#;
+        let settings = parse_csharp_settings(json).expect("SteamFh4Mode false parses");
+        assert!(!settings.steam_fh4_mode);
     }
 
     #[test]

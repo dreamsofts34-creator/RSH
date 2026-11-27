@@ -18,6 +18,20 @@
 #   5. FH4 wheel fix: the installer writes the complete GameInput
 #      RacingWheel tree and its vJoyConfig argv matches
 #      vjoy_config_argv() (single source of truth — no drift).
+#   6. Steam FH4 OEMData (v2.0.15, Part A3): the OEMData wheel flag
+#      is written ONLY from the optional, off-by-default installer
+#      section (a silent /S install never installs /o sections,
+#      so a default install has no OEMData), only for the vJoy
+#      device (never HID — A4), with the exact PC-tested bytes,
+#      and only the VALUE (never the OEM key); the uninstaller
+#      deletes the VALUE only when the RSH marker is present.
+#      The marker is a 64-bit-view value — the 32-bit installer
+#      would otherwise read/write WOW6432Node and never see it —
+#      so the gate tracks SetRegView for the marker ops (the
+#      OEMData key itself lives under SYSTEM\CurrentControlSet,
+#      which is NOT redirected, so no view assertion there).
+#      The GameInput mapping functions (check 5) must not have
+#      grown OEMData writes either.
 # Windows-only runtime behaviour (the headless smoke test itself:
 # install/update/uninstall on a real Windows runner) is NOT covered
 # here — per the local-first rule it is covered by waiting for the
@@ -144,5 +158,170 @@ assert m.group(1) == expected, (
     f"installer vJoyConfig argv drifted: NSIS has {m.group(1)!r}, "
     f"vjoy_config_argv() is {expected!r}")
 print(f"GameInput mapping complete in installer; vJoyConfig argv matches ({expected})")
+PYEOF
+
+# 6. Steam FH4 OEMData (v2.0.15, Part A3): the flag lives ONLY in
+# the optional, off-by-default installer section — a silent /S
+# install never installs /o sections, so a default install has
+# no OEMData. The section IS the installer checkbox (MUI
+# components page); an ${If}-gated write in the main section
+# would NOT pass this check — the write must be lexically inside
+# the /o section. Marker-gated uninstall delete, value-only.
+python3 - <<'PYEOF' || fail "installer Steam FH4 OEMData check failed"
+import re
+nsi_lines = open('installer/rsh.nsi').read().splitlines()
+
+# --- tiny NSIS context tracker: current section (/o? uninstall?),
+# LogicLib ${If} depth, and the last SetRegView (32-bit installer
+# defaults to the 32-bit view; only SetRegView 64 reaches the
+# native view where the 64-bit daemon reads the marker).
+section = None        # (name, optional?)
+if_depth = 0
+regview = 32
+oem_writes = []       # (line_no, section, regview)
+marker_writes = []    # (line_no, section, regview)
+marker_reads = []     # (line_no, section, regview)
+oem_deletes = []      # (line_no, section, if_depth, hive)
+marker_deletes = []   # (line_no, section, if_depth)
+for n, raw in enumerate(nsi_lines, 1):
+    line = raw.strip()
+    m = re.match(r'Section\s+(/o\s+)?"([^"]+)"', line, re.I)
+    if m:
+        section = (m.group(2), bool(m.group(1)))
+        continue
+    if re.match(r'SectionEnd\b', line, re.I):
+        section = None
+        continue
+    if re.match(r'\$\{(If|IfNot)\b', line):
+        if_depth += 1
+    elif re.match(r'\$\{EndIf\}', line):
+        assert if_depth > 0, f"line {n}: ${{EndIf}} without ${{If}}"
+        if_depth -= 1
+    m = re.match(r'SetRegView\s+(32|64)\b', line, re.I)
+    if m:
+        regview = int(m.group(1))
+        continue
+    low = line.lower()
+    # A DeleteRegKey on a Joystick OEM key has no "OEMData" text in
+    # it (the key path ends at ...\OEM\VID_...), so this guard lives
+    # outside the 'oemdata' branch below — only the VALUE may ever
+    # be deleted, never the OEM key (it is vJoy's).
+    if re.search(r'DeleteRegKey\b', line, re.I) and 'joystick\\oem' in low:
+        assert False, (
+            f"line {n}: DeleteRegKey on a Joystick OEM key — only "
+            "the OEMData VALUE may ever be deleted, never the OEM "
+            "key (it is vJoy's)")
+    if 'oemdata' in low:
+        assert 'vid_1209&pid_5253' not in low, (
+            f"line {n}: OEMData touched on the HID device "
+            "(A4: never write it for VID_1209&PID_5253)")
+        # The VALUE is spelled "OEMData" (quoted). The marker value
+        # "SteamFh4OemData" also contains the substring — it is NOT
+        # the flag, so only the quoted exact name counts here; the
+        # marker lines are handled by the SteamFh4OemData branch.
+        if re.search(r'WriteRegBin\b', line, re.I) and '"oemdata"' in low:
+            oem_writes.append((n, section, regview))
+            assert 'vid_1234&pid_bead' in low, (
+                f"line {n}: OEMData write is not on the vJoy OEM key "
+                "(VID_1234&PID_BEAD)")
+            assert '4000000000000000' in low, (
+                f"line {n}: OEMData bytes are not 40 00 00 00 00 00 00 00")
+        elif re.search(r'DeleteRegValue\b', line, re.I) and '"oemdata"' in low:
+            hive = re.match(r'DeleteRegValue\s+(HKLM|HKCU)\b', line, re.I).group(1).upper()
+            assert 'vid_1234&pid_bead' in low, (
+                f"line {n}: OEMData delete is not on the vJoy OEM key")
+            oem_deletes.append((n, section, if_depth, hive))
+    if 'steamfh4oemdata' in low:
+        if re.search(r'WriteReg(DWORD|Str)\b', line, re.I):
+            assert re.search(r'HKLM\s+"Software\\RSH"', line, re.I), (
+                f"line {n}: SteamFh4OemData marker must live under "
+                'HKLM "Software\\RSH"')
+            marker_writes.append((n, section, regview))
+        elif re.search(r'ReadReg(DWORD|Str)\b', line, re.I):
+            marker_reads.append((n, section, regview))
+        elif re.search(r'DeleteRegValue\b', line, re.I):
+            marker_deletes.append((n, section, if_depth))
+
+# (a) Default install writes no OEMData: exactly one write in the
+# whole file, and it sits in the optional /o "Steam FH4" section.
+assert len(oem_writes) == 1, (
+    f"expected exactly 1 OEMData write in installer/rsh.nsi, found "
+    f"{len(oem_writes)}: {[w[0] for w in oem_writes]}")
+wline, (wsec, wopt), _ = oem_writes[0]
+assert wopt and wsec is not None and re.search(r'FH4', wsec, re.I), (
+    f"line {wline}: OEMData write is in section {wsec!r} — it must "
+    "be in the optional (/o) Steam FH4 section only, so a default "
+    "install never writes it")
+assert 'MUI_PAGE_COMPONENTS' in open('installer/rsh.nsi').read(), (
+    "installer has no MUI_PAGE_COMPONENTS — the /o section would "
+    "have no checkbox page")
+# The marker is written next to the flag, same section, native view.
+assert len(marker_writes) == 1, (
+    f"expected exactly 1 SteamFh4OemData marker write, found "
+    f"{len(marker_writes)}: {[w[0] for w in marker_writes]}")
+mline, (msec, mopt), mview = marker_writes[0]
+assert mopt and msec == wsec, (
+    f"line {mline}: marker write is not in the same optional "
+    f"Steam FH4 section as the OEMData write (line {wline})")
+assert mview == 64, (
+    f"line {mline}: marker write is in the {mview}-bit registry "
+    "view — it must be SetRegView 64 (HKLM\\Software IS "
+    "redirected; the 64-bit daemon would never see a WOW6432Node "
+    "marker)")
+
+# (b) Uninstaller deletes the VALUE only when the marker is
+# present: marker read first (native view), then If-gated deletes.
+un_reads = [r for r in marker_reads if r[1] and r[1][0] == 'Uninstall']
+assert un_reads, (
+    "uninstaller never reads the SteamFh4OemData marker — it "
+    "cannot know whether RSH wrote the flag")
+rline, _, rview = un_reads[0]
+assert rview == 64, (
+    f"line {rline}: marker read is in the {rview}-bit registry "
+    "view — must match the write's SetRegView 64")
+assert oem_deletes, "uninstaller never deletes the OEMData value"
+for dline, (dsec, _), ddepth, hive in oem_deletes:
+    assert dsec == 'Uninstall', (
+        f"line {dline}: OEMData delete outside the Uninstall section")
+    assert ddepth >= 1, (
+        f"line {dline}: OEMData delete is NOT inside an ${{If}} — "
+        "the uninstaller must delete it only when the marker is present")
+    assert dline > rline, (
+        f"line {dline}: OEMData delete comes before the marker read "
+        f"(line {rline}) — the gate cannot be evaluated yet")
+assert {h for (_, _, _, h) in oem_deletes} == {'HKLM', 'HKCU'}, (
+    "uninstaller must delete the OEMData value from BOTH hives "
+    "(HKLM written by the installer, HKCU by the daemon) — found "
+    f"{sorted({h for (_, _, _, h) in oem_deletes})}")
+assert marker_deletes, (
+    "uninstaller deletes OEMData but never clears the "
+    "SteamFh4OemData marker value")
+for dline, (dsec, _), ddepth in marker_deletes:
+    assert dsec == 'Uninstall' and ddepth >= 1, (
+        f"line {dline}: marker delete must be If-gated in the "
+        "Uninstall section")
+
+# (c) GameInput mapping functions untouched by the OEMData work:
+# still defined, and no OEMData / SteamFh4 reference inside them.
+nsi = '\n'.join(nsi_lines)
+for fn in ("WriteGameInputVJoyMapping", "WriteGameInputHidMapping"):
+    m = re.search(rf'Function {fn}\b(.*?)^FunctionEnd',
+                  nsi, re.S | re.M | re.I)
+    assert m, f"installer lost Function {fn}"
+    body = m.group(1)
+    assert 'oemdata' not in body.lower(), (
+        f"Function {fn} now references OEMData — the mapping and "
+        "the Steam flag must stay separate")
+    assert 'steamfh4' not in body.lower(), (
+        f"Function {fn} now references SteamFh4")
+for key in ("1234BEAD00010004", "1209525300010004"):
+    assert re.search(
+        rf'DeleteRegKey HKLM "SYSTEM\\CurrentControlSet\\Control\\'
+        rf'GameInput\\Devices\\{key}"', nsi), (
+        f"uninstaller no longer removes the GameInput mapping for "
+        f"{key}")
+print(f"OEMData: 1 write in optional section {wsec!r} (line {wline}), "
+      f"marker write line {mline}, marker-gated uninstall deletes "
+      f"lines {[d[0] for d in oem_deletes]}; mapping functions clean")
 PYEOF
 echo "packaging gate: PASS"

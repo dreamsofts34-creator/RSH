@@ -864,6 +864,30 @@ pub trait AppApi: Send + Sync {
         ))
     }
 
+    /// Whether Steam FH4 wheel mode is on (FH4 fix, v2.0.15):
+    /// the vJoy device-1 `OEMData` flag is written so Steam Forza
+    /// Horizon 4 shows the Wheel tab. Default: false — only the
+    /// daemon overrides it.
+    fn steam_fh4_mode(&self) -> bool {
+        false
+    }
+
+    /// Set Steam FH4 wheel mode on/off; returns the new state.
+    /// Enabling is vJoy-only: on the `HIDMaestro` backend the daemon
+    /// refuses with code `steam_fh4_vjoy_only`. Disabling always
+    /// succeeds (cleanup is never blocked by the backend).
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the setting cannot be persisted, when the
+    /// registry write fails, or when enabling on a non-vJoy backend.
+    fn set_steam_fh4_mode(&self, _enabled: bool) -> Result<bool, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "Steam FH4 wheel mode is not supported by this API",
+        ))
+    }
+
     /// Current tuning for one module (stored value, or the neutral
     /// default when nothing is stored).
     fn get_tuning(&self, module: &str) -> TuningSettings;
@@ -1626,7 +1650,7 @@ mod tests {
     /// Slint default copy too.
     #[test]
     fn app_version_matches_release_tag() {
-        assert_eq!(app_version(), "2.0.14");
+        assert_eq!(app_version(), "2.0.15");
     }
 
     /// L-4: a stub whose state flips between two reads — the

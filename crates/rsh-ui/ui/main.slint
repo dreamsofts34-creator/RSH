@@ -108,7 +108,7 @@ export component MainWindow inherits Window {
     in property <bool> buttons-listening: false;
     in property <string> profile-name: "GT3 Sprint";
     in property <string> auto-profile-text: "No profile yet";
-    in property <string> app-version: "2.0.14";
+    in property <string> app-version: "2.0.15";
     in property <bool> daemon-live: false;
     // B5 (v2.0.2): the global busy strip reads these — Rust drives
     // them from busy_jobs (each start_*_job records its label, the
@@ -358,6 +358,10 @@ export component MainWindow inherits Window {
     in property <[GameItem]> games;
     // Settings live values (A9/A10/C3/C6): seeded from the API.
     in-out property <bool> autostart-enabled: false;
+    // A2 (Steam FH4 wheel mode): the daemon's `steam_fh4_mode`
+    // (default OFF) — two-way with the Settings screen, Rust
+    // reverts it on a failed toggle, like keep-in-tray.
+    in-out property <bool> steam-fh4-mode: false;
     // M-7 (v2.0.2): two-way — Rust reads keep-in-tray for the close
     // handler and writes it back when set_close_to_tray fails, so the
     // switch never lies about the real state. Same for the Extras
@@ -597,6 +601,9 @@ export component MainWindow inherits Window {
     // with the NEW state — settings-action("tray") drops the payload.
     // Rust wiring pending (FC: on_keep_tray_selected).
     callback keep-tray-selected(bool);
+    // A2 (Steam FH4 wheel mode): the Settings switch fires this
+    // with the NEW state. Rust wiring: on_steam_fh4_mode_selected.
+    callback steam-fh4-mode-selected(bool);
     callback settings-use-profile(int);
     callback settings-duplicate-profile(int);
     callback transport-selected(int);
@@ -1167,6 +1174,7 @@ export component MainWindow inherits Window {
                 backend <=> controller;
                 start-with-windows <=> autostart-enabled;
                 keep-in-tray <=> keep-in-tray;
+                steam-fh4-mode <=> steam-fh4-mode;
                 // R2-31 (h): the segment shows the STORED choice
                 // (theme-choice, 0/1/2) — never the resolved `theme`
                 // (0/1), so Auto stays visibly selected.
@@ -1194,6 +1202,7 @@ export component MainWindow inherits Window {
                 toggled-start-windows(b) => { autostart-selected(b); }
                 // M-7: forward the new switch state, don't drop it.
                 toggled-keep-tray(b) => { keep-tray-selected(b); }
+                toggled-steam-fh4-mode(b) => { steam-fh4-mode-selected(b); }
                 theme-selected(i) => { theme-choice = i; theme-persist(i); }
                 new-profile => { settings-action("new-profile"); }
                 use-profile(i) => { settings-use-profile(i); }

@@ -2505,6 +2505,7 @@ impl Ctx {
         self.refresh_profiles(win);
         self.sync_diag(win);
         self.sync_keep_in_tray(win);
+        self.sync_steam_fh4_mode(win);
         self.sync_vjoy(win);
     }
 
@@ -4054,6 +4055,24 @@ impl Ctx {
         });
     }
 
+    /// Seed the Steam FH4 wheel mode switch from the API (A2):
+    /// change-guarded, like [`Self::sync_keep_in_tray`] — the 1 Hz
+    /// `resync_from_cache` keeps it honest when the daemon-side
+    /// value moves. Skipped while a `SettingsOp` job is in flight,
+    /// so an unrelated generation bump cannot revert the
+    /// optimistic flip before the toggle job answers (the job's
+    /// own apply, or the timeout path below, owns the revert).
+    /// The sim's trait default is OFF.
+    fn sync_steam_fh4_mode(&self, win: &MainWindow) {
+        if self.busy_jobs.borrow().contains_key(&JobKind::SettingsOp) {
+            return;
+        }
+        let mode = self.api().steam_fh4_mode();
+        set_if_changed(win.get_steam_fh4_mode(), mode, |v| {
+            win.set_steam_fh4_mode(v);
+        });
+    }
+
     /// Start a background job (A9/B5): the work runs on its own
     /// thread — the UI thread never blocks on IPC, a spawn, or a
     /// flash. The busy label is recorded immediately (feedback in
@@ -4708,6 +4727,13 @@ impl Ctx {
                 // flight — so for any other SettingsOp timeout
                 // this is a no-op clear of an already-false prop.
                 win.set_wifi_password_busy(false);
+                // A2: a timed-out Steam FH4 toggle reverts to the
+                // cached (pre-toggle) value — the switch must not
+                // keep showing a state the daemon never confirmed.
+                // (The busy entry is already removed above, so
+                // the in-flight guard in `sync_steam_fh4_mode`
+                // does not block this revert.)
+                self.sync_steam_fh4_mode(win);
             }
             // R2-18: a timed-out tuning push reverts its slider to
             // the stored value — the UI must not keep showing a
@@ -5646,6 +5672,61 @@ impl Ctx {
         );
     }
 
+    /// Apply the Steam FH4 wheel mode switch (A2): the
+    /// `steam-fh4-mode-selected` callback carries the NEW state
+    /// (the .slint already flipped the prop). F6: the persist
+    /// runs on a [`JobKind::SettingsOp`] job thread via the
+    /// `AppApi` trait, exactly like `apply_keep_tray` — the
+    /// switch is disabled while any `SettingsOp` runs, so a
+    /// duplicate start cannot leave it flipped with no apply.
+    /// Success confirms the authoritative value and toasts the
+    /// restart notice; failure reverts the prop and explains —
+    /// the switch never lies about the real setting.
+    fn apply_steam_fh4_mode(&self, win: &MainWindow, enabled: bool) {
+        self.run_generic_job(
+            win,
+            JobKind::SettingsOp,
+            "Saving…",
+            move |api| JobResult::Bool(api.set_steam_fh4_mode(enabled)),
+            move |ctx, w, result| {
+                let JobResult::Bool(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(new_state) => {
+                        w.set_steam_fh4_mode(new_state);
+                        // A2: the plan's notice — the flag only
+                        // takes effect after a vJoy disable/enable
+                        // + PC restart.
+                        ctx.notify_success(
+                            w,
+                            "Settings",
+                            if new_state {
+                                "Steam FH4 wheel mode on"
+                            } else {
+                                "Steam FH4 wheel mode off"
+                            },
+                            if new_state {
+                                "Steam FH4 wheel mode is on. Disable/enable vJoy and restart your PC."
+                            } else {
+                                "Steam FH4 wheel mode is off. Disable/enable vJoy and restart your PC."
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        // A10: revert the switch the binding
+                        // already flipped, and show the typed
+                        // reason (a HIDMaestro enable says
+                        // vJoy-only, not "Unknown").
+                        w.set_steam_fh4_mode(!enabled);
+                        ctx.notify_error(w, "Settings", &e);
+                        ui_log!("RSH-UI set_steam_fh4_mode failed: {} ({})", e.code, e.title);
+                    }
+                }
+            },
+        );
+    }
+
     /// Open the setup wizard at Step 0 (Connect, D16): the user
     /// joins the wheel's Wi-Fi or plugs in USB there — no Begin,
     /// no pairing. A reopen starts from a clean wizard slate (no
@@ -5917,6 +5998,7 @@ impl Ctx {
             win.set_controller(1);
         }
         win.set_autostart_enabled(seed.autostart);
+        win.set_steam_fh4_mode(seed.steam_fh4_mode);
         // D19: the seed carries the fresh Wi-Fi state — sync the
         // Settings password card + the wizard's SSID from it (the
         // 1 Hz tick re-syncs from the cache afterwards).
@@ -12337,10 +12419,10 @@ fn wire_popover(win: &MainWindow, ctx: &Rc<Ctx>) {
     }
 }
 
-/// Wire the Settings transport / backend / autostart switches
-/// (A9/A10): the switch flips first (two-way binding), Rust calls
-/// the backend and REVERTS the switch on failure — never a silent
-/// local-only change.
+/// Wire the Settings transport / backend / autostart / Steam FH4
+/// switches (A9/A10): the switch flips first (two-way binding),
+/// Rust calls the backend and REVERTS the switch on failure —
+/// never a silent local-only change.
 #[allow(clippy::too_many_lines)]
 fn wire_transport(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
@@ -12415,6 +12497,15 @@ fn wire_transport(win: &MainWindow, ctx: &Rc<Ctx>) {
                     }
                 },
             );
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_steam_fh4_mode_selected(move |enabled| {
+            if let Some(w) = win.upgrade() {
+                ctx.apply_steam_fh4_mode(&w, enabled);
+            }
         });
     }
     {
@@ -15594,6 +15685,7 @@ mod tests {
         let seed_with = |connect: Result<ConnectionInfo, UserError>| crate::ipc_api::LiveSeed {
             backend: "vJoy".to_string(),
             autostart: true,
+            steam_fh4_mode: false,
             connect,
             wifi: WifiStatus {
                 ssid: None,
@@ -15712,6 +15804,7 @@ mod tests {
         let seed_with = |connect: Result<ConnectionInfo, UserError>| crate::ipc_api::LiveSeed {
             backend: "vJoy".to_string(),
             autostart: true,
+            steam_fh4_mode: false,
             connect,
             wifi: WifiStatus {
                 ssid: None,
@@ -16985,6 +17078,7 @@ mod tests {
         let seed_with = |connect: Result<ConnectionInfo, UserError>| crate::ipc_api::LiveSeed {
             backend: "vJoy".to_string(),
             autostart: true,
+            steam_fh4_mode: false,
             connect,
             wifi: WifiStatus {
                 ssid: None,

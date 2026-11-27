@@ -121,7 +121,8 @@ pub struct IpcRequest {
     /// `firmware_update_status`, `board_address`,
     /// `set_board_address`, `module_enabled`, `set_module_enabled`,
     /// `auto_pause`, `set_auto_pause`, `close_to_tray`,
-    /// `set_close_to_tray`, `restore_backup`, `rename_profile`,
+    /// `set_close_to_tray`, `steam_fh4_mode`, `set_steam_fh4_mode`,
+    /// `restore_backup`, `rename_profile`,
     /// `link_profile`, `knob_actions`, `set_knob_action`).
     pub method: String,
     /// Method params (object; may be empty).
@@ -461,6 +462,8 @@ pub fn dispatch(
         | "set_auto_pause"
         | "close_to_tray"
         | "set_close_to_tray"
+        | "steam_fh4_mode"
+        | "set_steam_fh4_mode"
         | "restore_backup"
         | "rename_profile"
         | "link_profile"
@@ -646,6 +649,7 @@ fn detailed_api_error(error: &rsh_api::UserError) -> IpcError {
 /// `{"enabled"}` to set) and return `{"enabled"}`; `auto_pause` /
 /// `set_auto_pause` use `{"paused"}`; `close_to_tray` /
 /// `set_close_to_tray` use `{"close_to_tray"}` / `{"enabled"}`;
+/// `steam_fh4_mode` / `set_steam_fh4_mode` use `{"steam_fh4_mode"}` / `{"enabled"}`;
 /// `restore_backup` → `{"message"}`; `rename_profile` takes
 /// `{"id", "name"}`; `link_profile` takes `{"id", "game_slug"}`;
 /// `knob_actions` → `{"knobs": [[...], [...]]}`; `set_knob_action`
@@ -752,6 +756,13 @@ fn dispatch_round3(
             let enabled = parse_bool_param(params, "enabled")?;
             api.set_close_to_tray(enabled)
                 .map(|new_state| serde_json::json!({"close_to_tray": new_state}))
+                .map_err(|error| detailed_api_error(&error))
+        }
+        "steam_fh4_mode" => Ok(serde_json::json!({"steam_fh4_mode": api.steam_fh4_mode()})),
+        "set_steam_fh4_mode" => {
+            let enabled = parse_bool_param(params, "enabled")?;
+            api.set_steam_fh4_mode(enabled)
+                .map(|new_state| serde_json::json!({"steam_fh4_mode": new_state}))
                 .map_err(|error| detailed_api_error(&error))
         }
         "restore_backup" => api

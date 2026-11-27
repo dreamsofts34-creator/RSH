@@ -3650,6 +3650,11 @@ impl AppStateCore {
                     if backend_kind == Some(BackendKind::HidMaestro) {
                         self.note_hid_switch_attempt(true);
                     }
+                    // FH4 fix (v2.0.15): the (re)connected backend
+                    // gets the persisted Steam FH4 mode before the
+                    // resend, so the first tick after connect
+                    // already dedupes.
+                    lock(&backend).set_steam_fh4_mode(self.settings().steam_fh4_mode);
                     let last = *lock(&self.last_output);
                     match lock(&backend).update(&last) {
                         Ok(()) => {
@@ -3736,6 +3741,10 @@ impl AppStateCore {
                 if kind == Some(BackendKind::HidMaestro) {
                     self.note_hid_switch_attempt(true);
                 }
+                // FH4 fix (v2.0.15): the (re)connected backend gets
+                // the persisted Steam FH4 mode before the resend, so
+                // the first tick after connect already dedupes.
+                backend.set_steam_fh4_mode(self.settings().steam_fh4_mode);
                 let last = *lock(&self.last_output);
                 match backend.update(&last) {
                     Ok(()) => {
@@ -4183,6 +4192,11 @@ impl AppStateCore {
         if let Some(check) = self.cached_wheel_check() {
             self.push_connection_log("INFO", &format!("wheel check: {}", check.summary_line()));
         }
+        // FH4 fix (v2.0.15): a switch (re)connects the live backend
+        // (or reuses an already-connected one) — either way it gets
+        // the persisted Steam FH4 mode now, so a switch to vJoy
+        // never leaves the feed undeduped.
+        self.push_steam_fh4_mode_to_backend();
         Ok(outcome)
     }
 
@@ -6210,6 +6224,46 @@ impl AppStateCore {
             ..Default::default()
         })?;
         Ok(merged.close_to_tray)
+    }
+
+    /// Whether Steam FH4 wheel mode is on (FH4 fix, v2.0.15): the
+    /// stored `steam_fh4_mode` flag (default off).
+    #[must_use]
+    pub fn steam_fh4_mode(&self) -> bool {
+        self.settings().steam_fh4_mode
+    }
+
+    /// Persist the Steam FH4 wheel mode choice (FH4 fix, v2.0.15)
+    /// and push it into the live backend at once, so a connected
+    /// vJoy backend starts deduping / hysteresis-filtering on the
+    /// next tick without a reconnect. The registry flag itself is
+    /// NOT written here — the daemon's `set_steam_fh4_mode` owns
+    /// the registry write (vJoy-only guard + installer marker),
+    /// and calls this to persist. Returns the stored value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the settings save fails.
+    pub fn set_steam_fh4_mode(self: &Arc<Self>, enabled: bool) -> Result<bool, String> {
+        let merged = self.set_settings_patch(AppSettingsPatch {
+            steam_fh4_mode: Some(enabled),
+            ..Default::default()
+        })?;
+        self.push_steam_fh4_mode_to_backend();
+        Ok(merged.steam_fh4_mode)
+    }
+
+    /// Push the persisted Steam FH4 wheel mode into the live backend
+    /// (FH4 fix, v2.0.15). Safe to call whenever the live backend
+    /// may have (re)connected — the push is idempotent, and
+    /// non-vJoy backends ignore it (trait default no-op). Never
+    /// call while the backend handle's own lock is already held
+    /// (connect paths push through their locked `&mut` backend
+    /// directly instead — see [`Self::connect_and_resend`]).
+    fn push_steam_fh4_mode_to_backend(&self) {
+        let enabled = self.settings().steam_fh4_mode;
+        let handle = self.backend_handle();
+        lock(&handle).set_steam_fh4_mode(enabled);
     }
 
     /// Restore the newest present profiles backup (M7): `bak1` first,
@@ -10869,6 +10923,20 @@ mod tests {
             "detail: {}",
             enabled.detail
         );
+    }
+
+    #[test]
+    fn steam_fh4_mode_defaults_off_and_persists() {
+        // FH4 fix (v2.0.15): default OFF, and the toggle round-trips
+        // through settings.json.
+        let (state, _dir) = test_state();
+        assert!(!state.steam_fh4_mode(), "default must be off");
+        assert!(!state.settings().steam_fh4_mode);
+        assert!(state.set_steam_fh4_mode(true).expect("persist on"));
+        assert!(state.steam_fh4_mode());
+        assert!(state.settings().steam_fh4_mode);
+        assert!(!state.set_steam_fh4_mode(false).expect("persist off"));
+        assert!(!state.steam_fh4_mode());
     }
 
     #[test]

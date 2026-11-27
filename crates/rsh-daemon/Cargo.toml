@@ -14,6 +14,7 @@ path = "src/main.rs"
 rsh-api = { path = "../rsh-api" }
 rsh-app-core = { path = "../rsh-app-core" }
 rsh-ipc = { path = "../rsh-ipc" }
+rsh-output = { path = "../rsh-output" }
 rsh-transport = { path = "../rsh-transport" }
 dirs.workspace = true
 keyring.workspace = true
