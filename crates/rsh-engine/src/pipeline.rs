@@ -334,7 +334,7 @@ impl Default for PipelinePlan {
 }
 
 /// The processed output of one tick. Consumed by the B1 engine worker
-/// and the output backends (`vJoy` / `HIDMaestro`).
+/// and the output backends (`vJoy` / `Xbox`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct OutputState {
     /// Steering, `-1..=1` (-1 = full left, +1 = full right).

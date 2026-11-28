@@ -837,12 +837,12 @@ mod tests {
         }
 
         fn set_binding(&self, button: u8, action: &str) -> Result<ButtonBinding, UserError> {
-            if !((1..=32).contains(&button) || (65..=72).contains(&button)) {
+            if !(1..=32).contains(&button) {
                 return Err(UserError {
                     code: "InvalidButton".to_string(),
                     title: "Button cannot be bound".to_string(),
                     what_happened: format!("button {button} cannot be bound"),
-                    what_to_do: "Bind a physical button (1-32) or an encoder button (65-72)."
+                    what_to_do: "Bind a physical button (1-32)."
                         .to_string(),
                     detail: Some(format!("button {button} cannot be bound")),
                 });

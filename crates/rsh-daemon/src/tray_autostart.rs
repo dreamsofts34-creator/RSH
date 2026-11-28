@@ -15,17 +15,14 @@
 //! honours by calling it:
 //! * the daemon exe itself needs no elevation, so the Run-key launch
 //!   never prompts;
-//! * `AppStateCore::activate_startup_backend` defers the elevated
-//!   `HIDMaestro` backend at startup (it is only activated when the
-//!   user turns "Send to game" on — the UAC prompt there is
-//!   expected, user-initiated);
-//! * a non-elevated backend (vJoy, driver present) *is* activated at
-//!   startup, so autostart defaults to vJoy until `HIDMaestro` is
-//!   ready — exactly LOGIC-FIX-PLAN §4.6 option (b) + (c).
+//! * `AppStateCore::activate_startup_backend` activates the
+//!   selected backend (vJoy or Xbox) directly at startup —
+//!   v2.0.19 deleted the HIDMaestro backend, so there is no
+//!   elevated backend left to defer and no UAC prompt at login.
 //! * the optional elevated helper (scheduled task, option (a)) is
-//!   NOT implemented: the deferral above already removes the
-//!   login-time prompt, and a scheduled task would be a second
-//!   autostart mechanism to keep in sync.
+//!   NOT implemented: with no elevated backend left, there is
+//!   nothing for it to launch, and a scheduled task would be a
+//!   second autostart mechanism to keep in sync.
 //!
 //! # Backends
 //!

@@ -1188,11 +1188,11 @@ pub struct OutputState {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendStatus {
-    /// Short id: `"hidmaestro"` / `"vjoy"` / `"none"`.
+    /// Short id: `"xbox"` / `"vjoy"` / `"none"`.
     pub id: String,
     /// Display name exactly as the backend reports it.
     pub name: String,
-    /// True for the default backend (`HIDMaestro`).
+    /// True for the default backend (`vJoy`).
     pub is_default: bool,
     /// True when this backend is the one the user selected in
     /// settings (may differ from `active` after a fallback).
@@ -1201,13 +1201,14 @@ pub struct BackendStatus {
     pub active: bool,
     /// True when the live backend is connected.
     pub connected: bool,
-    /// Whether the backend's driver/sidecar file was found by the
+    /// Whether the backend's driver/DLL file was found by the
     /// probe (`Some(false)` = probed, not present).
     pub installed: Option<bool>,
     /// True when the backend needs an elevated helper for the session
-    /// (`HIDMaestro` only).
+    /// (always false since v2.0.19 — no backend needs elevation).
     pub elevation_required: bool,
-    /// The UAC copy, when elevation is required.
+    /// The UAC copy, when elevation is required (never set since
+    /// v2.0.19 — no backend needs elevation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uac_note: Option<String>,
     /// Human-readable status line (shown verbatim).

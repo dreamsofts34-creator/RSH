@@ -25,8 +25,7 @@
 //! [`diagnose_udp_port_holder`] identifies the holder best-effort:
 //! Linux reads `/proc/net/udp` + `/proc/<pid>/fd` (pure std, fully
 //! testable here); Windows uses `GetExtendedUdpTable` with
-//! `UDP_TABLE_OWNER_PID` plus `QueryFullProcessImageNameW` (same
-//! `windows`-crate pattern as the `HIDMaestro` loopback-peer check).
+//! `UDP_TABLE_OWNER_PID` plus `QueryFullProcessImageNameW`.
 //! Anything it cannot prove returns `None` — never a guess.
 
 use std::fmt;
@@ -207,8 +206,7 @@ fn diagnose_windows(port: u16) -> Option<PortHolder> {
     use windows::Win32::Networking::WinSock::AF_INET;
 
     // Ports in the UDP table are network byte order in the low 16 bits
-    // (same layout as the TCP table rows — see the HIDMaestro
-    // loopback-peer check).
+    // (same layout as the TCP table rows).
     let table_port = |raw: u32| -> u16 { u16::try_from(raw & 0xFFFF).unwrap_or(0).swap_bytes() };
     let mut size: u32 = 0;
     // SAFETY: first call with a null table only queries the size

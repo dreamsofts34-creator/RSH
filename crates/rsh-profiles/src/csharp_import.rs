@@ -516,8 +516,9 @@ fn default_vjoy_device_id() -> u32 {
 fn default_output_backend() -> String {
     // v2.0.1 hotfix: the default output backend is vJoy — HIDMaestro
     // was the default until v2.0.0 (architecture Phase G), but its
-    // elevated sidecar pops a UAC prompt on every launch, so it is
-    // now an explicit choice only; "None" is the no-device choice.
+    // elevated sidecar pops a UAC prompt on every launch, so vJoy
+    // became the default; the HIDMaestro backend was deleted in
+    // v2.0.19, so "None" is the only other choice.
     "VJoy".to_owned()
 }
 

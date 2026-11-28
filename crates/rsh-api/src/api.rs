@@ -937,7 +937,7 @@ pub trait AppApi: Send + Sync {
         FirmwareUpdateStatus::default()
     }
 
-    /// Live output backend name (`"HIDMaestro"` / `"vJoy"`).
+    /// Live output backend name (`"vJoy"` / `"Xbox"`).
     /// Default: `"Unknown"` — only the daemon and the sim override it.
     fn output_backend(&self) -> String {
         "Unknown".to_string()
@@ -1494,9 +1494,9 @@ pub trait AppApi: Send + Sync {
     /// immediately (`"started"`); progress and failure surface
     /// through [`AppApi::vjoy_status`] polling — never by blocking
     /// the caller. The installer needs admin once (its own manifest
-    /// triggers the UAC prompt); that is expected and unlike
-    /// `HIDMaestro`, which prompts on every launch. Default: error —
-    /// only the daemon installs.
+    /// triggers the UAC prompt); that is expected (the deleted
+    /// `HIDMaestro` backend prompted on every launch). Default:
+    /// error — only the daemon installs.
     ///
     /// # Errors
     ///

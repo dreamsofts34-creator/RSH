@@ -579,8 +579,9 @@ fn dispatch_bindings(
 }
 
 /// Parse the `button` param of a binding request: a JSON number
-/// that fits in a `u8` (physical 1–32, encoder virtual 65–72 —
-/// the range itself is the API's job, so a `u8` that is out of
+/// that fits in a `u8` (physical 1–32 — v2.0.19: encoder virtual
+/// buttons 65–72 are gone; the range itself is the API's job, so
+/// a `u8` that is out of
 /// range still reaches it and fails there with `InvalidButton`).
 /// A missing / non-numeric / oversized value fails here with the
 /// same stable code.
@@ -591,7 +592,7 @@ fn parse_binding_button(params: &serde_json::Value) -> Result<u8, IpcError> {
         .and_then(|n| u8::try_from(n).ok())
         .ok_or_else(|| {
             IpcError::Api(
-                "InvalidButton|button must be a number (physical 1-32, encoder virtual 65-72)"
+                "InvalidButton|button must be a number (physical 1-32)"
                     .to_string(),
             )
         })
