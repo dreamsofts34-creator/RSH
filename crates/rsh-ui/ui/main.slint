@@ -454,6 +454,8 @@ export component MainWindow inherits Window {
     callback trim-edited(string);
     callback preset-selected(int);
     callback reset-defaults();
+    callback pedals-reset-defaults();
+    callback extras-reset-defaults();
     callback set-centre();
     callback capture-full-left();
     callback capture-full-right();
@@ -936,6 +938,7 @@ export component MainWindow inherits Window {
                 throttle-saturation-changed(v) => { throttle-saturation-changed(v); }
                 throttle-saturation-edited(t) => { throttle-saturation-edited(t); }
                 combine-pedals-changed(b) => { combine-pedals-changed(b); }
+                reset-defaults => { pedals-reset-defaults(); }
             }
             if page == 3 : ExtrasScreen {
                 busy-kind: busy-kind;
@@ -1018,6 +1021,7 @@ export component MainWindow inherits Window {
                 horn-min-changed(v) => { extras-horn-min(v); }
                 horn-min-edited(t) => { extras-horn-min-edited(t); }
                 horn-mode-selected(i) => { extras-horn-mode(i); }
+                reset-defaults => { extras-reset-defaults(); }
             }
             if page == 4 : SettingsScreen {
                 connected: connected;

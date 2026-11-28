@@ -105,13 +105,15 @@ export component SteeringPage inherits HorizontalLayout {
                 // margin-bottom 10px — the chips sat flush under the
                 // title (spacing 0 + no spacer).
                 Rectangle { height: 10px; }
+                Text { text: "Feel preset"; font-size: Theme.fs-label; font-weight: 500; color: Theme.text; }
                 HorizontalLayout { cross-axis-alignment: center;
                     spacing: 6px;
                     PresetChip { horizontal-stretch: 1; label: "Soft"; active: preset == 0; clicked => { preset-selected(0); } }
-                    PresetChip { horizontal-stretch: 1; label: "Balanced"; active: preset == 1; clicked => { preset-selected(1); } }
-                    PresetChip { horizontal-stretch: 1; label: "Sharp"; active: preset == 2; clicked => { preset-selected(2); } }
+                    PresetChip { horizontal-stretch: 1; label: "Normal"; active: preset == 1; clicked => { preset-selected(1); } }
+                    PresetChip { horizontal-stretch: 1; label: "Firm"; active: preset == 2; clicked => { preset-selected(2); } }
                     PresetChip { horizontal-stretch: 1; label: "Custom"; active: preset == 3; clicked => { preset-selected(3); } }
                 }
+                Text { text: preset == 0 ? "Soft — gentle response, forgiving at the centre." : preset == 1 ? "Normal — even response, the default." : preset == 2 ? "Firm — quick, direct response." : "Custom — your own deadzone and curve below."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
                 Rectangle { height: 14px; }
                 SliderRow { label: "Centre deadzone"; hint: "Ignores small inputs"; value-text: deadzone-text; value: deadzone; changed(v) => { deadzone-changed(v); } value-edited(t) => { deadzone-edited(t); } }
                 Rectangle { height: 14px; }

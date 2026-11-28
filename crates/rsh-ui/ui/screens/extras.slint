@@ -10,8 +10,8 @@
 //   handbrakeButtonMode, AXIS slot-4 flags bit0). The AppApi exposes NO
 //   method to read/set it, so `handbrake-mode` stays Axis (0) unless
 //   the mode lands — the segmented click explains itself.
-// - Shifter gate IS a set_tuning field (shifter_gate): Rust seeds
-//   `shifter-mode` from get_tuning("shifter"). Sensitivity IS a
+// - Shifter is sequential-only (v2.0.19: H-pattern deleted).
+//   Sensitivity IS a
 //   board-config value (SH1): Rust reads it once from the board
 //   config blob (`SHIFTER` record params[4]) and writes it back
 //   through the config transaction (stage → commit → confirm) —
@@ -32,9 +32,8 @@
 // - Handbrake deadzone/feel/mV come from get_tuning("handbrake");
 //   Set up/down need calibrate_pedal (BACKEND-2 seam) and stay
 //   disabled with a reason until it lands (A2).
-// Live values (handbrake pct, gear) are Rust-owned props fed from the
-// snapshot; the snapshot carries neither, so both read "—" / 0 until
-// the API grows them (A7). Nothing here talks to the daemon directly.
+// Live values (handbrake pct) are Rust-owned props fed from the
+// snapshot. Nothing here talks to the daemon directly.
 
 import { Theme } from "../tokens.slint";
 import { Card, CardBody, FormRow, Switch, Btn, SliderRow, RangeBlock, PresetChip, ButtonTile, SegmentedControl, PageScaffold } from "../components.slint";
@@ -135,9 +134,6 @@ export component ExtrasScreen inherits PageScaffold {
     in property <float> handbrake-grab-ms: 0;
     in property <string> handbrake-grab-ms-text: "0 ms";
     in property <bool> handbrake-auto-release: false;
-    // ---- shifter (live)
-    in property <string> gear: "—"; // "—" until the wheel reports a gear (A7)
-    in property <int> shifter-mode: 0; // 0 Sequential, 1 H-pattern
     in property <float> shifter-sensitivity: 0.5; // 0..1 (= 0..100%)
     // SH1: disabled until the board read lands (or no shifter is
     // configured) — the reason text below says why, instead of
@@ -172,6 +168,10 @@ export component ExtrasScreen inherits PageScaffold {
     in property <string> led-color-hex-text: "#2F6BFF";
     // Local toggle for the custom-colour sliders (no backend state).
     property <bool> show-custom-color: false;
+    // v2.0.19 (F4): Advanced mode (from the top-bar segment,
+    // like Steering/Pedals) hides the fine-tuning rows — grab
+    // speed, shift lockout, LED cycle time / custom colour.
+    in property <bool> advanced: false;
     // DS-54: which job kind the busy strip shows, as a
     // JobKind::order value (-1 = idle) — Horn Learn disables + dims
     // while its LearnOp job (11) runs; Handbrake Set up/down while
@@ -209,6 +209,9 @@ export component ExtrasScreen inherits PageScaffold {
     callback horn-min-changed(float);
     callback horn-min-edited(string);
     callback horn-mode-selected(int);
+    // v2.0.19 (F4): 1-tap reset — handbrake + shifter + horn back
+    // to the Normal preset + defaults.
+    callback reset-defaults();
 
     // P1: the page is a PageScaffold (ScrollView + standard
     // padding) — the 2x2 grid is ~750px tall, taller than the
@@ -298,12 +301,17 @@ export component ExtrasScreen inherits PageScaffold {
                                 }
                                 RangeBlock { up-value: handbrake-up-mv; down-value: handbrake-down-mv; up-disabled: calibration-disabled || busy-kind == 10; down-disabled: calibration-disabled || busy-kind == 10; set-up => { action("handbrake-up"); } set-down => { action("handbrake-down"); } }
                                 if calibration-disabled : Text { text: "RSH isn't running — reconnect to capture."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
+                                // v2.0.19 (F4): feel presets — Soft /
+                                // Normal / Firm (same feel values as
+                                // before: Soft = 1, Normal = 0, Firm = 2).
+                                Text { text: "Feel preset"; font-size: Theme.fs-label; font-weight: 500; color: Theme.text; }
                                 HorizontalLayout { cross-axis-alignment: center;
                                     spacing: 4px;
-                                    PresetChip { horizontal-stretch: 1; label: "Linear"; active: handbrake-feel == 0; clicked => { handbrake-feel-selected(0); } }
                                     PresetChip { horizontal-stretch: 1; label: "Soft"; active: handbrake-feel == 1; clicked => { handbrake-feel-selected(1); } }
-                                    PresetChip { horizontal-stretch: 1; label: "Sharp"; active: handbrake-feel == 2; clicked => { handbrake-feel-selected(2); } }
+                                    PresetChip { horizontal-stretch: 1; label: "Normal"; active: handbrake-feel == 0; clicked => { handbrake-feel-selected(0); } }
+                                    PresetChip { horizontal-stretch: 1; label: "Firm"; active: handbrake-feel == 2; clicked => { handbrake-feel-selected(2); } }
                                 }
+                                Text { text: handbrake-feel == 1 ? "Soft — gentle, forgiving handbrake." : handbrake-feel == 0 ? "Normal — even response, the default." : "Firm — quick, direct response."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
                                 SliderRow { label: "Deadzone"; hint: "Ignores small inputs"; value-text: handbrake-deadzone-text; value: handbrake-deadzone; changed(v) => { handbrake-deadzone-changed(v); } value-edited(t) => { handbrake-deadzone-edited(t); } }
                             }
                             if handbrake-mode == 1 : VerticalLayout {
@@ -321,7 +329,7 @@ export component ExtrasScreen inherits PageScaffold {
                             // while latch is on (the engine enforces
                             // it too); the note says so when it is off.
                             FormRow { label: "Latch mode"; hint: "Press once to hold, again to release"; Switch { accessible-name: "Latch mode"; on: handbrake-latch; toggled => { handbrake-latch-changed(!handbrake-latch); } } }
-                            SliderRow { label: "Grab speed"; hint: "How fast the handbrake bites"; value-text: handbrake-grab-ms-text; value: handbrake-grab-ms; changed(v) => { handbrake-grab-ms-changed(v); } value-edited(t) => { handbrake-grab-ms-edited(t); } }
+                            if advanced : SliderRow { label: "Grab speed"; hint: "How fast the handbrake bites"; value-text: handbrake-grab-ms-text; value: handbrake-grab-ms; changed(v) => { handbrake-grab-ms-changed(v); } value-edited(t) => { handbrake-grab-ms-edited(t); } }
                             FormRow { label: "Auto-release on throttle"; hint: "Throttle releases a latched handbrake"; Switch { accessible-name: "Auto-release on throttle"; on: handbrake-auto-release; toggled => { handbrake-auto-release-changed(!handbrake-auto-release); } } }
                             if !handbrake-latch : Text { text: "Auto-release only works with latch on."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
                             }
@@ -358,34 +366,25 @@ export component ExtrasScreen inherits PageScaffold {
                                 visible: shifter-on;
                                 width: 100%;
                                 spacing: 10px;
-                            Text { text: gear; font-family: Theme.font-mono; font-size: 44px; font-weight: 600; color: Theme.text; horizontal-alignment: center; }
-                            Text { text: shifter-mode == 1 ? "H-pattern · current gear" : "Sequential · current gear"; font-size: Theme.fs-hint; color: Theme.mute; horizontal-alignment: center; }
+                            Text { text: "Sequential"; font-family: Theme.font-mono; font-size: 44px; font-weight: 600; color: Theme.text; horizontal-alignment: center; }
+                            Text { text: "Shift up / down on the wheel"; font-size: Theme.fs-hint; color: Theme.mute; horizontal-alignment: center; }
+                            // v2.0.19 (F4): feel presets — one tap
+                            // sets the sensitivity (Soft 25%, Normal
+                            // 50%, Firm 75%, same values the slider
+                            // writes). The slider stays for fine tuning.
+                            Text { text: "Feel preset"; font-size: Theme.fs-label; font-weight: 500; color: Theme.text; }
+                            HorizontalLayout { cross-axis-alignment: center;
+                                spacing: 4px;
+                                PresetChip { horizontal-stretch: 1; label: "Soft"; active: shifter-sensitivity < 0.375; disabled: sensitivity-disabled; clicked => { shifter-sensitivity-changed(0.25); } }
+                                PresetChip { horizontal-stretch: 1; label: "Normal"; active: shifter-sensitivity >= 0.375 && shifter-sensitivity <= 0.625; disabled: sensitivity-disabled; clicked => { shifter-sensitivity-changed(0.5); } }
+                                PresetChip { horizontal-stretch: 1; label: "Firm"; active: shifter-sensitivity > 0.625; disabled: sensitivity-disabled; clicked => { shifter-sensitivity-changed(0.75); } }
+                            }
+                            Text { text: shifter-sensitivity < 0.375 ? "Soft — light touch shifts." : shifter-sensitivity > 0.625 ? "Firm — needs a solid push to shift." : "Normal — even shift feel, the default."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
                             // D8: the disabled reason (Rust-owned
                             // shifter-sensitivity-reason) shows under the
                             // slider now, via SliderRow itself.
-                            SliderRow { label: "Sensitivity"; hint: "Shift firmness"; value-text: shifter-sensitivity-text; value: shifter-sensitivity; disabled: sensitivity-disabled; disabled-hint: shifter-sensitivity-reason; changed(v) => { shifter-sensitivity-changed(v); } value-edited(t) => { shifter-sensitivity-edited(t); } }
-                            SliderRow { label: "Shift lockout"; hint: "Ignores shifts within this window"; value-text: shifter-lockout-text; value: shifter-lockout; changed(v) => { shifter-lockout-changed(v); } value-edited(t) => { shifter-lockout-edited(t); } }
-                            Text {
-                                text: "Change gear mapping in Buttons";
-                                font-size: Theme.fs-label;
-                                font-weight: 600;
-                                color: gear-fs.has-focus || gear-ta.has-hover ? Theme.text : Theme.accent-text;
-                                accessible-label: "Change gear mapping in Buttons";
-                                accessible-role: button;
-                                // FIX-4: keyboard activation for this text link.
-                                gear-fs := FocusScope {
-                                    width: 100%;
-                                    height: 100%;
-                                    key-pressed(event) => {
-                                        if (event.text == Key.Return || event.text == Key.Space) {
-                                            action("shifter-change-in-buttons");
-                                            return accept;
-                                        }
-                                        return reject;
-                                    }
-                                }
-                                gear-ta := TouchArea { mouse-cursor: pointer; clicked => { action("shifter-change-in-buttons"); } }
-                            }
+                            SliderRow { label: "Sensitivity"; hint: "Shift firmness, as a percent"; value-text: shifter-sensitivity-text; value: shifter-sensitivity; disabled: sensitivity-disabled; disabled-hint: shifter-sensitivity-reason; changed(v) => { shifter-sensitivity-changed(v); } value-edited(t) => { shifter-sensitivity-edited(t); } }
+                            if advanced : SliderRow { label: "Shift lockout"; hint: "Ignores shifts within this window"; value-text: shifter-lockout-text; value: shifter-lockout; changed(v) => { shifter-lockout-changed(v); } value-edited(t) => { shifter-lockout-edited(t); } }
                             }
                             Text {
                                 visible: !shifter-on;
@@ -482,7 +481,7 @@ export component ExtrasScreen inherits PageScaffold {
                                 PresetChip { horizontal-stretch: 1; label: "Rainbow"; active: led-pattern == 4; clicked => { led-pattern-selected(4); } }
                             }
                             SliderRow { label: "Brightness"; hint: "Overall LED brightness"; value-text: led-brightness-text; value: led-brightness; changed(v) => { led-brightness-changed(v); } value-edited(t) => { led-brightness-edited(t); } }
-                            if led-pattern == 2 || led-pattern == 3 || led-pattern == 4 : SliderRow { label: "Blink / Chase speed"; hint: "Blink / Chase / Rainbow cycle time"; value-text: led-period-text; value: (led-period-ms - 100) / 4900; changed(v) => { led-period-changed(v); } value-edited(t) => { led-period-edited(t); } }
+                            if advanced && (led-pattern == 2 || led-pattern == 3 || led-pattern == 4) : SliderRow { label: "Blink / Chase speed"; hint: "Blink / Chase / Rainbow cycle time"; value-text: led-period-text; value: (led-period-ms - 100) / 4900; changed(v) => { led-period-changed(v); } value-edited(t) => { led-period-edited(t); } }
                             if led-pattern == 1 : VerticalLayout {
                                 spacing: 6px;
                                 Text { text: "Colour"; font-size: Theme.fs-label; font-weight: 500; color: Theme.text; }
@@ -517,7 +516,7 @@ export component ExtrasScreen inherits PageScaffold {
                             // swatches — the button opens three channel
                             // sliders (Solid / Blink / Chase; Rainbow
                             // ignores the colour board-side).
-                            if led-pattern == 1 || led-pattern == 2 || led-pattern == 3 : VerticalLayout {
+                            if advanced && (led-pattern == 1 || led-pattern == 2 || led-pattern == 3) : VerticalLayout {
                                 spacing: 6px;
                                 HorizontalLayout {
                                     spacing: 8px;
@@ -545,6 +544,42 @@ export component ExtrasScreen inherits PageScaffold {
                             }
                         }
                     }
+
+    // v2.0.19 (F4): 1-tap reset, same text-link pattern as Steering.
+    HorizontalLayout { cross-axis-alignment: center;
+        spacing: 8px;
+        Text {
+            text: "Reset to defaults";
+            font-size: Theme.fs-label;
+            font-weight: 600;
+            color: extras-reset-fs.has-focus || extras-reset-ta.has-hover ? Theme.text : Theme.accent-text;
+            accessible-label: "Reset handbrake, shifter and horn to defaults";
+            accessible-role: button;
+            extras-reset-fs := FocusScope {
+                y: -4px;
+                width: 100%;
+                height: parent.height + 8px;
+                key-pressed(event) => {
+                    if (event.text == Key.Return || event.text == Key.Space) {
+                        reset-defaults();
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+            if extras-reset-fs.has-focus : Rectangle {
+                x: -6px;
+                y: -3px;
+                width: parent.width + 12px;
+                height: parent.height + 6px;
+                border-radius: 6px;
+                border-width: 2px;
+                border-color: Theme.accent-text;
+            }
+            extras-reset-ta := TouchArea { y: -4px; width: 100%; height: parent.height + 8px; mouse-cursor: pointer; clicked => { reset-defaults(); } }
+        }
+        if unsaved : Text { text: "Unsaved changes"; font-size: Theme.fs-hint; color: Theme.warn; }
+    }
                 }
             }
 }
