@@ -87,7 +87,7 @@ export component MainWindow inherits Window {
     in-out property <int> theme-choice: 0;
     in property <string> profile-name: "GT3 Sprint";
     in property <string> auto-profile-text: "No profile yet";
-    in property <string> app-version: "2.0.20";
+    in property <string> app-version: "2.0.21";
     in property <bool> daemon-live: false;
     // B5 (v2.0.2): the global busy strip reads these — Rust drives
     // them from busy_jobs (each start_*_job records its label, the
@@ -146,6 +146,11 @@ export component MainWindow inherits Window {
     // B5 spinner step (0..11, driven by the strip's Timer).
     property <int> spin-step: 0;
     in property <bool> connected: true;
+    // F3 (v2.0.21): the LIVE transport (0 Wi-Fi, 1 USB) — the
+    // Disconnect buttons label themselves from this. Set from Rust
+    // every frame from `ConnectionInfo.transport`; never the
+    // Settings `transport` segment (that is the user's selection).
+    in property <int> conn-transport: 0;
     in property <string> conn-label: "Disconnected";
     // D10: true while the wheel is not connected for a NON-fault
     // reason (not found / dropped / reconnecting) — the sidebar
@@ -172,12 +177,15 @@ export component MainWindow inherits Window {
     in property <string> curve-text;
     in property <int> preset;
     // Steering Advanced (Bug 7): invert + lock + smoothing — the
-    // old centre/raw-mV readouts are gone (steering.slint).
+    // old centre/raw-mV readouts are gone (steering.slint). The
+    // lock/smoothing defaults are the v2.0.21 P2 factory values
+    // (360° / 0%) — Rust re-syncs them from the live tuning within
+    // one frame; these only paint before the first refresh.
     in property <bool> steer-invert: false;
-    in property <float> steer-lock: 1.0;
-    in property <string> steer-lock-text: "900°";
-    in property <float> steer-smoothing: 0.3;
-    in property <string> steer-smoothing-text: "30%";
+    in property <float> steer-lock: (360.0 - 270.0) / 630.0;
+    in property <string> steer-lock-text: "360°";
+    in property <float> steer-smoothing: 0.0;
+    in property <string> steer-smoothing-text: "0%";
     // Steering per-module tuning (S2+S3): balance −20..+20%
     // (0.5 = even) and centre trim −5..+5% (0.5 = none).
     in property <float> steer-balance: 0.5;
@@ -424,6 +432,10 @@ export component MainWindow inherits Window {
     in-out property <string> diag-delay-text: "—";
     in-out property <string> diag-jitter-text: "—";
     in-out property <string> diag-lost-text: "—";
+    // F4 (v2.0.21 Phase 0): PC-side arrival gap p99 + age-at-output
+    // p99 — "—" until the daemon measures them.
+    in-out property <string> diag-arrival-gap-text: "—";
+    in-out property <string> diag-age-at-output-text: "—";
     in-out property <string> diag-loop-rate-text: "—";
     in-out property <string> diag-tx-failures-text: "—";
     in-out property <string> diag-seq-gaps-text: "—";
@@ -439,6 +451,10 @@ export component MainWindow inherits Window {
 
     callback toggled-send();
     callback reconnect();
+    // F3 (v2.0.21): explicit disconnect of the live transport —
+    // the Overview + Settings Disconnect buttons fire this; Rust
+    // runs it as a `JobKind::Disconnect` job.
+    callback disconnect();
     callback deadzone-changed(float);
     callback curve-changed(float);
     callback deadzone-edited(string);
@@ -774,6 +790,7 @@ export component MainWindow inherits Window {
                 daemon-error: daemon-error;
                 busy-kind: busy-kind;
                 connected: connected;
+                conn-transport: conn-transport;
                 firmware-line: firmware-line;
                 delay-text: delay-text;
                 jitter-text: jitter-text;
@@ -788,6 +805,7 @@ export component MainWindow inherits Window {
                 launch-game(g) => { launch-game(g); }
                 open-diagnostics => { open-diagnostics(); }
                 reconnect => { reconnect(); }
+                disconnect => { disconnect(); }
                 open-profile-popover => { profile-clicked(); }
                 // Manual games (no auto-scan): Add opens the dialog,
                 // Edit / Remove act on the tile's game.
@@ -1025,6 +1043,7 @@ export component MainWindow inherits Window {
             }
             if page == 4 : SettingsScreen {
                 connected: connected;
+                conn-transport: conn-transport;
                 busy-kind: busy-kind;
                 backend-cooldown-secs: backend-cooldown-secs;
                 // Two-way bindings: the screen edits these, Rust
@@ -1051,6 +1070,7 @@ export component MainWindow inherits Window {
                 // carried no payload, so Rust could never save it).
                 address-accepted(a) => { address-accepted(a); }
                 reconnect => { reconnect(); }
+                disconnect => { disconnect(); }
                 wifi-password-set: wifi-password-set;
                 wifi-password-error: wifi-password-error;
                 wifi-password-message: wifi-password-message;
@@ -1271,6 +1291,8 @@ export component MainWindow inherits Window {
         delay-text: diag-delay-text;
         jitter-text: diag-jitter-text;
         lost-text: diag-lost-text;
+        arrival-gap-text: diag-arrival-gap-text;
+        age-at-output-text: diag-age-at-output-text;
         loop-rate-text: diag-loop-rate-text;
         tx-failures-text: diag-tx-failures-text;
         seq-gaps-text: diag-seq-gaps-text;

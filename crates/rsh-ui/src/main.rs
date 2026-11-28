@@ -445,7 +445,7 @@ struct Tuning {
     /// Invert steering (Bug 7 Advanced toggle, default off).
     invert: bool,
     /// Steering lock in degrees (Bug 7 Advanced slider: one of the
-    /// 270/360/540/720/900° steps, default 900°).
+    /// 270/360/540/720/900° steps, default 360° — v2.0.21 P2).
     lock_deg: f32,
     /// Left/right lock balance, percent (−20..+20 — S2 Advanced
     /// slider, default 0 = even; positive favours the left).
@@ -478,7 +478,9 @@ impl Tuning {
             preset,
             smoothing_pct: settings.smoothing.clamp(0.0, 100.0) as f32,
             invert: settings.invert.unwrap_or(false),
-            lock_deg: snap_steering_lock_deg(settings.steering_lock_deg.unwrap_or(900.0)) as f32,
+            // v2.0.21 P2: no stored lock means the 360° factory
+            // default (was 900°).
+            lock_deg: snap_steering_lock_deg(settings.steering_lock_deg.unwrap_or(360.0)) as f32,
             // --- Steering per-module tuning ---
             balance_pct: settings
                 .steering_balance_pct
@@ -571,10 +573,13 @@ impl Tuning {
     fn reset_defaults(&mut self) {
         self.set_preset(1);
         // Bug 7: Reset restores the whole steering tuning, not just
-        // the Basic feel — smoothing 30%, not inverted, full lock.
-        self.smoothing_pct = 30.0;
+        // the Basic feel — smoothing 0% (v2.0.21 P2: the old 30%
+        // lagged the primary axis), not inverted, 360° lock (v2.0.21
+        // P2: the old 900° felt unresponsive in FH4). The preset
+        // above already sets the 2% deadzone.
+        self.smoothing_pct = 0.0;
         self.invert = false;
-        self.lock_deg = 900.0;
+        self.lock_deg = 360.0;
         // --- Steering per-module tuning ---
         self.balance_pct = 0.0;
         self.trim_pct = 0.0;
@@ -963,6 +968,13 @@ enum JobKind {
     /// sensitivity push is never swallowed by an in-flight
     /// `TuningPush` — and vice versa — by the duplicate-start rule.
     SensitivityPush,
+    /// Disconnect (F3, v2.0.21): the explicit per-transport
+    /// disconnect (`AppApi::disconnect()` → IPC `"disconnect"` →
+    /// daemon `disconnect_transport()`). Its OWN kind, so the
+    /// Disconnect button disables + dims while its job runs
+    /// (busy-kind 19) and a second click while one is in flight is
+    /// ignored by the duplicate-start rule.
+    Disconnect,
 }
 
 impl JobKind {
@@ -1003,10 +1015,13 @@ impl JobKind {
             // IPC arm (`timeout_for_method`), so their jobs get
             // 15 s — a lossy link + board control retries can push
             // a push/check past the old 5–10 s bounds while the
-            // daemon still lands it.
+            // daemon still lands it. `disconnect` rides the same
+            // 10 s IPC arm (session control + an OS serial-port
+            // rescan), so the Disconnect job gets 15 s too.
             JobKind::FirmwareUpdate
             | JobKind::SensitivityPush
             | JobKind::FirmwareCheck
+            | JobKind::Disconnect
             | JobKind::TuningPush => Duration::from_secs(15),
             // Settings ops share 10 s — they are fast settings
             // writes (500 ms IPC default), EXCEPT the slow ones,
@@ -1058,6 +1073,9 @@ impl JobKind {
             JobKind::ReconnectSeed => 15,
             JobKind::AppUpdateCheck => 16,
             JobKind::SensitivityPush => 18,
+            // F3 (v2.0.21): the Disconnect button disables on
+            // `busy-kind == 19` while its job runs.
+            JobKind::Disconnect => 19,
         }
     }
 }
@@ -1362,6 +1380,12 @@ enum JobDone {
     ReconnectSeed {
         api: Arc<IpcApi>,
         seed: crate::ipc_api::LiveSeed,
+    },
+    /// Disconnect finished (F3, v2.0.21): the connection state
+    /// right after the disconnect — `Disconnected` on success, so
+    /// the frame re-derives the Overview/Settings pills from it.
+    Disconnect {
+        result: Result<ConnectionInfo, UserError>,
     },
     /// Generic job finished (F6): `id` routes the result to the
     /// `PendingApply` the starter registered; `result` is the job
@@ -2668,6 +2692,17 @@ impl Ctx {
         // repaints, so a 20 Hz frame that re-sets ~50 props costs a
         // repaint even when nothing moved.
         set_if_changed(win.get_connected(), connected, |v| win.set_connected(v));
+        // F3 (v2.0.21): the LIVE transport (0 Wi-Fi, 1 USB) — the
+        // Disconnect buttons label themselves from this, so the
+        // button always names the transport that is actually
+        // connected. (The Settings `transport` segment is the
+        // user's SELECTION, not the live transport — never read it
+        // for the label.)
+        set_if_changed(
+            win.get_conn_transport(),
+            i32::from(conn.transport == ApiTransport::Usb),
+            |v| win.set_conn_transport(v),
+        );
         set_if_changed(
             win.get_conn_label(),
             self.frame_cmds.borrow_mut().conn_label(
@@ -4200,6 +4235,32 @@ impl Ctx {
                     }
                 }
             }
+            JobDone::Disconnect { result } => {
+                if self
+                    .busy_jobs
+                    .borrow_mut()
+                    .remove(&JobKind::Disconnect)
+                    .is_none()
+                {
+                    return;
+                }
+                match result {
+                    Ok(info) => {
+                        ui_log!(
+                            "RSH-UI disconnect ok: {} (transport {:?})",
+                            info.label,
+                            info.transport
+                        );
+                        // D17: the disconnect itself is not a
+                        // notification — the busy strip was the
+                        // surface while it ran, and the frame
+                        // re-derives the pills + banners from the
+                        // Disconnected state at once.
+                        self.refresh(win, 0);
+                    }
+                    Err(e) => self.notify_error(win, "Connection", &e),
+                }
+            }
             JobDone::Backend { index, result } => {
                 if self
                     .busy_jobs
@@ -4897,6 +4958,46 @@ impl Ctx {
                 result: api.connect(transport),
             },
         );
+    }
+
+    /// Start an explicit disconnect job (F3, v2.0.21): the
+    /// Disconnect button (Overview + Settings, shown per transport
+    /// while connected) calls this, and ONLY this function calls
+    /// [`AppApi::disconnect`] from the UI — the one clearly-marked
+    /// call site. The IPC method is `"disconnect"` (already
+    /// plumbed: `IpcApi::disconnect` → daemon
+    /// `DaemonApi::disconnect` → `disconnect_transport`, which
+    /// closes the session gate, aborts the forwarder and reports
+    /// `Disconnected`). It runs on a background thread under
+    /// [`JobKind::Disconnect`] (15 s job timeout over the 10 s IPC
+    /// arm), so the click never blocks on the daemon and the button
+    /// disables while it runs.
+    fn start_disconnect_job(&self, win: &MainWindow) {
+        // R2-15 (same shape as the transport switch): no live
+        // daemon → refuse visibly instead of running the job —
+        // never a silent Ok against the sim.
+        if !self.is_live() {
+            self.notify_toast(
+                win,
+                "Connection",
+                "RSH isn't running",
+                "Reconnect to RSH, then try again.",
+            );
+            return;
+        }
+        // The button only shows while connected; a click that
+        // arrives after the session already dropped is a no-op —
+        // nothing to disconnect, and no job to time out.
+        let conn = self.api().connection();
+        if !matches!(conn.state, ConnectionState::Active) {
+            return;
+        }
+        let api = self.api();
+        self.run_job(win, JobKind::Disconnect, "Disconnecting…", move || {
+            JobDone::Disconnect {
+                result: api.disconnect(),
+            }
+        });
     }
 
     /// Start an output-backend switch job (A9/B-2): `set_output_backend`
@@ -5956,30 +6057,34 @@ impl Ctx {
     /// Reset all three pedals to the Normal preset + defaults (v2.0.19,
     /// F4 — 1-tap reset): one `TuningPush` job sets all three records,
     /// so the duplicate-start rule cannot swallow the 2nd/3rd push.
-    /// Defaults mirror the sync fallbacks: curve 1.0 / 1.3 / 1.0,
-    /// deadzone 0, bite 0, slip zone 15%, brake force 100%, ramps
-    /// 100/50 ms (throttle), 50 ms (brake), 300 ms (clutch release),
-    /// saturation 100% (full travel), combined pedals off.
+    /// Defaults mirror the sync fallbacks (v2.0.21 P2/F7): curve
+    /// 1.0 / 1.3 / 1.0, deadzone 2% (kills pot idle drift — the old
+    /// 0% let a noisy 50k pot wander), bite 0, slip zone 15%, brake
+    /// force 100%, ramps 100/50 ms (throttle), 0/50 ms (brake —
+    /// instant bite), 50/300 ms (clutch), saturation 100% (full
+    /// travel), combined pedals off.
     fn reset_pedals_defaults(&self, win: &MainWindow) {
         let api = self.api();
         let mut throttle = api.get_tuning("throttle");
         throttle.curve = 1.0;
-        throttle.deadzone = 0.0;
+        throttle.deadzone = 2.0;
         throttle.press_ms = Some(100.0);
         throttle.release_ms = Some(50.0);
         throttle.combine_pedals = Some(false);
         throttle.max_mv = self.throttle_saturation_max_mv(&throttle, 100.0);
         let mut brake = api.get_tuning("brake");
         brake.curve = 1.3;
-        brake.deadzone = 0.0;
+        brake.deadzone = 2.0;
         brake.bite_point = Some(0.0);
         brake.saturation = Some(1.0);
-        brake.press_ms = Some(50.0);
+        brake.press_ms = Some(0.0);
+        brake.release_ms = Some(50.0);
         let mut clutch = api.get_tuning("clutch");
         clutch.curve = 1.0;
-        clutch.deadzone = 0.0;
+        clutch.deadzone = 2.0;
         clutch.bite_point = Some(0.0);
         clutch.bite_width = Some(0.15);
+        clutch.press_ms = Some(50.0);
         clutch.release_ms = Some(300.0);
         let records = [throttle, brake, clutch];
         self.run_generic_job(
@@ -7987,6 +8092,25 @@ impl Ctx {
                     format!("{:.1}%", stats.loss_pct).into(),
                     |v| win.set_diag_lost_text(v),
                 );
+                // F4 (v2.0.21 Phase 0): PC-side arrival gap p99 +
+                // age-at-output p99 — "—" until the daemon
+                // measures them, never a fake 0.
+                set_if_changed(
+                    win.get_diag_arrival_gap_text(),
+                    stats
+                        .arrival_gap_ms_p99
+                        .map_or_else(|| "—".to_string(), |v| format!("{v:.0} ms"))
+                        .into(),
+                    |v| win.set_diag_arrival_gap_text(v),
+                );
+                set_if_changed(
+                    win.get_diag_age_at_output_text(),
+                    stats
+                        .age_at_output_ms_p99
+                        .map_or_else(|| "—".to_string(), |v| format!("{v:.0} ms"))
+                        .into(),
+                    |v| win.set_diag_age_at_output_text(v),
+                );
                 set_if_changed(
                     win.get_diag_loop_rate_text(),
                     stats
@@ -8033,6 +8157,12 @@ impl Ctx {
             });
             set_if_changed(win.get_diag_lost_text(), "—".into(), |v| {
                 win.set_diag_lost_text(v);
+            });
+            set_if_changed(win.get_diag_arrival_gap_text(), "—".into(), |v| {
+                win.set_diag_arrival_gap_text(v);
+            });
+            set_if_changed(win.get_diag_age_at_output_text(), "—".into(), |v| {
+                win.set_diag_age_at_output_text(v);
             });
             set_if_changed(win.get_diag_loop_rate_text(), "—".into(), |v| {
                 win.set_diag_loop_rate_text(v);
@@ -11000,6 +11130,24 @@ fn wire_reconnect(win: &MainWindow, ctx: &Rc<Ctx>) {
     });
 }
 
+/// Wire Disconnect (F3, v2.0.21): the Overview + Settings
+/// Disconnect buttons (shown per transport while connected) start
+/// the disconnect job (see [`Ctx::start_disconnect_job`]) — the
+/// click returns immediately with the "Disconnecting…" busy strip,
+/// and the verdict arrives via the job channel. A second click
+/// while one is in flight is ignored instead of queueing another
+/// disconnect.
+fn wire_disconnect(win: &MainWindow, ctx: &Rc<Ctx>) {
+    let win = win.as_weak();
+    let ctx = ctx.clone();
+    win.unwrap().on_disconnect(move || {
+        let Some(w) = win.upgrade() else {
+            return;
+        };
+        ctx.start_disconnect_job(&w);
+    });
+}
+
 /// Wire Set centre + Launch game (A14/A22): Set centre captures
 /// the live centre (v2.0.2). Launch game works off the real games
 /// list: running → Stop, installed → Launch, not installed → honest
@@ -11713,6 +11861,7 @@ fn wire_diagnostics_opener(win: &MainWindow, ctx: &Rc<Ctx>) {
 #[allow(clippy::too_many_lines)]
 fn wire_actions(win: &MainWindow, ctx: &Rc<Ctx>) {
     wire_reconnect(win, ctx);
+    wire_disconnect(win, ctx);
     wire_action_notifications(win, ctx);
     wire_settings_action(win, ctx);
     wire_diagnostics_opener(win, ctx);
@@ -12926,7 +13075,9 @@ mod tests {
     fn steering_advanced_fields_round_trip_through_settings() {
         let mut t = Tuning::from_settings(&TuningSettings::neutral("steering"));
         assert!(!t.invert);
-        assert_eq!(t.lock_deg, 900.0);
+        // v2.0.21 P2: a neutral record carries no lock, so the
+        // factory default is 360°, not the old 900°.
+        assert_eq!(t.lock_deg, 360.0);
         assert_eq!(t.balance_pct, 0.0);
         assert_eq!(t.trim_pct, 0.0);
         t.set_invert(true);
@@ -12959,9 +13110,11 @@ mod tests {
         assert_eq!(t.deadzone_pct, 30.0);
         t.reset_defaults();
         assert_eq!(t.preset, 1);
-        assert_eq!(t.smoothing_pct, 30.0);
+        // v2.0.21 P2: reset restores smoothing 0% and the 360°
+        // lock (was 30% / 900°).
+        assert_eq!(t.smoothing_pct, 0.0);
         assert!(!t.invert);
-        assert_eq!(t.lock_deg, 900.0);
+        assert_eq!(t.lock_deg, 360.0);
         assert_eq!(t.balance_pct, 0.0);
         assert_eq!(t.trim_pct, 0.0);
     }
@@ -13088,6 +13241,7 @@ mod tests {
                 running: false,
                 installed: true,
                 bound_profile_id: None,
+                launch_error: None,
             },
             GameSummary {
                 id: "legacy".to_string(),
@@ -13096,6 +13250,7 @@ mod tests {
                 running: false,
                 installed: false,
                 bound_profile_id: None,
+                launch_error: None,
             },
         ];
         {
@@ -14094,8 +14249,8 @@ mod tests {
         ctx.sync_pedals(&win);
         // Sim neutral = task defaults: throttle curve 1.00, tip-in
         // 100 ms, lift-off 50 ms, saturation 100%, combined off;
-        // brake curve 1.30, bite 50 ms; clutch curve 1.00, release
-        // 300 ms.
+        // brake curve 1.30, bite instant (0 ms, v2.0.21 F7); clutch
+        // curve 1.00, release 300 ms.
         assert!((win.get_throttle_curve_value() - 1.0_f32 / 3.0).abs() < 0.001);
         assert_eq!(win.get_throttle_curve_text().as_str(), "1.00");
         assert!((win.get_throttle_press_ms_value() - 0.2).abs() < 0.001);
@@ -14107,8 +14262,8 @@ mod tests {
         assert!(!win.get_combine_pedals());
         assert!((win.get_brake_curve_value() - 0.8_f32 / 1.5).abs() < 0.001);
         assert_eq!(win.get_brake_curve_text().as_str(), "1.30");
-        assert!((win.get_brake_press_ms_value() - 50.0 / 300.0).abs() < 0.001);
-        assert_eq!(win.get_brake_press_ms_text().as_str(), "50 ms");
+        assert_eq!(win.get_brake_press_ms_value(), 0.0);
+        assert_eq!(win.get_brake_press_ms_text().as_str(), "0 ms");
         assert!((win.get_clutch_curve_value() - 1.0_f32 / 3.0).abs() < 0.001);
         assert_eq!(win.get_clutch_curve_text().as_str(), "1.00");
         assert!((win.get_clutch_release_ms_value() - 0.3).abs() < 0.001);
@@ -14268,10 +14423,11 @@ mod tests {
         let (ctx, dir) = fc2_test_ctx();
         wire_callbacks(&win, &ctx);
         ctx.refresh(&win, 0);
-        // Sim neutral: not inverted, full lock, no smoothing.
+        // Sim neutral: not inverted, 360° lock (v2.0.21 P2 factory
+        // default), no smoothing.
         assert!(!win.get_steer_invert());
-        assert_eq!(win.get_steer_lock(), 1.0);
-        assert_eq!(win.get_steer_lock_text().as_str(), "900°");
+        assert!((win.get_steer_lock() - (360.0 - 270.0) / 630.0).abs() < 0.001);
+        assert_eq!(win.get_steer_lock_text().as_str(), "360°");
         assert_eq!(win.get_steer_smoothing(), 0.0);
         // S2+S3 defaults: even balance (0.5), no trim (0.5).
         assert_eq!(win.get_steer_balance(), 0.5);
@@ -15498,6 +15654,109 @@ mod tests {
             win.get_status_text().as_str(),
             "",
             "a started switch must not toast"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3 (v2.0.21): the Disconnect job — 15 s timeout over the
+    /// 10 s IPC arm, its own busy-strip slot (19) — applies cleanly:
+    /// success clears the busy entry and toasts nothing (the frame
+    /// re-derives the pills from `Disconnected`), failure toasts
+    /// once, and the button refuses visibly while RSH isn't running
+    /// instead of running a job against the sim.
+    #[test]
+    fn disconnect_job_applies_and_refuses_without_daemon() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("disconnect test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        // Job > IPC invariant (v2.0.18): the `disconnect` IPC arm
+        // is 10 s, so the job must give it more room.
+        assert_eq!(JobKind::Disconnect.timeout(), Duration::from_secs(15));
+        assert_eq!(JobKind::Disconnect.order(), 19);
+
+        // Success: busy clears, no toast.
+        ctx.busy_jobs.borrow_mut().insert(
+            JobKind::Disconnect,
+            (
+                "Disconnecting…".to_string(),
+                Instant::now(),
+                JobKind::Disconnect.timeout(),
+            ),
+        );
+        let disconnected = ConnectionInfo {
+            state: ConnectionState::Idle,
+            label: "Disconnected".to_string(),
+            transport: ApiTransport::Wifi,
+            address: String::new(),
+            session_active: false,
+            board_reachable: false,
+            error: None,
+            hint: None,
+            connect_started: None,
+        };
+        ctx.apply_job_done(
+            &win,
+            JobDone::Disconnect {
+                result: Ok(disconnected),
+            },
+        );
+        assert!(
+            !ctx.busy_jobs.borrow().contains_key(&JobKind::Disconnect),
+            "a finished disconnect clears its busy entry"
+        );
+        assert_eq!(
+            win.get_status_text().as_str(),
+            "",
+            "a successful disconnect must not toast"
+        );
+
+        // Failure: busy clears, exactly one error toast.
+        ctx.busy_jobs.borrow_mut().insert(
+            JobKind::Disconnect,
+            (
+                "Disconnecting…".to_string(),
+                Instant::now(),
+                JobKind::Disconnect.timeout(),
+            ),
+        );
+        ctx.apply_job_done(
+            &win,
+            JobDone::Disconnect {
+                result: Err(UserError::from_connection(
+                    ConnectionError::Unknown,
+                    "engine is not running",
+                )),
+            },
+        );
+        assert!(
+            !ctx.busy_jobs.borrow().contains_key(&JobKind::Disconnect),
+            "a failed disconnect clears its busy entry"
+        );
+        assert_eq!(win.get_status_kind().as_str(), "error");
+        assert!(
+            win.get_status_text()
+                .as_str()
+                .contains("engine is not running"),
+            "a failed disconnect must toast the reason, got: {}",
+            win.get_status_text()
+        );
+
+        // No live daemon: the button refuses visibly, no job starts.
+        ctx.clear_status(&win);
+        win.invoke_disconnect();
+        assert!(
+            !ctx.busy_jobs.borrow().contains_key(&JobKind::Disconnect),
+            "a refused disconnect starts no job"
+        );
+        assert!(
+            win.get_status_title()
+                .as_str()
+                .contains("RSH isn't running"),
+            "a refused disconnect must say RSH isn't running, got: {}",
+            win.get_status_title()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

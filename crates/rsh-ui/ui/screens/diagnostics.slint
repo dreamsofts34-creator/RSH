@@ -75,6 +75,10 @@ export component DiagnosticsDrawer inherits FocusScope {
     in property <string> delay-text: "—";
     in property <string> jitter-text: "—";
     in property <string> lost-text: "—";
+    // F4 (v2.0.21 Phase 0): PC-side arrival gap p99 + age-at-output
+    // p99 — "—" until the daemon measures them.
+    in property <string> arrival-gap-text: "—";
+    in property <string> age-at-output-text: "—";
     in property <string> loop-rate-text: "—";
     in property <string> tx-failures-text: "—";
     in property <string> seq-gaps-text: "—";
@@ -188,6 +192,16 @@ export component DiagnosticsDrawer inherits FocusScope {
                         StatCell { horizontal-stretch: 1; label: "Loop rate"; value: loop-rate-text; }
                         StatCell { horizontal-stretch: 1; label: "TX failures"; value: tx-failures-text; bad: tx-failures-text != "0" && tx-failures-text != "—"; }
                         StatCell { horizontal-stretch: 1; label: "Sequence gaps"; value: seq-gaps-text; bad: seq-gaps-text != "0" && seq-gaps-text != "—"; }
+                    }
+                    // F4 (v2.0.21 Phase 0): the PC-side measures —
+                    // arrival gap p99 + age-at-output p99. The
+                    // third cell is a spacer so the two values sit
+                    // in the same columns as the rows above.
+                    HorizontalLayout {
+                        spacing: 12px;
+                        StatCell { horizontal-stretch: 1; label: "Arrival gap (p99)"; value: arrival-gap-text; bad: stats-bad; }
+                        StatCell { horizontal-stretch: 1; label: "Age at output (p99)"; value: age-at-output-text; bad: stats-bad; }
+                        Rectangle { horizontal-stretch: 1; }
                     }
                     // DS-82: frame-time histogram (this UI, last
                     // 30 s) + IPC dispatch latency (the daemon).

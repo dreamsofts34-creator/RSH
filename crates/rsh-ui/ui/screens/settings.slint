@@ -101,6 +101,9 @@ export component SettingsScreen inherits VerticalLayout {
     // JobKind::order value (-1 = idle) — the invoking button
     // disables + dims while its job runs.
     in property <int> busy-kind: -1;
+    // F3 (v2.0.21): the LIVE transport (0 Wi-Fi, 1 USB) — the
+    // Disconnect button labels itself from this.
+    in property <int> conn-transport: 0;
     in-out property <int> connection-type: 0; // 0 Wi-Fi, 1 USB cable
     // L-2: "—" until Rust sets the live address — never a hardcoded
     // default (the window binds this to setup-address).
@@ -119,7 +122,7 @@ export component SettingsScreen inherits VerticalLayout {
     // Theme.mode; the window binds this two-way to `theme-choice`.
     in-out property <int> theme-choice: 0;
     in-out property <[ProfileRow]> profiles;
-    in-out property <string> app-version: "RSH 2.0.20";
+    in-out property <string> app-version: "RSH 2.0.21";
     in-out property <string> firmware-text: "—";
     in-out property <string> app-update-text: "Auto-update is off — new versions are on GitHub Releases";
     in-out property <string> backup-text: "No backups yet";
@@ -141,6 +144,8 @@ export component SettingsScreen inherits VerticalLayout {
     // (Enter = accept the address, not Save — M5.)
     callback address-accepted(string);
     callback reconnect();
+    // F3 (v2.0.21): explicit disconnect of the live transport.
+    callback disconnect();
     callback set-wifi-password();
     callback forget-wifi-password();
     callback backend-selected(int);
@@ -214,6 +219,19 @@ export component SettingsScreen inherits VerticalLayout {
                                 enabled: [busy-kind != 1, busy-kind != 1];
                                 selected: connection-type;
                                 selected-changed(i) => { connection-type = i; connection-selected(i); }
+                            }
+                            // F3 (v2.0.21): Disconnect, under the
+                            // transport selector — one button per
+                            // transport, labelled for the transport
+                            // that is actually connected, shown only
+                            // while connected. `visible` (not `if`)
+                            // keeps the card's height while
+                            // disconnected. Disabled while its job
+                            // runs (busy-kind 19); the busy strip
+                            // shows "Disconnecting…" meanwhile.
+                            HorizontalLayout {
+                                padding-top: 6px;
+                                Btn { label: conn-transport == 1 ? "Disconnect USB" : "Disconnect Wi-Fi"; visible: connected; disabled: busy-kind == 19; clicked => { disconnect(); } }
                             }
                             HorizontalLayout { cross-axis-alignment: center;
                                 padding-top: 6px;

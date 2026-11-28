@@ -3357,6 +3357,7 @@ mod tests {
                 running: false,
                 installed: true,
                 bound_profile_id: None,
+                launch_error: None,
             }
         }
     }
