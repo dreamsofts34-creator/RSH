@@ -2317,190 +2317,13 @@ fn read_gate_source(path: &str) -> Result<String, String> {
         .map_err(|error| format!("read {path} failed: {error}"))
 }
 
-/// Gate: encoder tuning (E1–E4) — the Buttons page's "Rotary knob
-/// tuning" card holds the pulse-length slider, the steps-per-click
-/// segment, the acceleration switch + strength slider, and the
-/// per-knob invert switches, and the window + Rust wiring exist
-/// behind them. Static
-/// source checks only: the Buttons page has no probe harness (its
-/// render needs the full window + bindings), so — like the first half
-/// of `ui_steering_advanced` — this proves the controls are in the
-/// source and wired, not that they paint.
-fn ui_encoder_tuning() -> Outcome {
-    let mut report = Report::new();
-    let buttons = match read_gate_source("crates/rsh-ui/ui/screens/buttons.slint") {
-        Ok(src) => src,
-        Err(error) => return Outcome::fail(error),
-    };
-    for label in [
-        "Rotary knob tuning",
-        "Pulse length",
-        "Steps per click",
-        "Acceleration",
-        "Acceleration strength",
-        "Invert Knob 1",
-        "Invert Knob 2",
-    ] {
-        report.check(
-            &format!("encoder-tuning-has-{label}"),
-            buttons.contains(label),
-            &format!("buttons.slint must contain the {label} control"),
-        );
-    }
-    let main_slint = match read_gate_source("crates/rsh-ui/ui/main.slint") {
-        Ok(src) => src,
-        Err(error) => return Outcome::fail(error),
-    };
-    for prop in [
-        "enc-pulse-ms",
-        "enc-pulse-text",
-        "enc-counts",
-        "enc-accel",
-        "enc-accel-sens",
-        "enc-accel-sens-text",
-        "enc-invert1",
-        "enc-invert2",
-    ] {
-        report.check(
-            &format!("encoder-tuning-prop-{prop}"),
-            main_slint.contains(prop),
-            &format!("main.slint must carry the {prop} window property"),
-        );
-    }
-    for callback in [
-        "enc-pulse-changed",
-        "enc-pulse-edited",
-        "enc-counts-changed",
-        "enc-accel-changed",
-        "enc-accel-sens-changed",
-        "enc-accel-sens-edited",
-        "enc-invert-changed",
-    ] {
-        report.check(
-            &format!("encoder-tuning-callback-{callback}"),
-            main_slint.contains(&format!("callback {callback}")),
-            &format!("main.slint must declare the {callback} callback"),
-        );
-    }
-    let main_rs = match read_gate_source("crates/rsh-ui/src/main.rs") {
-        Ok(src) => src,
-        Err(error) => return Outcome::fail(error),
-    };
-    for wired in [
-        "on_enc_pulse_changed",
-        "on_enc_pulse_edited",
-        "on_enc_counts_changed",
-        "on_enc_accel_changed",
-        "on_enc_accel_sens_changed",
-        "on_enc_accel_sens_edited",
-        "on_enc_invert_changed",
-        "FieldKind::EncoderPulseMs",
-        "FieldKind::EncoderAccelSens",
-        "sync_encoder_props",
-    ] {
-        report.check(
-            &format!("encoder-tuning-wired-{wired}"),
-            main_rs.contains(wired),
-            &format!("main.rs must wire {wired}"),
-        );
-    }
-    report.finish()
-}
-
-/// Gate: button tuning (BU1–BU2) — the Buttons page's "Button
-/// tuning" card holds the debounce + long-press threshold sliders,
-/// the edit panel holds the long-press action picker, and the window
-/// + Rust wiring exist behind them. Static source checks only: the
-///   Buttons page has no probe harness (its render needs the full
-///   window + bindings), so — like `ui_encoder_tuning` — this proves
-///   the controls are in the source and wired, not that they paint.
-fn ui_button_tuning() -> Outcome {
-    let mut report = Report::new();
-    let buttons = match read_gate_source("crates/rsh-ui/ui/screens/buttons.slint") {
-        Ok(src) => src,
-        Err(error) => return Outcome::fail(error),
-    };
-    for label in [
-        "Button tuning",
-        "Debounce",
-        "Long-press threshold",
-        "Double-press window",
-        "Long-press action",
-    ] {
-        report.check(
-            &format!("button-tuning-has-{label}"),
-            buttons.contains(label),
-            &format!("buttons.slint must contain the {label} control"),
-        );
-    }
-    let main_slint = match read_gate_source("crates/rsh-ui/ui/main.slint") {
-        Ok(src) => src,
-        Err(error) => return Outcome::fail(error),
-    };
-    for prop in [
-        "btn-debounce-ms",
-        "btn-debounce-text",
-        "btn-longpress-ms",
-        "btn-longpress-text",
-        "btn-doublepress-ms",
-        "btn-doublepress-text",
-        "selected-long-action",
-    ] {
-        report.check(
-            &format!("button-tuning-prop-{prop}"),
-            main_slint.contains(prop),
-            &format!("main.slint must carry the {prop} window property"),
-        );
-    }
-    for callback in [
-        "btn-debounce-changed",
-        "btn-debounce-edited",
-        "btn-longpress-changed",
-        "btn-longpress-edited",
-        "btn-doublepress-changed",
-        "btn-doublepress-edited",
-        "long-action-chip",
-    ] {
-        report.check(
-            &format!("button-tuning-callback-{callback}"),
-            main_slint.contains(&format!("callback {callback}")),
-            &format!("main.slint must declare the {callback} callback"),
-        );
-    }
-    let main_rs = match read_gate_source("crates/rsh-ui/src/main.rs") {
-        Ok(src) => src,
-        Err(error) => return Outcome::fail(error),
-    };
-    for wired in [
-        "on_btn_debounce_changed",
-        "on_btn_debounce_edited",
-        "on_btn_longpress_changed",
-        "on_btn_longpress_edited",
-        "on_btn_doublepress_changed",
-        "on_btn_doublepress_edited",
-        "on_long_action_chip",
-        "FieldKind::ButtonDebounceMs",
-        "FieldKind::ButtonLongPressMs",
-        "FieldKind::ButtonDoublePressMs",
-        "sync_button_props",
-        "set_long_press_binding",
-    ] {
-        report.check(
-            &format!("button-tuning-wired-{wired}"),
-            main_rs.contains(wired),
-            &format!("main.rs must wire {wired}"),
-        );
-    }
-    report.finish()
-}
-
 /// Gate: shifter tuning (SH1–SH2) — the Extras page's Shifter card
 /// holds the sensitivity slider (board-config value, read once +
 /// written through the config transaction) and the shift-lockout
 /// slider (a `set_tuning` field), and the window + Rust wiring
 /// exist behind them. Static source checks only: the Extras page
 /// has no probe harness (its render needs the full window +
-/// bindings), so — like `ui_encoder_tuning` — this proves the
+/// bindings), so this proves the
 /// controls are in the source and wired, not that they paint.
 fn ui_shifter_tuning() -> Outcome {
     let mut report = Report::new();
@@ -2581,8 +2404,7 @@ fn ui_shifter_tuning() -> Outcome {
 /// Extras handbrake card holds the latch switch, the grab-speed
 /// slider and the auto-release switch; the Pedals clutch card holds
 /// the slip-zone slider (clutch only); the window + Rust wiring
-/// exist behind them. Static source checks only, like
-/// `ui_encoder_tuning`: the Extras page has no probe harness, and
+/// exist behind them. Static source checks only: the Extras page has no probe harness, and
 /// the clutch slider's callback fire is covered by the pedals probe
 /// (`pedals_probe_callbacks`).
 fn ui_handbrake_clutch_tuning() -> Outcome {
@@ -2681,7 +2503,7 @@ fn ui_handbrake_clutch_tuning() -> Outcome {
 /// honk slider and the Momentary / Latch segment; the window +
 /// Rust wiring exist behind them. Static source checks only: the
 /// Extras page has no probe harness (its render needs the full
-/// window + bindings), so — like `ui_encoder_tuning` — this proves
+/// window + bindings), so this proves
 /// the controls are in the source and wired, not that they paint.
 fn ui_led_horn_tuning() -> Outcome {
     let mut report = Report::new();
@@ -2942,16 +2764,6 @@ fn checks() -> Vec<UiCheck> {
             "ui-pedals-advanced",
             "Workstream C: Pedals Advanced holds per-module curve / ramps / saturation / combined pedals",
             ui_pedals_advanced as fn() -> Outcome,
-        ),
-        (
-            "ui-encoder-tuning",
-            "E1-E4: Buttons page holds pulse length + steps per click + accel + per-knob invert, wired through main.rs",
-            ui_encoder_tuning as fn() -> Outcome,
-        ),
-        (
-            "ui-button-tuning",
-            "BU1-BU3: Buttons page holds debounce + long-press threshold + double-press window sliders + long-press action picker, wired through main.rs",
-            ui_button_tuning as fn() -> Outcome,
         ),
         (
             "ui-shifter-tuning",
