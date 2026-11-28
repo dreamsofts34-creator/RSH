@@ -83,8 +83,6 @@ BrandingText "RSH ${VERSION}"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "..\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
-; FH4 Steam mode (v2.0.15, Part A3): the components page carries
-; the optional "Steam FH4 wheel mode" section (off by default).
 ; The main RSH section is required (SectionIn RO).
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_INSTFILES
@@ -117,8 +115,7 @@ InstallDirRegKey HKLM "Software\RSH" "InstallDir"
 RequestExecutionLevel admin
 ; Admin is requested ONCE here, at install time, so the firewall
 ; rule below can be created. Nothing at login ever prompts (D-7:
-; the daemon defers the elevated HIDMaestro sidecar until
-; "Send to game" is turned on).
+; no backend is deferred at startup in v2.0.19).
 ; ---- Smart installer: detect an existing install ------------
 ; Reads HKLM\Software\RSH "Version" (written by this installer
 ; since v2.0.2) and falls back to the Uninstall key
@@ -233,9 +230,6 @@ Function KillRSHProcesses
     ; the old app (own per-user install + uninstall entry)
     ; — it only stops it so the port is free.
     nsExec::Exec 'taskkill /F /IM RSH.exe'
-    ; P1-B: stop the sidecar too (both names) — it locks its exe + DLL.
-    nsExec::Exec 'taskkill /F /IM RshCoreHiDcr.exe'
-    nsExec::Exec 'taskkill /F /IM rsh-hm-sidecar.exe'
     Sleep 500
     IntOp $R0 $R0 + 1
     nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq rsh-ui.exe" /NH'
@@ -250,22 +244,6 @@ Function KillRSHProcesses
     Pop $R1  ; exit code (discard)
     Pop $R2  ; stdout: image name present only if still running
     ${StrStr} $R3 $R2 "rsh-daemon.exe"
-    ${If} $R3 != ""
-    ${AndIf} $R0 < 10
-      Goto DS68KillLoop
-    ${EndIf}
-    nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq RshCoreHiDcr.exe" /NH'
-    Pop $R1
-    Pop $R2
-    ${StrStr} $R3 $R2 "RshCoreHiDcr.exe"
-    ${If} $R3 != ""
-    ${AndIf} $R0 < 10
-      Goto DS68KillLoop
-    ${EndIf}
-    nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq rsh-hm-sidecar.exe" /NH'
-    Pop $R1
-    Pop $R2
-    ${StrStr} $R3 $R2 "rsh-hm-sidecar.exe"
     ${If} $R3 != ""
     ${AndIf} $R0 < 10
       Goto DS68KillLoop
@@ -298,14 +276,6 @@ Function KillRSHProcesses
     DetailPrint "KillRSHProcesses: rsh-ui.exe is still running after 10 kill passes — aborting the install."
     Abort
   ${EndIf}
-  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq RshCoreHiDcr.exe" /NH'
-  Pop $R1
-  Pop $R2
-  ${StrStr} $R3 $R2 "RshCoreHiDcr.exe"
-  ${If} $R3 != ""
-    DetailPrint "KillRSHProcesses: RshCoreHiDcr.exe is still running after 10 kill passes — aborting the install."
-    Abort
-  ${EndIf}
 FunctionEnd
 
 ; P2-2 (v2.0.13 polish): copy with one automatic kill-loop retry,
@@ -313,7 +283,7 @@ FunctionEnd
 ; the retry/abort labels unique per expansion (each !insertmacro
 ; call sits on its own line). A locked file used to abort into a
 ; half-installed state with a generic NSIS error.
-; Unique retry/abort labels come from the N parameter (1..6, one
+; Unique retry/abort labels come from the N parameter (1..5, one
 ; per call site below). Neither ${__LINE__} (expands to a dotted
 ; "line.column" value, not a valid label) nor a !define counter
 ; (redefinition is an error) works for this in NSIS.
@@ -340,188 +310,16 @@ FunctionEnd
   ${EndIf}
 !macroend
 
-; FH4 fix #1 (v2.0.13): GameInput RacingWheel mapping for the vJoy
-; device, so Windows.Gaming.Input wheel games (Forza Horizon 4/5,
-; Forza Motorsport on the Store) show a Wheel tab for RSH.
-; Wheel games classify wheels from the registry, not from
-; visibility:
-; mappings for VID VVVV / PID PPPP / usage page UUUU / usage XXXX
-; are read from
-;   HKLM\SYSTEM\CurrentControlSet\Control\GameInput\Devices\VVVVPPPPUUUUXXXX
-; (Microsoft Learn, "Registry data for game controllers"). vJoy
-; device 1 is VID 1234 / PID BEAD, usage page 0001 (Generic
-; Desktop), usage 0004 (Joystick) — hence key 1234BEAD00010004.
-; This is a Windows-level classification, not a per-game hack: no
-; game is detected, no game-specific key is written.
-; Axis indices are RawGameController indices, which follow the
-; vJoy HID descriptor order (fixed upstream in vJoyConf's
-; CreateHidReportDesc): X=0, Y=1, Z=2, Rx=3, Ry=4, Rz=5,
-; Slider=6, Dial=7 — the EmuWheel envelope (see
-; ConfigureVJoyDevice1) enables exactly these eight, so:
-;   Wheel=X/0, Throttle=Y/1, Brake=Z/2, Clutch=Rx/3,
-;   Handbrake=Slider/6.
-; Invert is 0 everywhere: RSH's raw values RISE with input
-; (steering right = max, pedals pressed = max — see
-; crates/rsh-output/src/vjoy.rs), so no inversion is needed.
-; (The Learn example inverts Throttle/Brake because ITS example
-; device reports pedals inverted; RSH does not.)
-; PreviousGear/NextGear are the sequential-shifter paddles:
-; PROTOCOL-V2.2 §1.1 — stream bit 0 = shift-up, bit 1 =
-; shift-down — and the output button word is 1-based (bit 0 =
-; button 1), so NextGear = button 1 = ButtonIndex 0 and
-; PreviousGear = button 2 = ButtonIndex 1. H-pattern gears are
-; deliberately NOT mapped (FirstGear..SixthGear, ReverseGear):
-; the pipeline strips gear bits 5–10 from the button word, so
-; those buttons never fire — a mapping would point at dead
-; indices. Clutch IS mapped (v2.0.14): the vJoy backend feeds
-; clutch to Rx (axis 3) as well as to wClutch, so the axis the
-; mapping points at is really fed (see crates/rsh-output/src/
-; vjoy.rs — clutch was wClutch-only before; mapping it to an
-; unfed axis would have been a lie). Button3–8 are not mapped
-; either: raw buttons 3–4 are pedal buttons (stripped by the
-; pipeline) and 6–11 are the H-pattern gear bits, so only
-; Button1 (shift-up, raw 1) and Button2 (shift-down, raw 2)
-; have fixed assignments. Labels ARE written (v2.0.14): the
-; Learn doc says they "should be present" and its example
-; includes them — v2.0.13 skipped them, and the incomplete tree
-; is the #1 suspect for FH4 ignoring the mapping. DPadUp/Down/
-; Left/Right point at switch index 0 (the 1 discrete POV) with
-; IncludeAdjacent 1, per the example.
-; MaxWheelAngle 450 = the default 900° lock-to-lock, one
-; direction (the Learn example uses 0x1C2 = 450 for the same
-; reason).
-; SetRegView 64 is SCOPED (same pattern as the WER block): the
-; mapping must land in the native 64-bit view, where 64-bit games
-; read it. Written on EVERY install (fresh and update — this
-; section always runs), and removed by the uninstaller.
-; The game must be restarted after install for the mapping to take
-; effect (GameInput reads it at device enumeration). The user's
-; PC retest — in Forza Horizon 4 and in a second game — is the
-; only proof the Wheel tab appears; nothing here claims the wheel
-; works in every game.
-Function WriteGameInputVJoyMapping
-  SetRegView 64
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004" "Description" "RSH Wheel (vJoy)"
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel" "MaxWheelAngle" 450
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Wheel" "AxisIndex" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Wheel" "Invert" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Throttle" "AxisIndex" 1
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Throttle" "Invert" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Brake" "AxisIndex" 2
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Brake" "Invert" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Handbrake" "AxisIndex" 6
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Handbrake" "Invert" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Clutch" "AxisIndex" 3
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Clutch" "Invert" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\PreviousGear" "ButtonIndex" 1
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\NextGear" "ButtonIndex" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Button1" "ButtonIndex" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Button2" "ButtonIndex" 1
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadUp" "SwitchIndex" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadUp" "IncludeAdjacent" 1
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadUp" "SwitchPosition" "Up"
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadDown" "SwitchIndex" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadDown" "IncludeAdjacent" 1
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadDown" "SwitchPosition" "Down"
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadLeft" "SwitchIndex" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadLeft" "IncludeAdjacent" 1
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadLeft" "SwitchPosition" "Left"
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadRight" "SwitchIndex" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadRight" "IncludeAdjacent" 1
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadRight" "SwitchPosition" "Right"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Buttons" "Button0" "LetterA"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Buttons" "Button1" "LetterB"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Buttons" "Button2" "LetterX"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Buttons" "Button3" "LetterY"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Buttons" "Button6" "Menu"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Buttons" "Button7" "View"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Buttons" "Button8" "RightStickButton"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Buttons" "Button9" "LeftStickButton"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Switches" "Switch0Up" "Up"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Switches" "Switch0Right" "Right"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Switches" "Switch0Down" "Down"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Switches" "Switch0Left" "Left"
-  SetRegView 32
-FunctionEnd
-
-; FH4 fix #2 (v2.0.13): the same Windows-level RacingWheel
-; classification for the HIDMaestro device — the parallel /
-; alternate experiment to fix #1, same mechanism, no
-; game-specific behaviour. VID 1209 / PID 5253 (the pid.codes
-; claim; tools/rsh-hm-sidecar/Constants.cs), usage page 0001,
-; usage 0004 — hence key 1209525300010004. Axis indices are
-; RawGameController indices following the custom profile's HID
-; descriptor order (tools/rsh-hm-sidecar/Program.cs,
-; BuildDescriptor: X, Y, Z, Rx, Slider — 5× 16-bit axes, 32
-; buttons, 1 hat, 15-byte report):
-;   Wheel=X/0, Throttle=Y/1, Brake=Z/2, Clutch=Rx/3,
-;   Handbrake=Slider/4.
-; Clutch IS mapped here (and on the vJoy mapping since v2.0.14):
-; Rx is the clutch axis on this profile and RSH feeds it there
-; (crates/rsh-output-hidmaestro/src/mapping.rs). Invert is 0
-; everywhere for the same reason as fix #1 (raw values rise with
-; input — see mapping.rs axis_to_u16: released = 0, pressed =
-; 32767). PreviousGear/NextGear are the same sequential-shifter
-; paddles as fix #1 (PROTOCOL-V2.2 §1.1: bit 0 = shift-up =
-; button 1 = ButtonIndex 0; bit 1 = shift-down = button 2 =
-; ButtonIndex 1). H-pattern gears are not mapped (gear bits are
-; stripped from the button word — same reason as fix #1).
-; Labels, DPad and Button1–2 are written exactly as in fix #1
-; (same Learn example values), v2.0.14.
-; MaxWheelAngle 450, same as fix #1 (default 900° lock). Written
-; on EVERY install (fresh and update), removed by the
-; uninstaller. The game must be restarted after install; the
-; user's PC retest (FH4 and a second game) is the only proof.
-Function WriteGameInputHidMapping
-  SetRegView 64
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004" "Description" "RSH Wheel (HIDMaestro)"
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel" "MaxWheelAngle" 450
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Wheel" "AxisIndex" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Wheel" "Invert" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Throttle" "AxisIndex" 1
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Throttle" "Invert" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Brake" "AxisIndex" 2
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Brake" "Invert" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Clutch" "AxisIndex" 3
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Clutch" "Invert" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Handbrake" "AxisIndex" 4
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Handbrake" "Invert" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\PreviousGear" "ButtonIndex" 1
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\NextGear" "ButtonIndex" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Button1" "ButtonIndex" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Button2" "ButtonIndex" 1
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadUp" "SwitchIndex" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadUp" "IncludeAdjacent" 1
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadUp" "SwitchPosition" "Up"
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadDown" "SwitchIndex" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadDown" "IncludeAdjacent" 1
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadDown" "SwitchPosition" "Down"
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadLeft" "SwitchIndex" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadLeft" "IncludeAdjacent" 1
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadLeft" "SwitchPosition" "Left"
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadRight" "SwitchIndex" 0
-  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadRight" "IncludeAdjacent" 1
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadRight" "SwitchPosition" "Right"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Buttons" "Button0" "LetterA"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Buttons" "Button1" "LetterB"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Buttons" "Button2" "LetterX"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Buttons" "Button3" "LetterY"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Buttons" "Button6" "Menu"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Buttons" "Button7" "View"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Buttons" "Button8" "RightStickButton"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Buttons" "Button9" "LeftStickButton"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Switches" "Switch0Up" "Up"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Switches" "Switch0Right" "Right"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Switches" "Switch0Down" "Down"
-  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Switches" "Switch0Left" "Left"
-  SetRegView 32
-FunctionEnd
-
 ; FH4 fix #1 (v2.0.13): reconfigure vJoy device 1 to the EmuWheel
 ; envelope (8 axes, 128 buttons, 1× 4-direction POV, all FFB) via
 ; vJoy's own CLI — see crates/rsh-output/src/vjoy_config.rs for
 ; the full derivation (the argv spelling lives there as the single
-; source of truth; this call mirrors it exactly):
+; source of truth; this call mirrors it exactly).
+; v2.0.19: the GameInput RacingWheel mappings are GONE (the
+; wheel-tab route they served did not work on the user's
+; Microsoft Store build of FH4) — the envelope stays: it is
+; the vJoy device-1 shape the app's capabilities check
+; verifies, and the 7-input mapping in vjoy.rs feeds it.
 ;   vJoyConfig.exe 1 -f -a x y z rx ry rz sl0 sl1 -b 128 -s 1 -e All
 ; Runs on EVERY install (fresh and update — `-f` replaces the
 ; existing device-1 config). vJoy missing → LOUD (v2.0.14 — a
@@ -529,9 +327,9 @@ FunctionEnd
 ; later, and the app's post-install path (rsh-app-core
 ; run_vjoy_install_inner) configures device 1 then — but a skipped
 ; envelope must be visible at install time, not discovered later
-; in a game. Best-effort, never fatal: a failure warns (the
-; mapping above is still written) and the app's connect-time
-; capabilities check is the real verification — vJoyConfig exits 0
+; in a game. Best-effort, never fatal: a failure warns and the
+; app's connect-time capabilities check is the real verification
+; — vJoyConfig exits 0
 ; even when its registry write fails, so the exit code only proves
 ; the tool ran. The installer additionally reads back
 ; HidReportDescriptorSize for Device01 (non-zero = a descriptor
@@ -563,7 +361,7 @@ Function ConfigureVJoyDevice1
   ${EndIf}
   ; Verify the descriptor landed: Device01 must exist with a
   ; non-zero HidReportDescriptorSize (SetRegView 64 — the key
-  ; lives in the native view; see WriteGameInputVJoyMapping).
+  ; lives in the native view).
   SetRegView 64
   ClearErrors
   ReadRegDWORD $R3 HKLM "SYSTEM\CurrentControlSet\Services\vjoy\Parameters\Device01" "HidReportDescriptorSize"
@@ -574,9 +372,21 @@ Function ConfigureVJoyDevice1
   ${EndIf}
 FunctionEnd
 
+; v2.0.19: delete the stale HKLM OEMData value the Steam FH4 mode
+; (v2.0.15) wrote on the vJoy key (VID_1234&PID_BEAD), on EVERY
+; install, unconditionally — the mode is deleted, and a leftover
+; value can confuse the Microsoft Store build of FH4. Only the
+; VALUE is ever deleted, never the OEM key (it is vJoy's).
+; SetRegView 64 is SCOPED: the key lives in the native view.
+; A missing value is fine (DeleteRegValue is a no-op then).
+Function DeleteStaleOemData
+  SetRegView 64
+  DeleteRegValue HKLM "SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_1234&PID_BEAD" "OEMData"
+  SetRegView 32
+FunctionEnd
+
 Section "RSH" SEC_RSH
-  ; Required: the app itself is never optional (the components
-  ; page only exists for the Steam FH4 wheel-mode section below).
+  ; Required: the app itself is never optional.
   SectionIn RO
   SetOutPath "$INSTDIR"
   Call KillRSHProcesses
@@ -587,31 +397,32 @@ Section "RSH" SEC_RSH
 
   !insertmacro RSH_File "" "..\target\release\rsh-daemon.exe" 1
   !insertmacro RSH_File "" "..\target\release\rsh-ui.exe" 2
-  ; Sidecar MUST sit beside rsh-daemon.exe: the daemon resolves it
-  ; as <own exe dir>\RshCoreHiDcr.exe (resolve_sidecar_path).
-  !insertmacro RSH_File "/oname=RshCoreHiDcr.exe" "..\src-tauri\binaries\RshCoreHiDcr-x86_64-pc-windows-msvc.exe" 3
-  ; Rename cleanup: drop a stale old-name sidecar from a
-  ; <= v2.0.8 install (Delete on a locked file fails silently).
+  ; ViGEmBus client DLL (v2.0.19): MUST sit beside
+  ; rsh-daemon.exe — the Xbox backend loads it from its
+  ; own exe dir (crates/rsh-output/src/vigem.rs,
+  ; resolve_dll_path). See tools/vigem/README.md for
+  ; provenance + SHA-256; makensis fails closed here if
+  ; it is missing.
+  !insertmacro RSH_File "" "..\tools\vigem\ViGEmClient.dll" 3
+  ; ViGEmBus driver setup (v2.0.19, official 1.22.0): the
+  ; app launches it interactively when the driver is
+  ; missing — there is no documented silent switch, so
+  ; it is bundled, never run silently. Makensis fails
+  ; closed here if it is missing.
+  !insertmacro RSH_File "" "..\tools\vigem\ViGEmBus_1.22.0_x64_x86_arm64.exe" 4
+  ; Rename cleanup: drop stale sidecar files from a
+  ; <= v2.0.18 install (Delete on a locked file fails
+  ; silently). The HIDMaestro backend + sidecar were
+  ; removed in v2.0.19.
+  Delete "$INSTDIR\RshCoreHiDcr.exe"
   Delete "$INSTDIR\rsh-hm-sidecar.exe"
-  ; HIDMaestro.Core.dll (v2.0.8 retest Bug 1, H1): the
-  ; sidecar SHA-256-hashes this DLL beside itself at
-  ; startup (Program.cs CheckDllHash) and the Rust side
-  ; refuses the hello when the hash is missing — the
-  ; installer never shipped it, so the switch always
-  ; failed. Pinned v2.1.0, hash-verified by the stage
-  ; step; makensis fails closed here if it is missing.
-  !insertmacro RSH_File "" "..\src-tauri\binaries\HIDMaestro.Core.dll" 4
-  ; HIDMaestro LICENSE (GitHub issue #2): the sidecar is
-  ; a NativeAOT build with HIDMaestro compiled in, so the
-  ; MIT notice must ship with it — this file (pinned
-  ; v2.1.0 ZIP, verbatim; THIRD-PARTY-LICENSES.md §3)
-  ; installs beside the sidecar.
-  !insertmacro RSH_File "" "..\tools\rsh-hm-sidecar\HIDMaestro-LICENSE.txt" 5
+  Delete "$INSTDIR\HIDMaestro.Core.dll"
+  Delete "$INSTDIR\HIDMaestro-LICENSE.txt"
   ; Signed OTA image, bundled so the app can flash the
   ; board with no download: the daemon resolves it as
   ; <own exe dir>\firmware-signed.bin. Makensis fails
   ; closed here if it is missing.
-  !insertmacro RSH_File "" "..\firmware\.pio\build\esp32dev\firmware-signed.bin" 6
+  !insertmacro RSH_File "" "..\firmware\.pio\build\esp32dev\firmware-signed.bin" 5
   WriteRegStr HKLM "Software\RSH" "InstallDir" "$INSTDIR"
   ; Version values the smart installer reads back in .onInit.
   WriteRegStr HKLM "Software\RSH" "Version" "${VERSION}"
@@ -660,11 +471,6 @@ Section "RSH" SEC_RSH
   WriteRegStr HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-ui.exe" "DumpFolder" "$COMMONPROGRAMDATA\RSH\dumps"
   WriteRegDWORD HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-ui.exe" "DumpType" 1
   WriteRegDWORD HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-ui.exe" "DumpCount" 5
-  ; P0 (v2.0.11): the sidecar too — its native crash left
-  ; no dump (only daemon/UI were registered).
-  WriteRegStr HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\RshCoreHiDcr.exe" "DumpFolder" "$COMMONPROGRAMDATA\RSH\dumps"
-  WriteRegDWORD HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\RshCoreHiDcr.exe" "DumpType" 1
-  WriteRegDWORD HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\RshCoreHiDcr.exe" "DumpCount" 5
   SetRegView 32
   ; P2-1 (v2.0.13 polish): NO scheduled task anymore — the
   ; "RSH Daemon" task is removed (see the header comment).
@@ -689,13 +495,15 @@ Section "RSH" SEC_RSH
   ${If} $0 != 0
     MessageBox MB_ICONEXCLAMATION "RSH installed, but the Windows Firewall rule could not be created (netsh exit $0). The wheel may not connect over Wi-Fi. Next step: Windows Security -> Firewall & network protection -> Allow an app through firewall -> add rsh-daemon.exe; or run the installer again as administrator." /SD IDOK
   ${EndIf}
-  ; FH4 fixes #1+#2 (v2.0.13): the RacingWheel mappings FIRST, then
-  ; the device-1 envelope — vJoyConfig restarts the vJoy devices,
-  ; so a mapping written before it is picked up at the same
-  ; re-enumeration. All run on every install (fresh and update).
-  Call WriteGameInputVJoyMapping
-  Call WriteGameInputHidMapping
+  ; v2.0.19: the GameInput RacingWheel mappings are gone — only
+  ; the device-1 envelope runs now (every install, fresh and
+  ; update). Then the stale-OEMData cleanup below: the Steam FH4
+  ; mode (v2.0.15) wrote an OEMData value on the vJoy key that
+  ; can confuse the Microsoft Store build of FH4, so every
+  ; install deletes it unconditionally (HKLM half; the daemon
+  ; deletes the HKCU half on first start).
   Call ConfigureVJoyDevice1
+  Call DeleteStaleOemData
   ; After an update, restart the daemon (it was stopped
   ; above so its files could be replaced). Fresh installs do
   ; not start it — the UI self-spawns it on first launch.
@@ -710,35 +518,6 @@ Section "RSH" SEC_RSH
     Exec '"$WINDIR\explorer.exe" "$INSTDIR\rsh-daemon.exe"'
 SectionEnd
 
-; FH4 Steam mode (v2.0.15, Part A3): optional, OFF by default.
-; Writes the OEMData wheel flag (REG_BINARY 40 00 00 00 00 00
-; 00 00) for vJoy device 1 (VID_1234&PID_BEAD) so the Steam
-; version of Forza Horizon 4 shows the Wheel tab — the user's
-; own PC-tested fix (v2.0.14's GameInput mapping alone did not
-; do it for the Steam build). Only HKLM is written here: the
-; installer runs elevated, and on a standard-user install its
-; HKCU would be the admin's hive, not the user's (P1-4
-; precedent — the installer never writes HKCU). The daemon
-; writes the HKCU half on first start (marker adoption — see
-; crates/rsh-output/src/vjoy_config.rs). The marker below
-; (HKLM\Software\RSH "SteamFh4OemData" = 1, native 64-bit
-; view — the daemon is 64-bit, so SetRegView 64 is load-bearing
-; here, same as the GameInput keys) is how the uninstaller
-; knows RSH wrote the flag: it deletes OEMData only when the
-; marker is present. Only the VALUE is ever written/deleted —
-; never the OEM key (it is vJoy's). Silent installs (/S) never
-; install an /o section, so a default install has no OEMData.
-; The in-app toggle (Settings) is the primary control; this
-; checkbox is the install-time shortcut. Needs a PC restart
-; (and a vJoy disable/enable) to take effect — the app says so
-; when the toggle changes.
-Section /o "Steam FH4 wheel mode (Steam version of Forza Horizon 4)" SEC_STEAM_FH4
-  SetRegView 64
-  WriteRegBin HKLM "SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_1234&PID_BEAD" "OEMData" 4000000000000000
-  WriteRegDWORD HKLM "Software\RSH" "SteamFh4OemData" 1
-  SetRegView 32
-SectionEnd
-
 Section "Uninstall"
   ; DS-10: stop the running app FIRST (UI first, then daemon —
   ; DS-68: the UI respawns a dead daemon, so daemon-first
@@ -750,10 +529,10 @@ Section "Uninstall"
   Sleep 1000
   nsExec::Exec 'taskkill /F /IM rsh-daemon.exe'
   nsExec::Exec 'taskkill /F /IM RSH.exe'
+  ; Stale sidecar exes from a <= v2.0.18 install can still be
+  ; running — kill them too so the old files are never locked
+  ; during uninstall (the sidecar was removed in v2.0.19).
   nsExec::Exec 'taskkill /F /IM RshCoreHiDcr.exe'
-  ; Old exe name (<= v2.0.8): an upgrade from an old install
-  ; can leave a running rsh-hm-sidecar.exe behind — kill it
-  ; too so the old file is never locked during uninstall.
   nsExec::Exec 'taskkill /F /IM rsh-hm-sidecar.exe'
   Sleep 1000
   nsExec::Exec 'taskkill /F /IM rsh-ui.exe'
@@ -785,38 +564,31 @@ Section "Uninstall"
   SetRegView 64
   DeleteRegKey HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-daemon.exe"
   DeleteRegKey HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-ui.exe"
-  DeleteRegKey HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\RshCoreHiDcr.exe"
-  ; FH4 fix #1 (v2.0.13): remove the vJoy RacingWheel mapping this
-  ; installer wrote — a stale mapping would classify a device that
-  ; no longer has RSH behind it.
+  ; v2.0.19: remove the GameInput RacingWheel mappings this
+  ; installer wrote in <= v2.0.18 — a stale mapping would
+  ; classify a device that no longer has RSH behind it.
   DeleteRegKey HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004"
-  ; FH4 fix #2 (v2.0.13): same for the HIDMaestro mapping.
   DeleteRegKey HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004"
-  ; FH4 Steam mode (v2.0.15, Part A3): remove the OEMData wheel
-  ; flag, but ONLY if RSH wrote it — marker HKLM\Software\RSH
-  ; "SteamFh4OemData" == 1 (written by the installer checkbox
-  ; above or the in-app toggle). Only the VALUE is deleted,
-  ; never the OEM key (it is vJoy's). The marker is deleted too
-  ; (the whole Software\RSH key is removed below anyway). The
-  ; HKCU delete is best-effort in the same-user context only:
-  ; an elevated uninstaller cannot reach a standard user's hive
-  ; (P1-4), so a standard-user install's HKCU value is removed
-  ; by toggling the mode off in the app instead — the CHANGELOG
-  ; says so. A missing value is fine (DeleteRegValue on an
-  ; absent value is a no-op for our purposes).
-  ReadRegDWORD $R0 HKLM "Software\RSH" "SteamFh4OemData"
-  ${If} $R0 == 1
-    DeleteRegValue HKLM "SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_1234&PID_BEAD" "OEMData"
-    DeleteRegValue HKCU "SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_1234&PID_BEAD" "OEMData"
-    DeleteRegValue HKLM "Software\RSH" "SteamFh4OemData"
-  ${EndIf}
+  ; v2.0.19: remove the stale OEMData value unconditionally —
+  ; the Steam FH4 mode (v2.0.15) is deleted, and its marker
+  ; (HKLM\Software\RSH "SteamFh4OemData") is gone with it.
+  ; Only the VALUE is deleted, never the OEM key (it is
+  ; vJoy's). The HKCU delete is best-effort in the same-user
+  ; context only: an elevated uninstaller cannot reach a
+  ; standard user's hive (P1-4). A missing value is fine
+  ; (DeleteRegValue on an absent value is a no-op).
+  DeleteRegValue HKLM "SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_1234&PID_BEAD" "OEMData"
+  DeleteRegValue HKCU "SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_1234&PID_BEAD" "OEMData"
   ClearErrors
   SetRegView 32
   Delete "$INSTDIR\rsh-daemon.exe"
   Delete "$INSTDIR\rsh-ui.exe"
+  Delete "$INSTDIR\ViGEmClient.dll"
+  Delete "$INSTDIR\ViGEmBus_1.22.0_x64_x86_arm64.exe"
+  ; Stale sidecar files from a <= v2.0.18 install (removed
+  ; in v2.0.19) — delete them too so no stale sidecar
+  ; survives an upgrade.
   Delete "$INSTDIR\RshCoreHiDcr.exe"
-  ; Old exe name (<= v2.0.8): remove it too on uninstall so
-  ; no stale sidecar survives an upgrade.
   Delete "$INSTDIR\rsh-hm-sidecar.exe"
   Delete "$INSTDIR\HIDMaestro.Core.dll"
   Delete "$INSTDIR\HIDMaestro-LICENSE.txt"
@@ -842,8 +614,10 @@ Section "Uninstall"
   Sleep 1000
   Delete "$INSTDIR\rsh-daemon.exe"
   Delete "$INSTDIR\rsh-ui.exe"
+  Delete "$INSTDIR\ViGEmClient.dll"
+  Delete "$INSTDIR\ViGEmBus_1.22.0_x64_x86_arm64.exe"
+  ; Stale sidecar files from a <= v2.0.18 install, retry pass.
   Delete "$INSTDIR\RshCoreHiDcr.exe"
-  ; Old exe name (<= v2.0.8): remove it too on the retry pass.
   Delete "$INSTDIR\rsh-hm-sidecar.exe"
   Delete "$INSTDIR\HIDMaestro.Core.dll"
   Delete "$INSTDIR\HIDMaestro-LICENSE.txt"
@@ -870,10 +644,7 @@ Section "Uninstall"
 SectionEnd
 
 ; Components-page descriptions (MUI2): shown when a section is
-; selected on the components page. The Steam FH4 text states the
-; restart requirement up front — the flag only takes effect
-; after a PC restart (and a vJoy disable/enable).
+; selected on the components page.
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SEC_RSH} "RSH — the wheel app, daemon, and firmware."
-  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_STEAM_FH4} "Steam FH4 wheel mode — writes the OEMData wheel flag for vJoy device 1 so the Steam version of Forza Horizon 4 shows the Wheel tab. Off by default. Needs a PC restart (and a vJoy disable/enable) to take effect. You can also turn it on later in RSH Settings."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END

@@ -29,6 +29,10 @@
 #   ViGEmClient.dll           ViGEmBus client DLL — sits beside
 #                             rsh-daemon.exe (the Xbox backend loads it
 #                             from its own exe dir)
+#   ViGEmBus_1.22.0_*.exe     official ViGEmBus 1.22.0 driver setup —
+#                             bundled so the app can launch it
+#                             interactively when the driver is missing
+#                             (no silent switch documented)
 # Firmware v4.0.7 IS shipped in this release (user orders 2026-11-16
 # ~20:20 + 2026-11-17 ~07:48): BOTH firmware files, built + signed
 # HERE on the runner from the tagged source (step 6 below) — never
@@ -539,7 +543,8 @@ jobs:
       # GitHub's 21,000-char `run:` ceiling). The "Prepare NSIS
       # script" step below only substitutes $${VERSION}; makensis
       # builds the committed file. It installs the two binaries +
-      # the ViGEmBus client DLL beside the daemon + the signed OTA firmware
+      # the ViGEmBus client DLL + driver setup beside the daemon +
+      # the signed OTA firmware
       # image (WebOTA flow, no download needed), creates the
       # program+port-scoped inbound UDP firewall rule for
       # rsh-daemon.exe (Private + Public), and removes the rule on
@@ -591,8 +596,10 @@ jobs:
           # would only shrink the sum while staying positive, so
           # fail closed on each file first. (C P2-1): the +256 KB
           # is the allowance for uninstall.exe (WriteUninstaller)
-          # — a 4th file in $INSTDIR that is not in this 3-file sum.
-          $installedFiles = @("target/release/rsh-daemon.exe", "target/release/rsh-ui.exe", "firmware/.pio/build/esp32dev/firmware-signed.bin")
+          # — a 6th file in $INSTDIR that is not in this 5-file sum.
+          # v2.0.19: the two ViGEmBus files (tools/vigem/) ship in
+          # $INSTDIR too — they belong in this sum.
+          $installedFiles = @("target/release/rsh-daemon.exe", "target/release/rsh-ui.exe", "tools/vigem/ViGEmClient.dll", "tools/vigem/ViGEmBus_1.22.0_x64_x86_arm64.exe", "firmware/.pio/build/esp32dev/firmware-signed.bin")
           foreach ($f in $installedFiles) { if (-not (Test-Path $f -PathType Leaf)) { Write-Error "EstimatedSize: expected installed file '$f' is missing."; exit 1 } }
           $installedKb = [int]((Get-ChildItem $installedFiles -File | Measure-Object Length -Sum).Sum / 1KB) + 256
           # Run 45775988045: the bare -DESTIMATEDSIZEKB=$installedKb
