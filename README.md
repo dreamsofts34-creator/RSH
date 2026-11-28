@@ -6,7 +6,7 @@
 [![Windows 10 / 11](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue.svg)](https://github.com/dreamsofts34-creator/RSH/releases/latest)
 
 RSH connects an ESP32 sim-racing wheel to Windows racing games over Wi-Fi or USB.
-The wheel's steering, pedals, shifter, buttons and encoders become a Windows game controller,
+The wheel's steering, pedals, shifter, handbrake and horn become a Windows game controller,
 so you can drive with your own hardware in games like Assetto Corsa, ACC and iRacing.
 A small backend engine runs in the background; the app window is only there when you open it.
 
