@@ -67,7 +67,7 @@ use rsh_api::connection::ConnectionState;
 use rsh_api::tuning::snap_steering_lock_deg;
 use rsh_api::{
     app_version, ApiTransport, AppApi, AppEvent, CalibrationInfo, ConnectionError, ConnectionInfo,
-    FirmwareCheck, FirmwareUpdateStatus, GameSummary, LedPattern, ProfileSummary, ShifterGate,
+    FirmwareCheck, FirmwareUpdateStatus, GameSummary, LedPattern, ProfileSummary,
     SnapshotInfo, TuningSettings, UserError,
 };
 use slint::{Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
@@ -120,23 +120,6 @@ const VY1: f32 = 190.0;
 /// Live chart history (20 Hz × 10 s, "Last 10 s").
 const CHART_SAMPLES: usize = 200;
 
-/// Default 12 wheel-button actions (local display defaults until
-/// the button-mapping backend lands — see the SEAM note on
-/// [`Ctx::capture_available`]).
-const DEFAULT_BUTTON_ACTIONS: [&str; 12] = [
-    "Shift up",
-    "Shift down",
-    "Horn",
-    "Gear 1",
-    "Gear 2",
-    "Gear 3",
-    "Gear 4",
-    "Gear 5",
-    "Gear 6",
-    "Handbrake",
-    "Not set",
-    "Not set",
-];
 
 /// Pedal feel exponents: Linear 1.0, Soft 0.7, Sharp 1.5 (the curve
 /// field of the pedal's stored tuning record).
@@ -266,50 +249,9 @@ pub fn game_code(name: &str) -> String {
     }
 }
 
-/// Display name ↔ backend action id for button/knob bindings (H-3 /
-/// B1 wiring): the Buttons screen shows display names ("Shift up",
-/// "Gear 3"), the daemon stores ids (`shifter_up`, `gear_3`).
-/// "Not set" (and anything unknown) maps to no id — saving it clears
-/// the binding.
-#[must_use]
-pub fn action_id(display: &str) -> Option<&'static str> {
-    match display {
-        "Shift up" => Some("shifter_up"),
-        "Shift down" => Some("shifter_down"),
-        "Horn" => Some("horn"),
-        "Gear 1" => Some("gear_1"),
-        "Gear 2" => Some("gear_2"),
-        "Gear 3" => Some("gear_3"),
-        "Gear 4" => Some("gear_4"),
-        "Gear 5" => Some("gear_5"),
-        "Gear 6" => Some("gear_6"),
-        "Handbrake" => Some("handbrake"),
-        _ => None,
-    }
-}
 
-/// Backend action id → display name (H-3): the inverse of
-/// [`action_id`]. App actions have display names too ("Next
-/// profile") even though the Buttons screen offers no chip for
-/// them — a stored app-action binding still reads correctly.
-#[must_use]
-pub fn action_display(id: &str) -> &'static str {
-    match id {
-        "shifter_up" => "Shift up",
-        "shifter_down" => "Shift down",
-        "horn" => "Horn",
-        "gear_1" => "Gear 1",
-        "gear_2" => "Gear 2",
-        "gear_3" => "Gear 3",
-        "gear_4" => "Gear 4",
-        "gear_5" => "Gear 5",
-        "gear_6" => "Gear 6",
-        "handbrake" => "Handbrake",
-        "profile_next" => "Next profile",
-        "profile_previous" => "Previous profile",
-        _ => "Not set",
-    }
-}
+
+
 
 /// A game slug ("`assetto_corsa`") as a display name ("Assetto Corsa").
 #[must_use]
@@ -687,10 +629,9 @@ fn parse_args() -> Args {
                     a.page = match argv[i + 1].as_str() {
                         "steering" => 1,
                         "pedals" => 2,
-                        "buttons" => 3,
-                        "extras" => 4,
-                        "settings" => 5,
-                        "about" => 6,
+                        "extras" => 3,
+                        "settings" => 4,
+                        "about" => 5,
                         _ => 0,
                     };
                     i += 1;
@@ -884,17 +825,6 @@ enum FieldKind {
     /// Throttle saturation as the effective max in mV (the queued
     /// value is already converted from percent by the handler).
     Saturation,
-    /// Encoder pulse length in ms, 20..200 (E1).
-    EncoderPulseMs,
-    /// Encoder acceleration sensitivity, 0..2 (E3).
-    EncoderAccelSens,
-    // --- Buttons per-module tuning ---
-    /// Button debounce in ms, 0..50 (BU1).
-    ButtonDebounceMs,
-    /// Long-press threshold in ms, 300..1500 (BU2).
-    ButtonLongPressMs,
-    /// Double-press window in ms, 150..500 (BU3).
-    ButtonDoublePressMs,
     // --- Shifter per-module tuning ---
     /// Shift lockout in ms, 0..200 (SH2).
     ShiftLockoutMs,
@@ -1074,7 +1004,7 @@ impl JobKind {
             // the IPC bound of the call it runs, or a healthy but
             // slow call is declared timed out, its apply dropped,
             // and the user told it failed while the daemon keeps
-            // working (the v2.0.17 G29-toggle shape — the IPC arm
+            // working (the v2.0.17 backend-toggle shape — the IPC arm
             // was fixed to 390 s but the job still gave up at 10 s).
             // `set_tuning` / `set_shifter_sensitivity` /
             // `update_firmware` / `firmware_check` all ride a 10 s
@@ -1089,8 +1019,8 @@ impl JobKind {
             // Settings ops share 10 s — they are fast settings
             // writes (500 ms IPC default), EXCEPT the slow ones,
             // which pass an explicit timeout to
-            // `run_generic_job_timeout` instead (G29 spoof /
-            // send-to-game 420 s, Wi-Fi join 300 s, Wi-Fi password
+            // `run_generic_job_timeout` instead (backend switch
+            // 420 s, Wi-Fi join 300 s, Wi-Fi password
             // 30 s, backup/restore 40 s). The app update check
             // (DS-20) shares it too: it is one bounded network
             // round-trip (`curl --max-time 8`).
@@ -1246,7 +1176,7 @@ const BACKEND_COOLDOWN: Duration = Duration::from_secs(30);
 /// IPC bound exceeds the kind's 10 s. Each exceeds its IPC bound
 /// with margin, so a healthy slow call is never declared timed out.
 ///
-/// - G29 spoof / send-to-game: 420 s, the same invariant as the
+/// - Backend switch: 420 s, the same invariant as the
 ///   Backend job (420 s) > IPC (390 s) > daemon worst case (370 s).
 /// - Wi-Fi join: 300 s — scan (45 s IPC) + rejoin (180 s IPC) +
 ///   connect, run sequentially, worst case ≈ 230 s.
@@ -1257,7 +1187,6 @@ const BACKEND_COOLDOWN: Duration = Duration::from_secs(30);
 ///   is fast (keystore clear + profile forget) but shares the
 ///   constant; the bound is a ceiling, not a wait.
 /// - Backup/restore: 40 s — the IPC arm is 30 s (file copies).
-const LONG_JOB_TIMEOUT_SPOOF: Duration = Duration::from_secs(420);
 const LONG_JOB_TIMEOUT_SEND: Duration = Duration::from_secs(420);
 const LONG_JOB_TIMEOUT_WIFI_JOIN: Duration = Duration::from_secs(300);
 const LONG_JOB_TIMEOUT_WIFI_PASSWORD: Duration = Duration::from_secs(200);
@@ -1389,22 +1318,9 @@ fn set_if_changed<T: PartialEq>(current: T, next: T, set: impl FnOnce(T)) {
     }
 }
 
-/// Canonical G29 pedal layout (v2.0.17): only "pcgamingwiki" is
-/// kept — anything else (including an old or unknown stored
-/// value) falls back to the "hidmaestro" default, so the radios
-/// never show neither option selected.
-fn normalize_g29_pedal_layout(layout: &str) -> &'static str {
-    if layout == "pcgamingwiki" {
-        "pcgamingwiki"
-    } else {
-        "hidmaestro"
-    }
-}
 
-/// Clamp the G29 handbrake button to its 1–25 range (v2.0.17).
-fn clamp_g29_handbrake_button(button: i32) -> i32 {
-    button.clamp(1, 25)
-}
+
+
 
 /// Background-job completions (A9/B5): a job thread sends exactly one
 /// of these on `job_tx`; the frame timer drains them on the UI thread
@@ -1423,7 +1339,7 @@ enum JobDone {
         result: Result<ConnectionInfo, UserError>,
     },
     /// Backend switch finished: `index` is the Settings segment the
-    /// user picked (0 `HIDMaestro`, 1 vJoy), so a failure reverts the
+    /// user picked (0 vJoy, 1 Xbox), so a failure reverts the
     /// switch to the other segment.
     Backend {
         index: i32,
@@ -1433,7 +1349,7 @@ enum JobDone {
     /// the switch job timed out, so the UI asked the daemon for its
     /// LIVE backend instead of trusting the UI-side cache.
     /// `requested` is the Settings segment the timed-out switch
-    /// asked for (0 `HIDMaestro`, 1 vJoy); `backend` is what the
+    /// asked for (0 vJoy, 1 Xbox); `backend` is what the
     /// daemon reports right now — `None` when the re-query itself
     /// did not answer, so the timeout stands as a failure. HID
     /// P3-5 (v2.0.13): the re-query polls a few times before it
@@ -1696,7 +1612,6 @@ struct FrameCmdCache {
     trim_text: Option<(f32, SharedString)>,
     conn_label: Option<(bool, bool, bool, String, SharedString)>,
     conn_sub: Option<(bool, bool, String, String, SharedString)>,
-    gear_text: Option<(u8, SharedString)>,
     pedals_readout: Option<(f64, f64, f64, SharedString)>,
 }
 
@@ -1879,21 +1794,7 @@ impl FrameCmdCache {
         built
     }
 
-    /// Gear text (`"—"` in neutral), rebuilt only when the gear moved.
-    fn gear_text(&mut self, gear: u8) -> SharedString {
-        if let Some((g, cached)) = &self.gear_text {
-            if *g == gear {
-                return cached.clone();
-            }
-        }
-        let built: SharedString = if gear == 0 {
-            self.dash()
-        } else {
-            gear.to_string().into()
-        };
-        self.gear_text = Some((gear, built.clone()));
-        built
-    }
+
 
     /// Diagnostics pedals readout, rebuilt only when a value moved.
     #[allow(clippy::float_cmp)]
@@ -1964,24 +1865,6 @@ struct Ctx {
     calibration: Rc<RefCell<Option<CalibrationInfo>>>,
     /// True while a vJoy install started by the wizard is polling.
     vjoy_polling: Rc<Cell<bool>>,
-    /// 12 wheel-button display actions (A3/A4) + the pending chip
-    /// choice not yet saved (None = the tile's stored action).
-    button_actions: Rc<RefCell<Vec<String>>>,
-    pending_action: Rc<RefCell<Option<String>>>,
-    /// 12 wheel-button long-press display actions (BU2) + the
-    /// pending chip choice not yet saved (None = the tile's stored
-    /// long-press action, "Not set" = none).
-    long_press_actions: Rc<RefCell<Vec<String>>>,
-    pending_long_action: Rc<RefCell<Option<String>>>,
-    selected_button: Rc<Cell<i32>>,
-    /// Edit-panel mirror of the Buttons page state (Rust tracks it
-    /// from the tile/knob callbacks): 0 button, 1 knob.
-    edit_kind: Rc<Cell<i32>>,
-    edit_knob: Rc<Cell<i32>>,
-    knob_row: Rc<Cell<i32>>,
-    /// Knob actions [knob][row: left, right, press], local only
-    /// until the mapping backend lands.
-    knob_actions: Rc<RefCell<[[String; 3]; 2]>>,
     /// Last profiles/games lists (A8/A14): index → id lookups.
     profiles_cache: Rc<RefCell<Vec<ProfileSummary>>>,
     games_cache: Rc<RefCell<Vec<GameSummary>>>,
@@ -2087,18 +1970,17 @@ struct Ctx {
     wifi_rejoining: Rc<Cell<bool>>,
     wifi_rejoin_since: Rc<Cell<Option<Instant>>>,
     /// P2 (v2.0.10 HID retest, Bug 1 retry storm): when the
-    /// backend-selector cooldown ends — set by a `HIDMaestro`-requested
-    /// switch failure only (HID-4, v2.0.12: a vJoy failure must not
-    /// lock the user out of `HIDMaestro`, the daemon storm guard
-    /// counts `HIDMaestro` attempts only; a backend-job timeout
-    /// re-queries the live backend first, see HID-3, and arms only
-    /// when the re-query itself fails), cleared on a genuine switch
-    /// success or on expiry by the 1 Hz tick. `None` = no cooldown.
+    /// backend-selector cooldown ends — set by any backend-switch
+    /// failure (v2.0.19: the old HIDMaestro-only storm guard is
+    /// gone); a backend-job timeout re-queries the live backend
+    /// first, see HID-3, and arms only when the re-query itself
+    /// fails), cleared on a genuine switch success or on expiry
+    /// by the 1 Hz tick. `None` = no cooldown.
     /// The Slint `backend-cooldown-secs` prop (seconds left, 0 =
     /// idle) is driven from this by [`Ctx::sync_backend_cooldown`].
     backend_cooldown_until: Rc<Cell<Option<Instant>>>,
     /// HID-3 (v2.0.12): the Settings segment the in-flight backend
-    /// switch requested (0 `HIDMaestro`, 1 vJoy) — recorded by
+    /// switch requested (0 vJoy, 1 Xbox) — recorded by
     /// [`Ctx::start_backend_job`] so a backend-job timeout can
     /// re-query the live backend and tell a switch that actually
     /// succeeded from one still running. `None` = no switch in
@@ -2561,10 +2443,6 @@ impl Ctx {
         self.refresh_profiles(win);
         self.sync_diag(win);
         self.sync_keep_in_tray(win);
-        self.sync_steam_fh4_mode(win);
-        self.sync_g29_spoof_mode(win);
-        self.sync_g29_pedal_layout(win);
-        self.sync_g29_handbrake_button(win);
         self.sync_vjoy(win);
     }
 
@@ -2932,11 +2810,6 @@ impl Ctx {
         set_if_changed(win.get_handbrake(), (snap.handbrake * 100.0) as f32, |v| {
             win.set_handbrake(v);
         });
-        set_if_changed(
-            win.get_gear(),
-            self.frame_cmds.borrow_mut().gear_text(snap.gear),
-            |v| win.set_gear(v),
-        );
         set_if_changed(win.get_input_pct(), input_pct, |v| win.set_input_pct(v));
         set_if_changed(win.get_output_pct(), output_pct, |v| win.set_output_pct(v));
         set_if_changed(win.get_marker_vx(), mx, |v| win.set_marker_vx(v));
@@ -3366,22 +3239,6 @@ impl Ctx {
                     FieldKind::ReleaseMs => record.release_ms = Some(value),
                     FieldKind::Curve => record.curve = value,
                     FieldKind::Saturation => record.max_mv = value,
-                    FieldKind::EncoderPulseMs => {
-                        record.encoder_pulse_ms = Some(value.clamp(20.0, 200.0));
-                    }
-                    FieldKind::EncoderAccelSens => {
-                        record.encoder_accel_sensitivity = Some(value.clamp(0.0, 2.0));
-                    }
-                    // --- Buttons per-module tuning ---
-                    FieldKind::ButtonDebounceMs => {
-                        record.button_debounce_ms = Some(value.clamp(0.0, 50.0));
-                    }
-                    FieldKind::ButtonLongPressMs => {
-                        record.button_long_press_ms = Some(value.clamp(300.0, 1500.0));
-                    }
-                    FieldKind::ButtonDoublePressMs => {
-                        record.button_double_press_ms = Some(value.clamp(150.0, 500.0));
-                    }
                     // --- Shifter per-module tuning ---
                     FieldKind::ShiftLockoutMs => {
                         record.shift_lockout_ms = Some(value.clamp(0.0, 200.0));
@@ -3844,8 +3701,8 @@ impl Ctx {
             return (busy, label, kind, String::new());
         }
         // v2.0.18 (P1-6 generalised): the elapsed clock runs for
-        // EVERY job, not just the Backend switch — a 420 s G29
-        // toggle or a 300 s Wi-Fi join must show it is still
+        // EVERY job, not just the Backend switch — a 420 s backend
+        // switch or a 300 s Wi-Fi join must show it is still
         // working, not a bare spinner. The oldest busy job owns
         // the strip (same tie-break as the label/kind above).
         let secs = oldest_busy_job(&jobs).map_or(0, |(job_kind, _)| {
@@ -3904,9 +3761,11 @@ impl Ctx {
     /// has no known backend yet (`"Unknown"`), fall back to
     /// `fallback_index` (the segment the click flipped away from).
     fn resync_controller_from_live(&self, win: &MainWindow, fallback_index: i32) {
+        // v2.0.19: 0 vJoy (default), 1 Xbox (ViGEmBus) — the
+        // HIDMaestro backend is gone.
         let index = match self.api().output_backend().as_str() {
-            "HIDMaestro" => 0,
-            "vJoy" => 1,
+            "vJoy" => 0,
+            "Xbox" => 1,
             _ => fallback_index,
         };
         win.set_controller(index);
@@ -4120,78 +3979,13 @@ impl Ctx {
         });
     }
 
-    /// Seed the Steam FH4 wheel mode switch from the API (A2):
-    /// change-guarded, like [`Self::sync_keep_in_tray`] — the 1 Hz
-    /// `resync_from_cache` keeps it honest when the daemon-side
-    /// value moves. Skipped while a `SettingsOp` job is in flight,
-    /// so an unrelated generation bump cannot revert the
-    /// optimistic flip before the toggle job answers (the job's
-    /// own apply, or the timeout path below, owns the revert).
-    /// The sim's trait default is OFF.
-    fn sync_steam_fh4_mode(&self, win: &MainWindow) {
-        if self.busy_jobs.borrow().contains_key(&JobKind::SettingsOp) {
-            return;
-        }
-        let mode = self.api().steam_fh4_mode();
-        set_if_changed(win.get_steam_fh4_mode(), mode, |v| {
-            win.set_steam_fh4_mode(v);
-        });
-    }
 
-    /// Seed the G29 spoof mode switch from the API: change-guarded,
-    /// like [`Self::sync_steam_fh4_mode`] — the 1 Hz
-    /// `resync_from_cache` keeps it honest when the daemon-side
-    /// value moves. Skipped while a `SettingsOp` job is in flight,
-    /// so an unrelated generation bump cannot revert the
-    /// optimistic flip before the toggle job answers (the job's
-    /// own apply, or the timeout path below, owns the revert).
-    /// The sim's trait default is OFF.
-    fn sync_g29_spoof_mode(&self, win: &MainWindow) {
-        if self.busy_jobs.borrow().contains_key(&JobKind::SettingsOp) {
-            return;
-        }
-        let mode = self.api().g29_spoof_mode();
-        set_if_changed(win.get_g29_spoof_mode(), mode, |v| {
-            win.set_g29_spoof_mode(v);
-        });
-    }
 
-    /// Seed the G29 pedal layout from the API: change-guarded,
-    /// like [`Self::sync_g29_spoof_mode`] — the 1 Hz
-    /// `resync_from_cache` keeps it honest when the daemon-side
-    /// value moves. Skipped while a `SettingsOp` job is in flight,
-    /// so an unrelated generation bump cannot revert the
-    /// optimistic pick before the change job answers (the job's
-    /// own apply, or the timeout path below, owns the revert).
-    /// The sim's trait default is "hidmaestro".
-    fn sync_g29_pedal_layout(&self, win: &MainWindow) {
-        if self.busy_jobs.borrow().contains_key(&JobKind::SettingsOp) {
-            return;
-        }
-        let layout = normalize_g29_pedal_layout(&self.api().g29_pedal_layout());
-        set_if_changed(
-            win.get_g29_pedal_layout().to_string(),
-            layout.to_string(),
-            |v| win.set_g29_pedal_layout(v.into()),
-        );
-    }
 
-    /// Seed the G29 handbrake button from the API: change-guarded,
-    /// like [`Self::sync_g29_spoof_mode`]. The API carries a
-    /// `u32`; the window prop is a Slint `int` (`i32`), so the
-    /// value crosses with a fall-back-to-8 conversion. The sim's
-    /// trait default is 8.
-    fn sync_g29_handbrake_button(&self, win: &MainWindow) {
-        if self.busy_jobs.borrow().contains_key(&JobKind::SettingsOp) {
-            return;
-        }
-        let button = clamp_g29_handbrake_button(
-            i32::try_from(self.api().g29_handbrake_button()).unwrap_or(8),
-        );
-        set_if_changed(win.get_g29_handbrake_button(), button, |v| {
-            win.set_g29_handbrake_button(v);
-        });
-    }
+
+
+
+
 
     /// Start a background job (A9/B5): the work runs on its own
     /// thread — the UI thread never blocks on IPC, a spawn, or a
@@ -4241,7 +4035,7 @@ impl Ctx {
     /// [`Ctx::run_job`]); the apply is dropped when the job times
     /// out, so a late result never applies. The job times out after
     /// `timeout` — for the `SettingsOp` jobs whose IPC bound exceeds
-    /// the kind's 10 s (G29 spoof / send-to-game / Wi-Fi join /
+    /// the kind's 10 s (backend switch / Wi-Fi join /
     /// Wi-Fi password / backup/restore; see the
     /// `LONG_JOB_TIMEOUT_*` consts). The kind stays `SettingsOp`,
     /// so the Slint `busy-kind == 14` disables and the timeout
@@ -4443,14 +4237,14 @@ impl Ctx {
                 // backend that is actually live is the one the user
                 // asked for. The daemon reports the LIVE name, so a
                 // silent fallback used to arrive here as
-                // `Ok("vJoy")` for a HIDMaestro request and toast
+                // `Ok("vJoy")` for an Xbox request and toast
                 // "Game controller is now vJoy". A mismatch is a
                 // failure now: error toast, radio back on the live
                 // backend, no success toast.
                 // Both failure paths (mismatch and Err) funnel
                 // through the single failure notification below, so
                 // a failed switch shows exactly one message.
-                let requested = if index == 1 { "vJoy" } else { "HIDMaestro" };
+                let requested = if index == 0 { "vJoy" } else { "Xbox" };
                 let failure: Option<UserError> = match result {
                     Ok(active) if active == requested => {
                         // P2: a genuine success ends any cooldown
@@ -4461,8 +4255,8 @@ impl Ctx {
                         // backend choice (fallback flag + controller
                         // segment + any install error cleared).
                         win.set_controller(index);
-                        if index == 0 {
-                            win.set_setup_vjoy_fallback(true);
+                        if index == 1 {
+                            win.set_setup_xbox_fallback(true);
                             win.set_setup_vjoy_error("".into());
                         }
                         self.notify_success(
@@ -4494,19 +4288,12 @@ impl Ctx {
                     // backend moved mid-switch.
                     self.resync_controller_from_live(win, 1 - index);
                     self.notify_error(win, "Game controller", &error);
-                    // HID-4 (v2.0.12): the 30 s selector cooldown
-                    // arms ONLY for a HIDMaestro-requested failure.
-                    // The daemon storm guard counts HIDMaestro
-                    // attempts only, so a vJoy failure (e.g. vJoy
-                    // not installed) must not lock the user out of
-                    // HIDMaestro for 30 s. The old code armed on
-                    // ANY failure — Err, wrong-backend success, or
-                    // a daemon-side cooldown refusal — with no
-                    // error text parsed and no requested index
-                    // consulted.
-                    if index == 0 {
-                        self.start_backend_cooldown(win);
-                    }
+                    // v2.0.19: the 30 s selector cooldown arms on
+                    // ANY backend-switch failure (the old
+                    // HIDMaestro-only storm guard is gone with
+                    // that backend).
+                    let _ = index;
+                    self.start_backend_cooldown(win);
                 }
             }
             JobDone::BackendRequery { requested, backend } => {
@@ -4534,7 +4321,7 @@ impl Ctx {
                     );
                     return;
                 }
-                let requested_name = if requested == 1 { "vJoy" } else { "HIDMaestro" };
+                let requested_name = if requested == 0 { "vJoy" } else { "Xbox" };
                 match backend.as_deref() {
                     Some(live) if live == requested_name => {
                         // The switch DID complete while the UI was
@@ -4566,7 +4353,7 @@ impl Ctx {
                         // "retry at once" was a guaranteed error);
                         // the next poll re-syncs the segment if
                         // the switch lands.
-                        win.set_controller(i32::from(live != "HIDMaestro"));
+                        win.set_controller(i32::from(live != "vJoy"));
                         self.notify_toast(
                             win,
                             "Game controller",
@@ -4582,7 +4369,8 @@ impl Ctx {
                         // timeout stands as a failure: restore the
                         // segment from the cache and arm the
                         // cooldown, but only for a
-                        // HIDMaestro-requested switch (HID-4).
+                        // any switch (v2.0.19: the cooldown arms on
+                        // any failure now).
                         self.resync_controller_from_live(win, 1 - requested);
                         self.notify_error(
                             win,
@@ -4595,9 +4383,7 @@ impl Ctx {
                                 detail: None,
                             },
                         );
-                        if requested == 0 {
-                            self.start_backend_cooldown(win);
-                        }
+                        self.start_backend_cooldown(win);
                     }
                 }
             }
@@ -4780,8 +4566,8 @@ impl Ctx {
             // entry — `kind.timeout()` for most jobs, the explicit
             // override for the slow SettingsOp jobs (see
             // `run_generic_job_timeout`). Comparing against the
-            // kind default here would time a 420 s G29 toggle out
-            // at 10 s again.
+            // kind default here would time a 420 s backend switch
+            // out at 10 s again.
             if now.duration_since(*started) > *timeout {
                 timed_out.push((*kind, label.clone()));
             }
@@ -4883,22 +4669,6 @@ impl Ctx {
                 // a timed-out join can be retried in the wizard
                 // instead of needing a reopen.
                 win.set_setup_wifi_joining(false);
-                // A2: a timed-out Steam FH4 toggle reverts to the
-                // cached (pre-toggle) value — the switch must not
-                // keep showing a state the daemon never confirmed.
-                // (The busy entry is already removed above, so
-                // the in-flight guard in `sync_steam_fh4_mode`
-                // does not block this revert.)
-                self.sync_steam_fh4_mode(win);
-                // G29 spoof mode: same revert as the Steam FH4
-                // toggle above — a timed-out toggle reverts to the
-                // cached (pre-toggle) value.
-                self.sync_g29_spoof_mode(win);
-                // G29 pedal layout + handbrake button: same revert
-                // as the toggle above — a timed-out change reverts
-                // to the cached value.
-                self.sync_g29_pedal_layout(win);
-                self.sync_g29_handbrake_button(win);
             }
             // R2-18: a timed-out tuning push reverts its slider to
             // the stored value — the UI must not keep showing a
@@ -5152,12 +4922,12 @@ impl Ctx {
 
     /// Start an output-backend switch job (A9/B-2): `set_output_backend`
     /// runs on a background thread with the 420 s job timeout (IPC
-    /// 390 s > daemon worst case 310 s + 60 s UAC allowance, P1-1).
-    /// Switching to `HIDMaestro` warns first —
-    /// Windows will ask once for admin permission. A second switch
-    /// while one is in flight is ignored (no re-spawn loop, A10).
+    /// 390 s > daemon worst case 310 s + 60 s allowance, P1-1).
+    /// A second switch while one is in flight is ignored
+    /// (no re-spawn loop, A10).
+    // v2.0.19: index 0 = vJoy (default), 1 = Xbox (ViGEmBus).
     fn start_backend_job(&self, win: &MainWindow, index: i32) {
-        let name = if index == 1 { "vJoy" } else { "HIDMaestro" };
+        let name = if index == 0 { "vJoy" } else { "Xbox" };
         if self.api().output_backend() == name {
             return;
         }
@@ -5171,17 +4941,6 @@ impl Ctx {
         }
         if self.busy_jobs.borrow().contains_key(&JobKind::Backend) {
             return;
-        }
-        if name == "HIDMaestro" {
-            // D17: the admin warning toasts in place (the UAC
-            // prompt itself follows) — no drawer entry needed
-            // beyond the toast's own.
-            self.notify_toast(
-                win,
-                "Game controller",
-                "Admin permission needed",
-                "HIDMaestro needs admin permission — Windows will ask once.",
-            );
         }
         // HID-3: record what this switch asked for — a job timeout
         // re-queries the live backend and compares against this.
@@ -5210,19 +4969,14 @@ impl Ctx {
 
     /// The plain backend-timeout failure (HID-3 fallback): the
     /// timeout stands — restore the segment from the (possibly
-    /// stale) cache and arm the cooldown, but only for a
-    /// `HIDMaestro`-requested switch (HID-4). A vJoy request never
-    /// arms; an unrecorded request keeps the old storm-guard
-    /// behaviour (arm) — the daemon counts `HIDMaestro` attempts,
-    /// and an unknown request is most likely one.
+    /// stale) cache and arm the cooldown (v2.0.19: any switch
+    /// failure arms it).
     fn backend_timeout_failure(&self, win: &MainWindow) {
-        let requested = self.backend_job_requested.get();
+        let _requested = self.backend_job_requested.get();
         self.backend_job_requested.set(None);
         let backend = self.api().output_backend();
-        win.set_controller(i32::from(backend != "HIDMaestro"));
-        if requested != Some(1) {
-            self.start_backend_cooldown(win);
-        }
+        win.set_controller(i32::from(backend != "vJoy"));
+        self.start_backend_cooldown(win);
     }
 
     /// Start the HID-3 re-query after a backend-job timeout: ask
@@ -5251,7 +5005,7 @@ impl Ctx {
             return false;
         };
         self.backend_requery_in_flight.set(true);
-        let requested_name = if requested == 1 { "vJoy" } else { "HIDMaestro" };
+        let requested_name = if requested == 0 { "vJoy" } else { "Xbox" };
         let started = self.run_job(win, JobKind::Backend, "Checking controller…", move || {
             JobDone::BackendRequery {
                 requested,
@@ -5645,95 +5399,16 @@ impl Ctx {
         win.set_confirm_open(true);
     }
 
-    /// Seed the Buttons page from the daemon's stored bindings (H-3 /
-    /// B1 wiring): button 1–12 ← stored action, unbound ← the
-    /// display default. Runs on (re)connect — at startup the sim has
-    /// no bindings, so the defaults stand until the daemon answers.
-    /// The long-press actions (BU2) seed the same way, from
-    /// `list_long_press_bindings` ("Not set" = none).
-    fn load_bindings(&self, win: &MainWindow) {
-        let mut actions: Vec<String> = DEFAULT_BUTTON_ACTIONS
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        for binding in self.api().list_bindings() {
-            let idx = usize::from(binding.button.saturating_sub(1));
-            if idx < actions.len() {
-                actions[idx] = action_display(&binding.action).to_string();
-            }
-        }
-        (*self.button_actions.borrow_mut()).clone_from(&actions);
-        win.set_button_actions(ModelRc::new(Rc::new(VecModel::from(
-            actions
-                .iter()
-                .map(SharedString::from)
-                .collect::<Vec<SharedString>>(),
-        ))));
-        let idx = usize::try_from(self.selected_button.get()).unwrap_or(0);
-        if let Some(action) = actions.get(idx) {
-            win.set_selected_action(action.clone().into());
-        }
-        let mut long_actions: Vec<String> = vec!["Not set".to_string(); 12];
-        for binding in self.api().list_long_press_bindings() {
-            let idx = usize::from(binding.button.saturating_sub(1));
-            if idx < long_actions.len() {
-                long_actions[idx] = action_display(&binding.action).to_string();
-            }
-        }
-        (*self.long_press_actions.borrow_mut()).clone_from(&long_actions);
-        if let Some(action) = long_actions.get(idx) {
-            win.set_selected_long_action(action.clone().into());
-        }
-    }
 
-    /// Seed the knob actions from the daemon's stored knobs (M9):
-    /// action ids → display names, "" → "Not set". Runs on
-    /// (re)connect alongside [`Ctx::load_bindings`].
-    fn load_knobs(&self, win: &MainWindow) {
-        let stored = self.api().knob_actions();
-        let mut knobs: [[String; 3]; 2] = [
-            [
-                "Not set".to_string(),
-                "Not set".to_string(),
-                "Not set".to_string(),
-            ],
-            [
-                "Not set".to_string(),
-                "Not set".to_string(),
-                "Not set".to_string(),
-            ],
-        ];
-        for (k, rows) in stored.iter().enumerate() {
-            for (r, action) in rows.iter().enumerate() {
-                knobs[k][r] = action_display(action).to_string();
-            }
-        }
-        let knob = usize::try_from(self.edit_knob.get()).unwrap_or(0);
-        let row = usize::try_from(self.knob_row.get()).unwrap_or(0);
-        let row_action = knobs[knob][row].clone();
-        self.knob_actions.borrow_mut().clone_from(&knobs);
-        // UI-1 (v2.0.12): drive the card + edit-panel labels from
-        // the real bindings — the Slint defaults are "Not set" and
-        // nothing else ever writes these props, so without this the
-        // card kept showing the old hardcoded "Gear 1 / Gear 2".
-        // Rows are [left, right, press] per knob.
-        win.set_knob1_left(knobs[0][0].clone().into());
-        win.set_knob1_right(knobs[0][1].clone().into());
-        win.set_knob1_press(knobs[0][2].clone().into());
-        win.set_knob2_left(knobs[1][0].clone().into());
-        win.set_knob2_right(knobs[1][1].clone().into());
-        win.set_knob2_press(knobs[1][2].clone().into());
-        win.set_knob_row_action(row_action.into());
-    }
+
+
 
     /// Seed everything the daemon owns on (re)connect (B1 wiring):
-    /// bindings + knobs + auto-pause + module on/off + the firmware
-    /// check cache + the keep-in-tray switch (FC2: the switch is a
-    /// `MainWindow` in-out prop now, seeded from the API like the
-    /// others — the close handler reads the same value).
+    /// auto-pause + module on/off + the firmware check cache + the
+    /// keep-in-tray switch (FC2: the switch is a `MainWindow`
+    /// in-out prop now, seeded from the API like the others — the
+    /// close handler reads the same value).
     fn seed_live_state(&self, win: &MainWindow) {
-        self.load_bindings(win);
-        self.load_knobs(win);
         win.set_auto_paused(self.api().auto_pause());
         self.sync_keep_in_tray(win);
         *self.module_states.borrow_mut() = [
@@ -5840,228 +5515,13 @@ impl Ctx {
         );
     }
 
-    /// Apply the Steam FH4 wheel mode switch (A2): the
-    /// `steam-fh4-mode-selected` callback carries the NEW state
-    /// (the .slint already flipped the prop). F6: the persist
-    /// runs on a [`JobKind::SettingsOp`] job thread via the
-    /// `AppApi` trait, exactly like `apply_keep_tray` — the
-    /// switch is disabled while any `SettingsOp` runs, so a
-    /// duplicate start cannot leave it flipped with no apply.
-    /// Success confirms the authoritative value and toasts the
-    /// restart notice; failure reverts the prop and explains —
-    /// the switch never lies about the real setting.
-    fn apply_steam_fh4_mode(&self, win: &MainWindow, enabled: bool) {
-        self.run_generic_job(
-            win,
-            JobKind::SettingsOp,
-            "Saving…",
-            move |api| JobResult::Bool(api.set_steam_fh4_mode(enabled)),
-            move |ctx, w, result| {
-                let JobResult::Bool(result) = result else {
-                    return;
-                };
-                match result {
-                    Ok(new_state) => {
-                        w.set_steam_fh4_mode(new_state);
-                        // A2: the plan's notice — the flag only
-                        // takes effect after a vJoy disable/enable
-                        // + PC restart.
-                        ctx.notify_success(
-                            w,
-                            "Settings",
-                            if new_state {
-                                "Steam FH4 wheel mode on"
-                            } else {
-                                "Steam FH4 wheel mode off"
-                            },
-                            if new_state {
-                                "Steam FH4 wheel mode is on. Disable/enable vJoy and restart your PC."
-                            } else {
-                                "Steam FH4 wheel mode is off. Disable/enable vJoy and restart your PC."
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        // A10: revert the switch the binding
-                        // already flipped, and show the typed
-                        // reason (a HIDMaestro enable says
-                        // vJoy-only, not "Unknown").
-                        w.set_steam_fh4_mode(!enabled);
-                        ctx.notify_error(w, "Settings", &e);
-                        ui_log!("RSH-UI set_steam_fh4_mode failed: {} ({})", e.code, e.title);
-                    }
-                }
-            },
-        );
-    }
 
-    /// Apply a G29 spoof mode toggle, mirroring
-    /// [`Self::apply_steam_fh4_mode`]: a `SettingsOp` job (420 s
-    /// bound — `LONG_JOB_TIMEOUT_SPOOF`, the 390 s IPC arm plus
-    /// margin — busy strip = loading state, timeout reverts via
-    /// `check_job_timeouts`), so the switch is disabled while any
-    /// `SettingsOp` runs and a duplicate start cannot leave it
-    /// flipped with no apply. Success confirms the authoritative
-    /// value and toasts the restart notice; failure reverts the
-    /// prop and explains — the switch never lies about the real
-    /// setting.
-    fn apply_g29_spoof_mode(&self, win: &MainWindow, enabled: bool) {
-        // v2.0.18: the LONG timeout — `set_g29_spoof_mode` rides
-        // the 390 s IPC arm (sidecar respawn + UAC dwell), so the
-        // 10 s SettingsOp bound declared a healthy switch timed
-        // out, reverted the toggle, and let the next poll flip it
-        // back on silently minutes later.
-        self.run_generic_job_timeout(
-            win,
-            JobKind::SettingsOp,
-            "Saving…",
-            LONG_JOB_TIMEOUT_SPOOF,
-            move |api| JobResult::Bool(api.set_g29_spoof_mode(enabled)),
-            move |ctx, w, result| {
-                let JobResult::Bool(result) = result else {
-                    return;
-                };
-                match result {
-                    Ok(new_state) => {
-                        w.set_g29_spoof_mode(new_state);
-                        // The flag only takes effect after the
-                        // game controller backend is restarted /
-                        // reconnected.
-                        ctx.notify_success(
-                            w,
-                            "Settings",
-                            if new_state {
-                                "G29 spoof mode on"
-                            } else {
-                                "G29 spoof mode off"
-                            },
-                            if new_state {
-                                "G29 spoof mode is on. Restart or reconnect the game controller backend for the change to take effect."
-                            } else {
-                                "G29 spoof mode is off. Restart or reconnect the game controller backend for the change to take effect."
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        // Revert the switch the binding already
-                        // flipped, and show the typed reason (a
-                        // vJoy enable says HID-only, not
-                        // "Unknown").
-                        w.set_g29_spoof_mode(!enabled);
-                        ctx.notify_error(w, "Settings", &e);
-                        ui_log!("RSH-UI set_g29_spoof_mode failed: {} ({})", e.code, e.title);
-                    }
-                }
-            },
-        );
-    }
 
-    /// Apply a G29 pedal layout change, mirroring
-    /// [`Self::apply_g29_spoof_mode`]: a `SettingsOp` job (10 s
-    /// bound, busy strip = loading state, timeout reverts via
-    /// `check_job_timeouts`), so the radios are disabled while any
-    /// `SettingsOp` runs and a duplicate start cannot leave a
-    /// pick with no apply. Success confirms the authoritative
-    /// value and toasts it; failure re-syncs from the daemon
-    /// (the source of truth — the radios must not keep showing a
-    /// layout the daemon never stored) and explains. The daemon
-    /// pushes the layout live to the HID backend (next tick, no
-    /// restart, no recreate); while disconnected the change
-    /// applies when the HID backend connects (the Bug 4 note
-    /// above the radios says so).
-    fn apply_g29_pedal_layout(&self, win: &MainWindow, layout: &str) {
-        let layout = normalize_g29_pedal_layout(layout).to_string();
-        self.run_generic_job(
-            win,
-            JobKind::SettingsOp,
-            "Saving…",
-            move |api| JobResult::Text(api.set_g29_pedal_layout(&layout)),
-            move |ctx, w, result| {
-                let JobResult::Text(result) = result else {
-                    return;
-                };
-                match result {
-                    Ok(new_layout) => {
-                        let new_layout = normalize_g29_pedal_layout(&new_layout);
-                        w.set_g29_pedal_layout(new_layout.into());
-                        ctx.notify_success(
-                            w,
-                            "Settings",
-                            "Pedal layout saved",
-                            if new_layout == "pcgamingwiki" {
-                                "PCGamingWiki layout: Y accel · Rz brake · Z clutch."
-                            } else {
-                                "HIDMaestro layout: Z accel · Rz brake · Y clutch."
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        ctx.sync_g29_pedal_layout(w);
-                        ctx.notify_error(w, "Settings", &e);
-                        ui_log!(
-                            "RSH-UI set_g29_pedal_layout failed: {} ({})",
-                            e.code,
-                            e.title
-                        );
-                    }
-                }
-            },
-        );
-    }
 
-    /// Apply a G29 handbrake button change, mirroring
-    /// [`Self::apply_g29_pedal_layout`]: one `SettingsOp` job per
-    /// stepper tap (the value is clamped to 1–25 before it is
-    /// sent). Success confirms the authoritative value and toasts
-    /// it; failure re-syncs from the daemon and explains. The
-    /// daemon pushes the button live to the HID backend (next
-    /// tick, no restart, no recreate); while disconnected the
-    /// change applies when the HID backend connects.
-    fn apply_g29_handbrake_button(&self, win: &MainWindow, button: i32) {
-        let button = clamp_g29_handbrake_button(button);
-        // The API carries a `u32`; the clamp above already proved
-        // 1–25, so this conversion cannot fail (8 is the fallback).
-        let button_u32 = u32::try_from(button).unwrap_or(8);
-        self.run_generic_job(
-            win,
-            JobKind::SettingsOp,
-            "Saving…",
-            move |api| {
-                JobResult::Text(
-                    api.set_g29_handbrake_button(button_u32)
-                        .map(|stored| stored.to_string()),
-                )
-            },
-            move |ctx, w, result| {
-                let JobResult::Text(result) = result else {
-                    return;
-                };
-                match result {
-                    Ok(new_button) => {
-                        let new_button = new_button
-                            .parse::<i32>()
-                            .map_or(button, clamp_g29_handbrake_button);
-                        w.set_g29_handbrake_button(new_button);
-                        ctx.notify_success(
-                            w,
-                            "Settings",
-                            "Handbrake button saved",
-                            &format!("Handbrake now presses G29 button {new_button}."),
-                        );
-                    }
-                    Err(e) => {
-                        ctx.sync_g29_handbrake_button(w);
-                        ctx.notify_error(w, "Settings", &e);
-                        ui_log!(
-                            "RSH-UI set_g29_handbrake_button failed: {} ({})",
-                            e.code,
-                            e.title
-                        );
-                    }
-                }
-            },
-        );
-    }
+
+
+
+
 
     /// Open the setup wizard at Step 0 (Connect, D16): the user
     /// joins the wheel's Wi-Fi or plugs in USB there — no Begin,
@@ -6328,19 +5788,9 @@ impl Ctx {
         // Seed the controller + autostart switches from the daemon
         // (the startup seeding cannot run — the daemon was not
         // there when the window opened).
-        if seed.backend == "HIDMaestro" {
-            win.set_controller(0);
-        } else {
-            win.set_controller(1);
-        }
+        // v2.0.19: 0 vJoy (default), 1 Xbox (ViGEmBus).
+        win.set_controller(i32::from(seed.backend != "vJoy"));
         win.set_autostart_enabled(seed.autostart);
-        win.set_steam_fh4_mode(seed.steam_fh4_mode);
-        win.set_g29_spoof_mode(seed.g29_spoof_mode);
-        win.set_g29_pedal_layout(seed.g29_pedal_layout.clone().into());
-        // The seed carries a `u32`; the window prop is a Slint
-        // `int` (`i32`) — same fall-back-to-8 conversion as the
-        // sync above.
-        win.set_g29_handbrake_button(i32::try_from(seed.g29_handbrake_button).unwrap_or(8));
         // D19: the seed carries the fresh Wi-Fi state — sync the
         // Settings password card + the wizard's SSID from it (the
         // 1 Hz tick re-syncs from the cache afterwards).
@@ -6348,10 +5798,10 @@ impl Ctx {
         if let Some(ssid) = &seed.wifi.ssid {
             win.set_setup_wifi_ssid(ssid.clone().into());
         }
-        // B1 wiring: bindings + knobs + auto-pause + module on/off +
-        // the firmware check cache all seed from the daemon now that
-        // it is live (at startup the sim has none of these). All
-        // cache reads now (F5).
+        // B1 wiring: auto-pause + module on/off + the firmware
+        // check cache all seed from the daemon now that it is live
+        // (at startup the sim has none of these). All cache reads
+        // now (F5).
         self.seed_live_state(win);
         // F12 (v2.0.3): a flap reconnect stays silent — the
         // "Wheel connected" notify is noise when the daemon died
@@ -6536,6 +5986,117 @@ impl Ctx {
         );
     }
 
+    /// Reset all three pedals to the Normal preset + defaults (v2.0.19,
+    /// F4 — 1-tap reset): one TuningPush job sets all three records,
+    /// so the duplicate-start rule cannot swallow the 2nd/3rd push.
+    /// Defaults mirror the sync fallbacks: curve 1.0 / 1.3 / 1.0,
+    /// deadzone 0, bite 0, slip zone 15%, brake force 100%, ramps
+    /// 100/50 ms (throttle), 50 ms (brake), 300 ms (clutch release),
+    /// saturation 100% (full travel), combined pedals off.
+    fn reset_pedals_defaults(&self, win: &MainWindow) {
+        let api = self.api();
+        let mut throttle = api.get_tuning("throttle");
+        throttle.curve = 1.0;
+        throttle.deadzone = 0.0;
+        throttle.press_ms = Some(100.0);
+        throttle.release_ms = Some(50.0);
+        throttle.combine_pedals = Some(false);
+        throttle.max_mv = self.throttle_saturation_max_mv(&throttle, 100.0);
+        let mut brake = api.get_tuning("brake");
+        brake.curve = 1.3;
+        brake.deadzone = 0.0;
+        brake.bite_point = Some(0.0);
+        brake.saturation = Some(1.0);
+        brake.press_ms = Some(50.0);
+        let mut clutch = api.get_tuning("clutch");
+        clutch.curve = 1.0;
+        clutch.deadzone = 0.0;
+        clutch.bite_point = Some(0.0);
+        clutch.bite_width = Some(0.15);
+        clutch.release_ms = Some(300.0);
+        let records = [throttle, brake, clutch];
+        self.run_generic_job(
+            win,
+            JobKind::TuningPush,
+            "Resetting pedals…",
+            move |api| {
+                for record in &records {
+                    if let Err(e) = api.set_tuning(record) {
+                        return JobResult::Unit(Err(e));
+                    }
+                }
+                JobResult::Unit(Ok(()))
+            },
+            move |ctx, win, result| {
+                let JobResult::Unit(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(()) => {
+                        ctx.unsaved.set(true);
+                        ctx.sync_pedals(win);
+                    }
+                    Err(e) => {
+                        ctx.notify(win, "Pedals", "Couldn't reset pedals", &e.title);
+                        ui_log!("RSH-UI pedals reset failed: {} ({})", e.code, e.title);
+                    }
+                }
+            },
+        );
+    }
+
+    /// Reset handbrake + shifter + horn to the Normal preset +
+    /// defaults (v2.0.19, F4 — 1-tap reset): one TuningPush job,
+    /// same shape as [`Self::reset_pedals_defaults`]. Handbrake:
+    /// curve 1.0 (Normal), deadzone 0, latch off, grab instant,
+    /// auto-release off. Shifter: lockout 50 ms (sensitivity is a
+    /// board value, not tuning — untouched). Horn: minimum honk
+    /// 400 ms, Momentary (the learned button is a binding, not a
+    /// preset — untouched).
+    fn reset_extras_defaults(&self, win: &MainWindow) {
+        let api = self.api();
+        let mut handbrake = api.get_tuning("handbrake");
+        handbrake.curve = 1.0;
+        handbrake.deadzone = 0.0;
+        handbrake.handbrake_latch = Some(false);
+        handbrake.press_ms = Some(0.0);
+        handbrake.handbrake_auto_release = Some(false);
+        let mut shifter = api.get_tuning("shifter");
+        shifter.shift_lockout_ms = Some(50.0);
+        let mut horn = api.get_tuning("horn");
+        horn.horn_min_ms = Some(400.0);
+        horn.horn_latch = Some(false);
+        let records = [handbrake, shifter, horn];
+        self.run_generic_job(
+            win,
+            JobKind::TuningPush,
+            "Resetting…",
+            move |api| {
+                for record in &records {
+                    if let Err(e) = api.set_tuning(record) {
+                        return JobResult::Unit(Err(e));
+                    }
+                }
+                JobResult::Unit(Ok(()))
+            },
+            move |ctx, win, result| {
+                let JobResult::Unit(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(()) => {
+                        ctx.unsaved.set(true);
+                        ctx.sync_extras(win);
+                    }
+                    Err(e) => {
+                        ctx.notify(win, "Extras", "Couldn't reset", &e.title);
+                        ui_log!("RSH-UI extras reset failed: {} ({})", e.code, e.title);
+                    }
+                }
+            },
+        );
+    }
+
     /// True while a field push is pending for `module` (R2-10):
     /// the drag's local value owns the slider until the push
     /// completes — a ~1 Hz re-sync must not overwrite it from the
@@ -6619,32 +6180,6 @@ impl Ctx {
                                 }
                                 FieldKind::Curve => effective.curve = local.curve,
                                 FieldKind::Saturation => effective.max_mv = local.max_mv,
-                                // --- Encoder per-module tuning ---
-                                // An encoder drag can never reach this
-                                // pedal arm (`same_module` is false when
-                                // the pending module is "encoders"), but
-                                // the match must cover the new variants —
-                                // same carry-over as the pedal fields.
-                                FieldKind::EncoderPulseMs => {
-                                    effective.encoder_pulse_ms = local.encoder_pulse_ms;
-                                }
-                                FieldKind::EncoderAccelSens => {
-                                    effective.encoder_accel_sensitivity =
-                                        local.encoder_accel_sensitivity;
-                                }
-                                // --- Buttons per-module tuning ---
-                                // Same as the encoder fields above: a
-                                // buttons drag never reaches the pedal
-                                // arm, but the match must cover them.
-                                FieldKind::ButtonDebounceMs => {
-                                    effective.button_debounce_ms = local.button_debounce_ms;
-                                }
-                                FieldKind::ButtonLongPressMs => {
-                                    effective.button_long_press_ms = local.button_long_press_ms;
-                                }
-                                FieldKind::ButtonDoublePressMs => {
-                                    effective.button_double_press_ms = local.button_double_press_ms;
-                                }
                                 // --- Shifter per-module tuning ---
                                 // A shifter drag can never reach this
                                 // pedal arm (`same_module` is false
@@ -6708,13 +6243,6 @@ impl Ctx {
             "horn" => {
                 *self.horn_record.borrow_mut() = stored.clone();
                 self.sync_extras_horn_props(win, stored);
-            }
-            "encoders" => {
-                Self::sync_encoder_props(win, stored);
-            }
-            // --- Buttons per-module tuning ---
-            "buttons" => {
-                Self::sync_button_props(win, stored);
             }
             // Shifter has no per-module writer — the slow re-sync
             // owns its props (as before).
@@ -7280,51 +6808,7 @@ impl Ctx {
         );
     }
 
-    /// Write the Buttons page's encoder tuning props from a record
-    /// (E1/E2/E3/E4, R2-10): pulse slider + text, steps-per-click
-    /// segment, acceleration switch + strength slider + text, and
-    /// the per-knob invert switches. All writes are change-guarded,
-    /// like `push_frame`.
-    #[allow(clippy::cast_possible_truncation)]
-    fn sync_encoder_props(win: &MainWindow, enc: &TuningSettings) {
-        let pulse_ms = enc.encoder_pulse_ms.unwrap_or(50.0);
-        set_if_changed(win.get_enc_pulse_ms(), pulse_ms as f32, |v| {
-            win.set_enc_pulse_ms(v);
-        });
-        set_if_changed(
-            win.get_enc_pulse_text(),
-            format!("{pulse_ms:.0} ms").into(),
-            |v| win.set_enc_pulse_text(v),
-        );
-        set_if_changed(
-            win.get_enc_counts(),
-            i32::from(enc.encoder_counts_per_click.unwrap_or(4)),
-            |v| win.set_enc_counts(v),
-        );
-        set_if_changed(
-            win.get_enc_accel(),
-            enc.encoder_accel.unwrap_or(false),
-            |v| {
-                win.set_enc_accel(v);
-            },
-        );
-        let sens = enc.encoder_accel_sensitivity.unwrap_or(1.0);
-        set_if_changed(win.get_enc_accel_sens(), sens as f32, |v| {
-            win.set_enc_accel_sens(v);
-        });
-        set_if_changed(
-            win.get_enc_accel_sens_text(),
-            format!("{:.0}%", sens * 100.0).into(),
-            |v| win.set_enc_accel_sens_text(v),
-        );
-        let mask = enc.encoder_invert_mask.unwrap_or(0);
-        set_if_changed(win.get_enc_invert1(), mask & 0b0001 != 0, |v| {
-            win.set_enc_invert1(v);
-        });
-        set_if_changed(win.get_enc_invert2(), mask & 0b0010 != 0, |v| {
-            win.set_enc_invert2(v);
-        });
-    }
+
 
     /// Write the Extras page's shifter props from a tuning record +
     /// the cached board sensitivity (SH1/SH2, R2-10): the lockout
@@ -7405,81 +6889,11 @@ impl Ctx {
         }
     }
 
-    /// Echo an encoder slider drag locally (R2-10): the slider + text
-    /// move with the drag, not at the next ~1 Hz re-sync. Only the
-    /// encoder fields are read, so the neutral record is enough —
-    /// no API round-trip per drag move. Both slider values are
-    /// passed in (the moving one fresh, the other from the window),
-    /// so a drag never clobbers the other slider's value.
-    fn apply_encoder_local(win: &MainWindow, pulse_ms: f64, sens: f64) {
-        let record = TuningSettings {
-            module: "encoders".to_string(),
-            encoder_pulse_ms: Some(pulse_ms),
-            encoder_counts_per_click: Some(u8::try_from(win.get_enc_counts()).unwrap_or(4)),
-            encoder_accel: Some(win.get_enc_accel()),
-            encoder_accel_sensitivity: Some(sens),
-            encoder_invert_mask: Some(
-                (u8::from(win.get_enc_invert1())) | (u8::from(win.get_enc_invert2()) << 1),
-            ),
-            ..TuningSettings::neutral("encoders")
-        };
-        Self::sync_encoder_props(win, &record);
-    }
 
-    /// Write the Buttons page's button tuning props from a record
-    /// (BU1/BU2/BU3, R2-10): debounce slider + text, long-press
-    /// threshold slider + text, double-press window slider + text.
-    /// All writes are change-guarded, like `push_frame`.
-    #[allow(clippy::cast_possible_truncation)]
-    fn sync_button_props(win: &MainWindow, buttons: &TuningSettings) {
-        let debounce_ms = buttons.button_debounce_ms.unwrap_or(10.0);
-        set_if_changed(win.get_btn_debounce_ms(), debounce_ms as f32, |v| {
-            win.set_btn_debounce_ms(v);
-        });
-        set_if_changed(
-            win.get_btn_debounce_text(),
-            format!("{debounce_ms:.0} ms").into(),
-            |v| win.set_btn_debounce_text(v),
-        );
-        let long_press_ms = buttons.button_long_press_ms.unwrap_or(800.0);
-        set_if_changed(win.get_btn_longpress_ms(), long_press_ms as f32, |v| {
-            win.set_btn_longpress_ms(v);
-        });
-        set_if_changed(
-            win.get_btn_longpress_text(),
-            format!("{long_press_ms:.0} ms").into(),
-            |v| win.set_btn_longpress_text(v),
-        );
-        let double_press_ms = buttons.button_double_press_ms.unwrap_or(300.0);
-        set_if_changed(win.get_btn_doublepress_ms(), double_press_ms as f32, |v| {
-            win.set_btn_doublepress_ms(v);
-        });
-        set_if_changed(
-            win.get_btn_doublepress_text(),
-            format!("{double_press_ms:.0} ms").into(),
-            |v| win.set_btn_doublepress_text(v),
-        );
-    }
 
-    /// Echo a button tuning slider drag locally (R2-10): same
-    /// pattern as [`Self::apply_encoder_local`]. All three slider
-    /// values are passed in (the moving one fresh, the others from
-    /// the window), so a drag never clobbers another slider's value.
-    fn apply_button_local(
-        win: &MainWindow,
-        debounce_ms: f64,
-        long_press_ms: f64,
-        double_press_ms: f64,
-    ) {
-        let record = TuningSettings {
-            module: "buttons".to_string(),
-            button_debounce_ms: Some(debounce_ms),
-            button_long_press_ms: Some(long_press_ms),
-            button_double_press_ms: Some(double_press_ms),
-            ..TuningSettings::neutral("buttons")
-        };
-        Self::sync_button_props(win, &record);
-    }
+
+
+
 
     /// Echo a handbrake deadzone drag locally (R2-10): same pattern
     /// as [`Self::apply_pedal_deadzone_local`].
@@ -7727,30 +7141,8 @@ impl Ctx {
             !self.capture_available(),
             |v| win.set_extras_calibration_disabled(v),
         );
-        set_if_changed(
-            win.get_shifter_mode(),
-            match shifter.shifter_gate {
-                Some(ShifterGate::HPattern) => 1,
-                _ => 0,
-            },
-            |v| win.set_shifter_mode(v),
-        );
         self.sync_extras_horn_props(win, &horn);
         self.sync_extras_led_props(win, &led);
-        // E1/E2: the Buttons page's encoder tuning rides this slow
-        // re-sync (no separate sync_buttons exists). While a drag's
-        // push is pending, the local echo owns the slider — the
-        // slow cache must not snap it back mid-drag (R2-10).
-        if !self.field_push_pending_for("encoders") {
-            let enc = api.get_tuning("encoders");
-            Self::sync_encoder_props(win, &enc);
-        }
-        // BU1/BU2: the Buttons page's button tuning rides the same
-        // slow re-sync, with the same pending-drag guard.
-        if !self.field_push_pending_for("buttons") {
-            let buttons = api.get_tuning("buttons");
-            Self::sync_button_props(win, &buttons);
-        }
         // SH1/SH2: the shifter props ride this slow re-sync — the
         // lockout from the tuning record, the sensitivity from the
         // board cache (see `sync_shifter_props`).
@@ -7760,7 +7152,7 @@ impl Ctx {
         // would be a control session per second. A failed read
         // retries at most every 30 s; a SensitivityPush job already
         // running (fetch or write) is never doubled.
-        if win.get_page() == 4
+        if win.get_page() == 3
             && self.sensitivity_cached.get().is_none()
             && !self
                 .busy_jobs
@@ -8611,27 +8003,6 @@ impl Ctx {
         set_if_changed(win.get_diag_firmware(), firmware.clone().into(), |v| {
             win.set_diag_firmware(v);
         });
-        // FH4 wheel check (v2.0.14): the same cached
-        // `vjoy_status()` the wizard reads — a local cache read,
-        // not a second IPC call — so the drawer shows the same
-        // line. "—" until a check exists (non-Windows / before
-        // the first check), never a fake OK.
-        let (wheel_text, wheel_ok) = match api.vjoy_status() {
-            Ok(status) => match status.wheel_check {
-                Some(check) => {
-                    let (ok, line, _) = Self::wheel_check_summary(&check);
-                    (line, ok)
-                }
-                None => ("—".to_string(), false),
-            },
-            Err(_) => ("—".to_string(), false),
-        };
-        set_if_changed(win.get_diag_wheel_text(), wheel_text.into(), |v| {
-            win.set_diag_wheel_text(v);
-        });
-        set_if_changed(win.get_diag_wheel_ok(), wheel_ok, |v| {
-            win.set_diag_wheel_ok(v);
-        });
         // A20: measured stats, or "—" (the drawer shows
         // "No telemetry yet" while these are "—").
         if let Ok(stats) = api.diag_stats() {
@@ -8774,77 +8145,16 @@ impl Ctx {
         }
     }
 
-    /// Plain-words one-line summary of a [`rsh_api::WheelCheck`] for the
-    /// wizard Drivers step and the Diagnostics drawer (FH4 fix,
-    /// v2.0.14). Returns (`all_ok`, `summary_line`, `next_step`): the
-    /// summary names the three things a game needs to see the wheel
-    /// — the complete `GameInput` mapping, the `EmuWheel` envelope,
-    /// and the feeder state — in words the user can read in a photo;
-    /// no registry paths, hex keys, or jargon. The wording is
-    /// universal (Windows-level wheel setup, every `GameInput`
-    /// game and the vJoy joystick games, not one game) and never
-    /// promises a game will work: when everything is OK the next
-    /// step frames the check as setup-complete and asks the user
-    /// to test in the game — the game itself is the proof. FFB is
-    /// deliberately not an item: FH4 does not send FFB data to
-    /// vJoy, so it never blocks the headline. `next_step` is the
-    /// daemon's text verbatim when present; when the daemon
-    /// reports a problem with no next step, the repair path is
-    /// the RSH installer (it writes both the mapping and the
-    /// envelope while elevated), so that is the fallback — never
-    /// a blank.
-    fn wheel_check_summary(check: &rsh_api::WheelCheck) -> (bool, String, String) {
-        let mapping_ok = check.vjoy_mapping_ok && check.hid_mapping_ok;
-        let all_ok = mapping_ok && check.envelope_ok && check.feeding;
-        let line = format!(
-            "Wheel setup: {} · {} · {}",
-            if mapping_ok {
-                "mapping OK"
-            } else {
-                "mapping incomplete"
-            },
-            if check.envelope_ok {
-                "envelope OK"
-            } else {
-                "envelope wrong"
-            },
-            if check.feeding {
-                "feed active"
-            } else {
-                "not feeding"
-            },
-        );
-        let next = if check.next_step.is_empty() {
-            if all_ok {
-                // Facts only, never a promise about a game: the
-                // setup is complete, the game is the test.
-                "Wheel setup complete — test it in your game.".to_string()
-            } else if mapping_ok && check.envelope_ok {
-                // Only the feeder is down: the installer writes
-                // mapping + envelope, it cannot start a stopped
-                // feeder — a restart is the repair.
-                "Restart RSH to start feeding the wheel.".to_string()
-            } else {
-                "Re-run the RSH installer to repair the wheel setup.".to_string()
-            }
-        } else {
-            check.next_step.clone()
-        };
-        (all_ok, line, next)
-    }
+
 
     /// Sync the wizard Drivers step (vJoy) from `vjoy_status()`:
     /// installed / installing / version / last install error are all
     /// real. When the call errors (sim / no daemon) the status is
     /// honestly unknown — never a fake "installed" — and the
-    /// `HIDMaestro` fallback stays the way forward. The user's
+    /// Xbox (ViGEmBus) fallback stays the way forward. The user's
     /// fallback choice is preserved across calls.
     /// R2-11: every write is change-guarded.
     fn sync_vjoy(&self, win: &MainWindow) {
-        // FH4 wheel check (v2.0.14): (checked, all_ok, line, next)
-        // — filled from the daemon's check below, all-false/blank
-        // when there is no check to show.
-        let wheel: (bool, bool, String, String);
         if let Ok(status) = self.api().vjoy_status() {
             set_if_changed(win.get_setup_vjoy_installed(), status.installed, |v| {
                 win.set_setup_vjoy_installed(v);
@@ -8857,17 +8167,6 @@ impl Ctx {
                 status.version.unwrap_or_default().into(),
                 |v| win.set_setup_vjoy_version(v),
             );
-            // The daemon's wheel check rides on this same ~1 Hz
-            // poll. None = not checked yet (non-Windows / before
-            // the first check) — the wizard hides the line until
-            // a check exists, never a fake OK.
-            wheel = match &status.wheel_check {
-                Some(check) => {
-                    let (ok, line, next) = Self::wheel_check_summary(check);
-                    (true, ok, line, next)
-                }
-                None => (false, false, String::new(), String::new()),
-            };
             // R2-40: never clobber a failure the install job already
             // reported with the daemon's (possibly empty)
             // `install_error` — the 1 Hz tick used to wipe the
@@ -8896,34 +8195,10 @@ impl Ctx {
             });
             set_if_changed(
                 win.get_setup_vjoy_error(),
-                "Driver status unavailable — use HIDMaestro instead.".into(),
+                "Driver status unavailable — use Xbox (ViGEmBus) instead.".into(),
                 |v| win.set_setup_vjoy_error(v),
             );
-            // No daemon answer means no wheel check either.
-            wheel = (false, false, String::new(), String::new());
         }
-        // FH4 wheel check (v2.0.14): one write site for both arms
-        // above, change-guarded like the rest.
-        set_if_changed(win.get_setup_vjoy_wheel_checked(), wheel.0, |v| {
-            win.set_setup_vjoy_wheel_checked(v);
-        });
-        set_if_changed(win.get_setup_vjoy_wheel_ok(), wheel.1, |v| {
-            win.set_setup_vjoy_wheel_ok(v);
-        });
-        set_if_changed(
-            win.get_setup_vjoy_wheel_line(),
-            wheel.2.clone().into(),
-            |v| {
-                win.set_setup_vjoy_wheel_line(v);
-            },
-        );
-        set_if_changed(
-            win.get_setup_vjoy_wheel_next(),
-            wheel.3.clone().into(),
-            |v| {
-                win.set_setup_vjoy_wheel_next(v);
-            },
-        );
         // D16: the Drivers step shows indeterminate progress +
         // elapsed while an install runs (the daemon reports no %).
         let elapsed = self
@@ -9627,8 +8902,9 @@ impl Ctx {
             },
             move |ctx, win, result| match result {
                 JobResult::LearnPoll(Some(b)) => {
+                    // v2.0.19: horn only — the Buttons page (learn
+                    // target 1) is gone.
                     ctx.learn_target.set(0);
-                    win.set_buttons_listening(false);
                     win.set_horn_learning(false);
                     if target == 2 {
                         ctx.run_generic_job(
@@ -9664,23 +8940,6 @@ impl Ctx {
                                 }
                             },
                         );
-                    } else {
-                        let idx = i32::from(b).saturating_sub(1);
-                        if (0..12).contains(&idx) {
-                            ctx.selected_button.set(idx);
-                            win.set_selected_index(idx);
-                            let action = ctx.button_actions.borrow()
-                                [usize::try_from(idx).unwrap_or(0)]
-                            .clone();
-                            *ctx.pending_action.borrow_mut() = None;
-                            win.set_selected_action(action.into());
-                        }
-                        ctx.notify(
-                            win,
-                            "Buttons",
-                            "Button learned",
-                            &format!("Learned Button {b}."),
-                        );
                     }
                 }
                 JobResult::LearnPoll(None) => {
@@ -9688,7 +8947,6 @@ impl Ctx {
                     // stopped learning) — say so instead of going
                     // silent; the listening state was the only cue.
                     ctx.learn_target.set(0);
-                    win.set_buttons_listening(false);
                     win.set_horn_learning(false);
                     // R2-35: Learn ended with nothing learned — say
                     // so instead of silently clearing the listening
@@ -9706,7 +8964,8 @@ impl Ctx {
         );
     }
 
-    /// Start (or cancel) learning for `target` (1 Buttons, 2 horn):
+    /// Start (or cancel) learning for `target` (2 = horn, v2.0.19 —
+    /// the Buttons-page target 1 is gone):
     /// `start_learn` / `cancel_learn` run on a [`JobKind::LearnToggle`]
     /// job thread — a dedicated kind (R2-35), NOT the poll job's
     /// [`JobKind::LearnOp`], so a click while the 1 Hz poll job is in
@@ -9727,7 +8986,6 @@ impl Ctx {
                     match result {
                         Ok(()) => {
                             ctx.learn_target.set(0);
-                            win.set_buttons_listening(false);
                             win.set_horn_learning(false);
                             ctx.notify(win, "Learn", "Learning cancelled", "Learning cancelled.");
                         }
@@ -9749,7 +9007,6 @@ impl Ctx {
                 match result {
                     Ok(true) => {
                         ctx.learn_target.set(target);
-                        win.set_buttons_listening(target == 1);
                         win.set_horn_learning(target == 2);
                         ctx.notify(
                             win,
@@ -9782,7 +9039,6 @@ fn wire_callbacks(win: &MainWindow, ctx: &Rc<Ctx>) {
     wire_setup(win, ctx);
     wire_game_dialog(win, ctx);
     wire_pedals(win, ctx);
-    wire_buttons(win, ctx);
     wire_extras(win, ctx);
     wire_theme(win, ctx);
     wire_popover(win, ctx);
@@ -10001,10 +9257,10 @@ fn wire_setup(win: &MainWindow, ctx: &Rc<Ctx>) {
     wire_setup_vjoy(win, ctx);
 }
 
-/// Wire the wizard's Drivers step (vJoy install / `HIDMaestro`
+/// Wire the wizard's Drivers step (vJoy install / Xbox (ViGEmBus)
 /// fallback). Install needs the vJoy backend (`install_vjoy` seam):
 /// until it lands the button explains itself and the fallback is
-/// the way forward — `set_output_backend("HIDMaestro")` is real.
+/// the way forward — `set_output_backend("Xbox")` is real.
 fn wire_setup_vjoy(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         let win = win.as_weak();
@@ -10050,12 +9306,12 @@ fn wire_setup_vjoy(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         let win = win.as_weak();
         let ctx = ctx.clone();
-        win.unwrap().on_setup_use_hidmaestro(move || {
+        win.unwrap().on_setup_use_xbox(move || {
             if let Some(w) = win.upgrade() {
-                // A9/B-2/A10: the shared backend-switch job (warn +
-                // 390 s bound); the wizard's fallback flag is set in
-                // the job drain on success.
-                ctx.start_backend_job(&w, 0);
+                // A9/B-2/A10: the shared backend-switch job (390 s
+                // bound); the wizard's fallback flag is set in the
+                // job drain on success.
+                ctx.start_backend_job(&w, 1);
             }
         });
     }
@@ -10380,7 +9636,7 @@ fn wire_pedals(win: &MainWindow, ctx: &Rc<Ctx>) {
 /// 0.5..2.0, throttle ramps 0..500 ms, brake press 0..300 ms,
 /// clutch release 0..1000 ms, saturation 70..100%.
 // Nine near-identical callback blocks (one per control), like
-// `wire_buttons` above — splitting them would hide the pattern.
+// the other wire_* fns — splitting them would hide the pattern.
 #[allow(clippy::too_many_lines)]
 fn wire_pedals_tuning(win: &MainWindow, ctx: &Rc<Ctx>) {
     const MODULES: [&str; 3] = ["throttle", "brake", "clutch"];
@@ -10816,556 +10072,7 @@ fn wire_pedals_set(win: &MainWindow, ctx: &Rc<Ctx>) {
     }
 }
 
-/// Wire the Buttons page callbacks (v2.0.1 hotfix + UI-FINISH A3–A5).
-///
-/// A3: an action chip updates the pending mapping for the selected
-/// tile (visible at once); a knob click opens the knob edit panel
-/// (the Slint sets edit-kind itself); Save calls
-/// `set_button_action` (BACKEND-2 seam) — until it lands Save
-/// explains the gap and keeps the pending choice. A4: the Pill
-/// follows the selected tile's action (Rust-owned, index 5 / "Gear
-/// 3" at startup). A5: pressed-index is always -1 (no live button
-/// state in the snapshot).
-#[allow(clippy::too_many_lines, clippy::cast_sign_loss)]
-fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_tile_selected(move |i| {
-            let Some(w) = win.upgrade() else {
-                return;
-            };
-            ctx.selected_button.set(i);
-            *ctx.pending_action.borrow_mut() = None;
-            *ctx.pending_long_action.borrow_mut() = None;
-            let idx = usize::try_from(i).unwrap_or(0);
-            let action = ctx
-                .button_actions
-                .borrow()
-                .get(idx)
-                .cloned()
-                .unwrap_or_else(|| "Not set".to_string());
-            let long_action = ctx
-                .long_press_actions
-                .borrow()
-                .get(idx)
-                .cloned()
-                .unwrap_or_else(|| "Not set".to_string());
-            w.set_selected_index(i);
-            w.set_selected_action(action.into());
-            w.set_selected_long_action(long_action.into());
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_knob_selected(move |i| {
-            ctx.edit_kind.set(1);
-            ctx.edit_knob.set(i);
-            let row = ctx.knob_row.get();
-            let action = ctx.knob_actions.borrow()[usize::try_from(i).unwrap_or(0)]
-                [usize::try_from(row).unwrap_or(0)]
-            .clone();
-            if let Some(w) = win.upgrade() {
-                w.set_knob_row_action(action.into());
-            }
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_knob_row_selected(move |i| {
-            ctx.knob_row.set(i);
-            let knob = ctx.edit_knob.get();
-            let action = ctx.knob_actions.borrow()[usize::try_from(knob).unwrap_or(0)]
-                [usize::try_from(i).unwrap_or(0)]
-            .clone();
-            if let Some(w) = win.upgrade() {
-                w.set_knob_row_action(action.into());
-            }
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_action_chip(move |a| {
-            let Some(w) = win.upgrade() else {
-                return;
-            };
-            let action = a.to_string();
-            if ctx.edit_kind.get() == 1 {
-                let knob = usize::try_from(ctx.edit_knob.get()).unwrap_or(0);
-                let row = usize::try_from(ctx.knob_row.get()).unwrap_or(0);
-                ctx.knob_actions.borrow_mut()[knob][row].clone_from(&action);
-                w.set_knob_row_action(action.into());
-            } else {
-                *ctx.pending_action.borrow_mut() = Some(action.clone());
-                w.set_selected_action(action.into());
-            }
-            ctx.unsaved.set(true);
-            ctx.refresh(&w, 0);
-        });
-    }
-    // BU2: a long-press chip updates the pending long-press mapping
-    // for the selected tile (visible at once, same pattern as the
-    // normal action chip above — button edits only, knobs have no
-    // long-press action).
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_long_action_chip(move |a| {
-            let Some(w) = win.upgrade() else {
-                return;
-            };
-            let action = a.to_string();
-            *ctx.pending_long_action.borrow_mut() = Some(action.clone());
-            w.set_selected_long_action(action.into());
-            ctx.unsaved.set(true);
-            ctx.refresh(&w, 0);
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_learn_clicked(move || {
-            if let Some(w) = win.upgrade() {
-                ctx.toggle_learn(&w, 1);
-            }
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_edit_save(move || {
-            let Some(w) = win.upgrade() else {
-                return;
-            };
-            // Knob edit (edit_kind == 1): persist the knob row's
-            // action (M9) — the chip tap already staged it in
-            // `knob_actions`; Save writes it to the daemon store.
-            // F6: `set_knob_action` runs on a BindingOp job thread.
-            if ctx.edit_kind.get() == 1 {
-                let knob = ctx.edit_knob.get();
-                let row = ctx.knob_row.get();
-                let display = ctx.knob_actions.borrow()[usize::try_from(knob).unwrap_or(0)]
-                    [usize::try_from(row).unwrap_or(0)]
-                .clone();
-                let action = action_id(&display).unwrap_or("");
-                let knob_u8 = u8::try_from(knob).unwrap_or(0);
-                let row_u8 = u8::try_from(row).unwrap_or(0);
-                let action = action.to_string();
-                ctx.run_generic_job(
-                    &w,
-                    JobKind::BindingOp,
-                    "Saving knob mapping…",
-                    move |api| JobResult::Unit(api.set_knob_action(knob_u8, row_u8, &action)),
-                    move |ctx, w, result| {
-                        let JobResult::Unit(result) = result else {
-                            return;
-                        };
-                        match result {
-                            Ok(()) => {
-                                ctx.unsaved
-                                    .set(ctx.api().draft_status().is_some_and(|s| s.dirty));
-                                ctx.load_knobs(w);
-                                ctx.notify(
-                                    w,
-                                    "Buttons",
-                                    "Knob mapping saved",
-                                    &format!("Knob {} → {display}.", knob + 1),
-                                );
-                            }
-                            Err(e) => {
-                                ctx.notify_error(w, "Buttons", &e);
-                                // Revert the staged choice to the stored one.
-                                ctx.load_knobs(w);
-                            }
-                        }
-                    },
-                );
-                return;
-            }
-            // Button edit: persist the pending chip choices (H-3 +
-            // BU2) — "Not set" clears the binding, any other chip
-            // sets it; the long-press chip does the same for the
-            // long-press action. Both save in one BindingOp job so
-            // the tile never shows a half-saved pair. The tile
-            // refreshes from the daemon immediately after. F6:
-            // `set_binding` / `clear_binding` /
-            // `set_long_press_binding` / `clear_long_press_binding`
-            // run on a BindingOp job thread.
-            let pending = ctx.pending_action.borrow().clone();
-            let pending_long = ctx.pending_long_action.borrow().clone();
-            if pending.is_some() || pending_long.is_some() {
-                let button = ctx.selected_button.get() + 1;
-                let button_u8 = u8::try_from(button).unwrap_or(0);
-                let binding_id = pending.as_deref().and_then(action_id);
-                let long_binding_id = pending_long.as_deref().and_then(action_id);
-                let saved_action = pending.clone().unwrap_or_default();
-                let saved_long = pending_long.clone().unwrap_or_default();
-                ctx.run_generic_job(
-                    &w,
-                    JobKind::BindingOp,
-                    "Saving button mapping…",
-                    move |api| {
-                        JobResult::Unit(
-                            (|| -> Result<(), UserError> {
-                                // Normal binding first, then the
-                                // long-press one — either failing
-                                // aborts the job, and the tile
-                                // reverts to the stored pair.
-                                if pending.is_some() {
-                                    match binding_id {
-                                        Some(id) => {
-                                            api.set_binding(button_u8, id).map(|_| ())?;
-                                        }
-                                        None => {
-                                            api.clear_binding(button_u8).map(|_| ())?;
-                                        }
-                                    }
-                                }
-                                if pending_long.is_some() {
-                                    match long_binding_id {
-                                        Some(id) => {
-                                            api.set_long_press_binding(button_u8, id)
-                                                .map(|_| ())?;
-                                        }
-                                        None => {
-                                            api.clear_long_press_binding(button_u8)
-                                                .map(|_| ())?;
-                                        }
-                                    }
-                                }
-                                Ok(())
-                            })(),
-                        )
-                    },
-                    move |ctx, w, result| {
-                        let JobResult::Unit(result) = result else {
-                            return;
-                        };
-                        match result {
-                            Ok(()) => {
-                                *ctx.pending_action.borrow_mut() = None;
-                                *ctx.pending_long_action.borrow_mut() = None;
-                                ctx.unsaved
-                                    .set(ctx.api().draft_status().is_some_and(|s| s.dirty));
-                                ctx.load_bindings(w);
-                                let detail = if saved_long.is_empty() {
-                                    format!("Button {button} → {saved_action}.")
-                                } else if saved_action.is_empty() {
-                                    format!("Button {button} long-press → {saved_long}.")
-                                } else {
-                                    format!(
-                                        "Button {button} → {saved_action}; long-press → {saved_long}."
-                                    )
-                                };
-                                ctx.notify(w, "Buttons", "Button mapping saved", &detail);
-                            }
-                            Err(e) => {
-                                ctx.notify_error(w, "Buttons", &e);
-                                // Revert the tile to the stored actions.
-                                ctx.load_bindings(w);
-                            }
-                        }
-                    },
-                );
-                return;
-            }
-            // F6: `save_draft` runs on a ProfileOp job thread.
-            ctx.run_generic_job(
-                &w,
-                JobKind::ProfileOp,
-                "Saving changes…",
-                move |api| JobResult::Bool(api.save_draft()),
-                move |ctx, w, result| {
-                    let JobResult::Bool(result) = result else {
-                        return;
-                    };
-                    match result {
-                        Ok(true) => {
-                            ctx.unsaved.set(false);
-                            ctx.notify(w, "Buttons", "Changes saved", "Button changes saved.");
-                        }
-                        Ok(false) => {
-                            ctx.notify(w, "Buttons", "Nothing to save", "No changes to save.");
-                        }
-                        Err(e) => {
-                            ctx.notify_error(w, "Buttons", &e);
-                            ui_log!("RSH-UI buttons edit-save failed: {} ({})", e.code, e.title);
-                        }
-                    }
-                },
-            );
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_edit_cancel(move || {
-            let Some(w) = win.upgrade() else {
-                return;
-            };
-            *ctx.pending_action.borrow_mut() = None;
-            *ctx.pending_long_action.borrow_mut() = None;
-            let idx = usize::try_from(ctx.selected_button.get()).unwrap_or(0);
-            let action = ctx
-                .button_actions
-                .borrow()
-                .get(idx)
-                .cloned()
-                .unwrap_or_else(|| "Not set".to_string());
-            w.set_selected_action(action.into());
-            let long_action = ctx
-                .long_press_actions
-                .borrow()
-                .get(idx)
-                .cloned()
-                .unwrap_or_else(|| "Not set".to_string());
-            w.set_selected_long_action(long_action.into());
-            // F6: `discard_draft` runs on a ProfileOp job thread.
-            ctx.run_generic_job(
-                &w,
-                JobKind::ProfileOp,
-                "Discarding changes…",
-                move |api| JobResult::Bool(Ok(api.discard_draft())),
-                move |ctx, w, result| {
-                    let JobResult::Bool(result) = result else {
-                        return;
-                    };
-                    if result.unwrap_or(false) {
-                        ctx.unsaved.set(false);
-                        ctx.notify(w, "Buttons", "Changes discarded", "Changes discarded.");
-                    } else {
-                        ctx.notify(w, "Buttons", "Nothing to discard", "No changes to discard.");
-                    }
-                },
-            );
-        });
-    }
-    // Encoder tuning (E1/E2): pulse slider (debounced push, local
-    // echo while dragging) + steps-per-click segment (immediate
-    // push, like the handbrake Axis/Button segment).
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_enc_pulse_changed(move |v| {
-            let Some(w) = win.upgrade() else {
-                return;
-            };
-            let pulse_ms = (20.0 + f64::from(v) * 180.0).clamp(20.0, 200.0);
-            Ctx::apply_encoder_local(&w, pulse_ms, f64::from(w.get_enc_accel_sens()));
-            // M-7: a drag queues one debounced push, not one per move.
-            ctx.queue_field_push("encoders", FieldKind::EncoderPulseMs, pulse_ms);
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_enc_pulse_edited(move |t| {
-            let Some(w) = win.upgrade() else {
-                return;
-            };
-            if let Ok(ms) = t.trim().trim_end_matches(['m', 's', ' ']).parse::<f64>() {
-                let pulse_ms = ms.clamp(20.0, 200.0);
-                Ctx::apply_encoder_local(&w, pulse_ms, f64::from(w.get_enc_accel_sens()));
-                ctx.queue_field_push("encoders", FieldKind::EncoderPulseMs, pulse_ms);
-            }
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_enc_counts_changed(move |i| {
-            if let Some(w) = win.upgrade() {
-                let counts = match i {
-                    1 => 1u8,
-                    2 => 2u8,
-                    _ => 4u8,
-                };
-                ctx.set_module_tuning(&w, "encoders", move |t| {
-                    t.encoder_counts_per_click = Some(counts);
-                });
-            }
-        });
-    }
-    // Encoder tuning (E3/E4): acceleration switch (immediate push)
-    // + strength slider (debounced push, local echo) + per-knob
-    // invert switches (immediate push, mask bit per knob).
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_enc_accel_changed(move |b| {
-            if let Some(w) = win.upgrade() {
-                ctx.set_module_tuning(&w, "encoders", move |t| {
-                    t.encoder_accel = Some(b);
-                });
-            }
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_enc_accel_sens_changed(move |v| {
-            let Some(w) = win.upgrade() else {
-                return;
-            };
-            let sens = (f64::from(v) * 2.0).clamp(0.0, 2.0);
-            Ctx::apply_encoder_local(&w, f64::from(w.get_enc_pulse_ms()), sens);
-            ctx.queue_field_push("encoders", FieldKind::EncoderAccelSens, sens);
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_enc_accel_sens_edited(move |t| {
-            let Some(w) = win.upgrade() else {
-                return;
-            };
-            if let Ok(pct) = t.trim().trim_end_matches(['%', ' ']).parse::<f64>() {
-                let sens = (pct / 100.0).clamp(0.0, 2.0);
-                Ctx::apply_encoder_local(&w, f64::from(w.get_enc_pulse_ms()), sens);
-                ctx.queue_field_push("encoders", FieldKind::EncoderAccelSens, sens);
-            }
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_enc_invert_changed(move |i, b| {
-            if let Some(w) = win.upgrade() {
-                let bit: u8 = match i {
-                    0 => 0b0001,
-                    1 => 0b0010,
-                    _ => return,
-                };
-                ctx.set_module_tuning(&w, "encoders", move |t| {
-                    let mut mask = t.encoder_invert_mask.unwrap_or(0);
-                    if b {
-                        mask |= bit;
-                    } else {
-                        mask &= !bit;
-                    }
-                    t.encoder_invert_mask = Some(mask);
-                });
-            }
-        });
-    }
-    // Button tuning (BU1/BU2): debounce + long-press threshold
-    // sliders (debounced push, local echo while dragging — same
-    // pattern as the encoder pulse slider above).
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_btn_debounce_changed(move |v| {
-            let Some(w) = win.upgrade() else {
-                return;
-            };
-            let debounce_ms = (f64::from(v) * 50.0).clamp(0.0, 50.0);
-            Ctx::apply_button_local(
-                &w,
-                debounce_ms,
-                f64::from(w.get_btn_longpress_ms()),
-                f64::from(w.get_btn_doublepress_ms()),
-            );
-            // M-7: a drag queues one debounced push, not one per move.
-            ctx.queue_field_push("buttons", FieldKind::ButtonDebounceMs, debounce_ms);
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_btn_debounce_edited(move |t| {
-            let Some(w) = win.upgrade() else {
-                return;
-            };
-            if let Ok(ms) = t.trim().trim_end_matches(['m', 's', ' ']).parse::<f64>() {
-                let debounce_ms = ms.clamp(0.0, 50.0);
-                Ctx::apply_button_local(
-                    &w,
-                    debounce_ms,
-                    f64::from(w.get_btn_longpress_ms()),
-                    f64::from(w.get_btn_doublepress_ms()),
-                );
-                ctx.queue_field_push("buttons", FieldKind::ButtonDebounceMs, debounce_ms);
-            }
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_btn_longpress_changed(move |v| {
-            let Some(w) = win.upgrade() else {
-                return;
-            };
-            let long_press_ms = (300.0 + f64::from(v) * 1200.0).clamp(300.0, 1500.0);
-            Ctx::apply_button_local(
-                &w,
-                f64::from(w.get_btn_debounce_ms()),
-                long_press_ms,
-                f64::from(w.get_btn_doublepress_ms()),
-            );
-            // M-7: a drag queues one debounced push, not one per move.
-            ctx.queue_field_push("buttons", FieldKind::ButtonLongPressMs, long_press_ms);
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_btn_longpress_edited(move |t| {
-            let Some(w) = win.upgrade() else {
-                return;
-            };
-            if let Ok(ms) = t.trim().trim_end_matches(['m', 's', ' ']).parse::<f64>() {
-                let long_press_ms = ms.clamp(300.0, 1500.0);
-                Ctx::apply_button_local(
-                    &w,
-                    f64::from(w.get_btn_debounce_ms()),
-                    long_press_ms,
-                    f64::from(w.get_btn_doublepress_ms()),
-                );
-                ctx.queue_field_push("buttons", FieldKind::ButtonLongPressMs, long_press_ms);
-            }
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_btn_doublepress_changed(move |v| {
-            let Some(w) = win.upgrade() else {
-                return;
-            };
-            let double_press_ms = (150.0 + f64::from(v) * 350.0).clamp(150.0, 500.0);
-            Ctx::apply_button_local(
-                &w,
-                f64::from(w.get_btn_debounce_ms()),
-                f64::from(w.get_btn_longpress_ms()),
-                double_press_ms,
-            );
-            // M-7: a drag queues one debounced push, not one per move.
-            ctx.queue_field_push("buttons", FieldKind::ButtonDoublePressMs, double_press_ms);
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_btn_doublepress_edited(move |t| {
-            let Some(w) = win.upgrade() else {
-                return;
-            };
-            if let Ok(ms) = t.trim().trim_end_matches(['m', 's', ' ']).parse::<f64>() {
-                let double_press_ms = ms.clamp(150.0, 500.0);
-                Ctx::apply_button_local(
-                    &w,
-                    f64::from(w.get_btn_debounce_ms()),
-                    f64::from(w.get_btn_longpress_ms()),
-                    double_press_ms,
-                );
-                ctx.queue_field_push("buttons", FieldKind::ButtonDoublePressMs, double_press_ms);
-            }
-        });
-    }
-}
+
 
 /// Wire the Extras page callbacks (A6): LED pattern/brightness/colour
 /// and handbrake feel/deadzone push through `set_tuning`; horn Learn
@@ -11515,7 +10222,6 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
                         .set(Some(Instant::now() + Duration::from_secs_f64(ms / 1000.0)));
                     ctx.refresh(&w, 0);
                 }
-                "shifter-change-in-buttons" => w.set_page(3),
                 other => ui_log!("RSH-UI unknown extras-action: {other}"),
             }
         });
@@ -11575,7 +10281,7 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
     // H1 latch + H3 auto-release: switches push immediately.
     // H2 grab speed: the slider is 0..1 of 0..200 ms (the
     // handbrake press ramp); drags echo locally + push debounced,
-    // typed values parse like the encoder pulse ("120 ms").
+    // typed values parse like the other sliders ("120 ms").
     {
         let win = win.as_weak();
         let ctx = ctx.clone();
@@ -11688,8 +10394,8 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
     }
     // Shifter tuning (SH1/SH2): sensitivity slider (debounced
     // board-config push, local echo while dragging) + lockout
-    // slider (debounced `set_tuning` field push, like the encoder
-    // pulse slider). Both have typed-value handlers, like the
+    // slider (debounced `set_tuning` field push, like the handbrake
+    // grab slider). Both have typed-value handlers, like the
     // handbrake deadzone / LED brightness sliders.
     {
         let win = win.as_weak();
@@ -12214,6 +10920,26 @@ fn wire_tuning(win: &MainWindow, ctx: &Rc<Ctx>) {
             ctx.push_steering();
             // R2-13: no full `refresh` per reset — the 50 ms timer
             // paints the new local value within one frame.
+        });
+    }
+    // v2.0.19 (F4): 1-tap reset for Pedals + Extras — same
+    // window-callback pattern as the steering reset above.
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_pedals_reset_defaults(move || {
+            if let Some(w) = win.upgrade() {
+                ctx.reset_pedals_defaults(&w);
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_reset_defaults(move || {
+            if let Some(w) = win.upgrade() {
+                ctx.reset_extras_defaults(&w);
+            }
         });
     }
 }
@@ -12839,42 +11565,6 @@ fn wire_transport(win: &MainWindow, ctx: &Rc<Ctx>) {
                     }
                 },
             );
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_steam_fh4_mode_selected(move |enabled| {
-            if let Some(w) = win.upgrade() {
-                ctx.apply_steam_fh4_mode(&w, enabled);
-            }
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_g29_spoof_mode_selected(move |enabled| {
-            if let Some(w) = win.upgrade() {
-                ctx.apply_g29_spoof_mode(&w, enabled);
-            }
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_g29_pedal_layout_chosen(move |layout| {
-            if let Some(w) = win.upgrade() {
-                ctx.apply_g29_pedal_layout(&w, layout.as_str());
-            }
-        });
-    }
-    {
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_g29_handbrake_button_chosen(move |button| {
-            if let Some(w) = win.upgrade() {
-                ctx.apply_g29_handbrake_button(&w, button);
-            }
         });
     }
     {
@@ -13799,7 +12489,7 @@ fn start_frame_timer(
                                 code: "vjoy_install_failed".to_string(),
                                 title: "vJoy install failed".to_string(),
                                 what_happened: w.get_setup_vjoy_error().to_string(),
-                                what_to_do: "Try again, or use HIDMaestro instead.".to_string(),
+                                what_to_do: "Try again, or use Xbox (ViGEmBus) instead.".to_string(),
                                 detail: None,
                             },
                         );
@@ -13926,31 +12616,6 @@ fn main() -> Result<(), slint::PlatformError> {
         horn_record: Rc::new(RefCell::new(TuningSettings::neutral("horn"))),
         calibration: Rc::new(RefCell::new(None)),
         vjoy_polling: Rc::new(Cell::new(false)),
-        button_actions: Rc::new(RefCell::new(
-            DEFAULT_BUTTON_ACTIONS
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect(),
-        )),
-        pending_action: Rc::new(RefCell::new(None)),
-        long_press_actions: Rc::new(RefCell::new(vec!["Not set".to_string(); 12])),
-        pending_long_action: Rc::new(RefCell::new(None)),
-        selected_button: Rc::new(Cell::new(5)),
-        edit_kind: Rc::new(Cell::new(0)),
-        edit_knob: Rc::new(Cell::new(0)),
-        knob_row: Rc::new(Cell::new(0)),
-        knob_actions: Rc::new(RefCell::new([
-            [
-                "Gear 1".to_string(),
-                "Gear 2".to_string(),
-                "Not set".to_string(),
-            ],
-            [
-                "Not set".to_string(),
-                "Not set".to_string(),
-                "Not set".to_string(),
-            ],
-        ])),
         profiles_cache: Rc::new(RefCell::new(Vec::new())),
         games_cache: Rc::new(RefCell::new(Vec::new())),
         game_dialog_edit_id: Rc::new(RefCell::new(None)),
@@ -14165,17 +12830,8 @@ fn main() -> Result<(), slint::PlatformError> {
     // starts hidden (no job runs yet).
     ctx.sync_daemon_error(&win);
     ctx.sync_busy(&win);
-    win.set_gear("—".into());
     win.set_notif_open(false);
     win.set_diag_open(false);
-    win.set_selected_index(5);
-    win.set_selected_action("Gear 3".into());
-    win.set_button_actions(ModelRc::new(Rc::new(VecModel::from(
-        DEFAULT_BUTTON_ACTIONS
-            .iter()
-            .map(|s| SharedString::from(*s))
-            .collect::<Vec<SharedString>>(),
-    ))));
     // A10: Start with Windows seeds from the API at startup.
     win.set_autostart_enabled(api.autostart());
     // FC2: keep-in-tray seeds from the API too (the close handler
@@ -14295,90 +12951,7 @@ mod tests {
         assert_eq!(t.exponent, 1.0);
     }
 
-    /// FH4 wheel check (v2.0.14): the Drivers-step / Diagnostics
-    /// summary names mapping + envelope + feeder in plain words,
-    /// and the daemon's next step passes through verbatim. The
-    /// wording is universal wheel setup, never one game — and the
-    /// all-OK next step frames the check as setup-complete, never
-    /// a promise about a game.
-    #[test]
-    fn wheel_check_summary_states() {
-        let ok = rsh_api::WheelCheck {
-            vjoy_mapping_ok: true,
-            hid_mapping_ok: true,
-            envelope_ok: true,
-            button_count: 128,
-            ffb_present: true,
-            feeding: true,
-            next_step: String::new(),
-        };
-        let (all_ok, line, next) = Ctx::wheel_check_summary(&ok);
-        assert!(all_ok);
-        assert_eq!(line, "Wheel setup: mapping OK · envelope OK · feed active");
-        assert_eq!(next, "Wheel setup complete — test it in your game.");
 
-        let mut missing_mapping = ok.clone();
-        missing_mapping.vjoy_mapping_ok = false;
-        // The daemon names the missing piece; it passes through
-        // verbatim, never paraphrased.
-        missing_mapping.next_step = "mapping incomplete — Labels missing".to_string();
-        let (all_ok, line, next) = Ctx::wheel_check_summary(&missing_mapping);
-        assert!(!all_ok);
-        assert_eq!(
-            line,
-            "Wheel setup: mapping incomplete · envelope OK · feed active"
-        );
-        assert_eq!(next, "mapping incomplete — Labels missing");
-
-        let mut wrong_envelope = ok.clone();
-        wrong_envelope.envelope_ok = false;
-        wrong_envelope.button_count = 32;
-        // No next step from the daemon: the installer repair path
-        // is the fallback, never a blank.
-        let (all_ok, line, next) = Ctx::wheel_check_summary(&wrong_envelope);
-        assert!(!all_ok);
-        assert_eq!(
-            line,
-            "Wheel setup: mapping OK · envelope wrong · feed active"
-        );
-        assert_eq!(next, "Re-run the RSH installer to repair the wheel setup.");
-
-        // HID mapping alone missing still reads "mapping incomplete".
-        let mut hid_missing = ok.clone();
-        hid_missing.hid_mapping_ok = false;
-        let (all_ok, line, _) = Ctx::wheel_check_summary(&hid_missing);
-        assert!(!all_ok);
-        assert_eq!(
-            line,
-            "Wheel setup: mapping incomplete · envelope OK · feed active"
-        );
-
-        // Feeder down, mapping + envelope fine: the headline says
-        // so, and the daemon's next step passes through verbatim.
-        let mut not_feeding = ok.clone();
-        not_feeding.feeding = false;
-        not_feeding.next_step = "Feeder stopped — restart the RSH backend.".to_string();
-        let (all_ok, line, next) = Ctx::wheel_check_summary(&not_feeding);
-        assert!(!all_ok);
-        assert_eq!(line, "Wheel setup: mapping OK · envelope OK · not feeding");
-        assert_eq!(next, "Feeder stopped — restart the RSH backend.");
-
-        // Feeder down with no next step: a restart is the repair,
-        // not the installer (it cannot start a stopped feeder).
-        let mut not_feeding_quiet = ok.clone();
-        not_feeding_quiet.feeding = false;
-        let (all_ok, line, next) = Ctx::wheel_check_summary(&not_feeding_quiet);
-        assert!(!all_ok);
-        assert_eq!(line, "Wheel setup: mapping OK · envelope OK · not feeding");
-        assert_eq!(next, "Restart RSH to start feeding the wheel.");
-
-        // FFB is not a blocking item: no FFB still reads all OK.
-        let mut no_ffb = ok.clone();
-        no_ffb.ffb_present = false;
-        let (all_ok, line, _) = Ctx::wheel_check_summary(&no_ffb);
-        assert!(all_ok);
-        assert_eq!(line, "Wheel setup: mapping OK · envelope OK · feed active");
-    }
 
     #[test]
     fn preset_round_trips_through_settings() {
@@ -14535,33 +13108,7 @@ mod tests {
         assert_eq!(game_code("Dirt Rally 2.0"), "DR");
     }
 
-    #[test]
-    fn action_names_round_trip_through_ids() {
-        // H-3: the Buttons screen's display names map to backend ids
-        // and back — "Not set" clears, unknown ids read as "Not set".
-        assert_eq!(action_id("Shift up"), Some("shifter_up"));
-        assert_eq!(action_id("Gear 3"), Some("gear_3"));
-        assert_eq!(action_id("Not set"), None);
-        assert_eq!(action_display("shifter_up"), "Shift up");
-        assert_eq!(action_display("gear_3"), "Gear 3");
-        assert_eq!(action_display("profile_next"), "Next profile");
-        assert_eq!(action_display("bogus"), "Not set");
-        for display in [
-            "Shift up",
-            "Shift down",
-            "Horn",
-            "Gear 1",
-            "Gear 2",
-            "Gear 3",
-            "Gear 4",
-            "Gear 5",
-            "Gear 6",
-            "Handbrake",
-        ] {
-            let id = action_id(display).expect("a chip maps to an id");
-            assert_eq!(action_display(id), display);
-        }
-    }
+
 
     #[test]
     fn pretty_game_slug_reads_as_name() {
@@ -14648,23 +13195,9 @@ mod tests {
         assert!(!user_text("Daemon x daemon y").contains("aemon"));
     }
 
-    #[test]
-    fn g29_pedal_layout_normalizes_to_known_values() {
-        assert_eq!(normalize_g29_pedal_layout("hidmaestro"), "hidmaestro");
-        assert_eq!(normalize_g29_pedal_layout("pcgamingwiki"), "pcgamingwiki");
-        assert_eq!(normalize_g29_pedal_layout(""), "hidmaestro");
-        assert_eq!(normalize_g29_pedal_layout("PCGamingWiki"), "hidmaestro");
-    }
 
-    #[test]
-    fn g29_handbrake_button_clamps_to_1_to_25() {
-        assert_eq!(clamp_g29_handbrake_button(8), 8);
-        assert_eq!(clamp_g29_handbrake_button(1), 1);
-        assert_eq!(clamp_g29_handbrake_button(25), 25);
-        assert_eq!(clamp_g29_handbrake_button(0), 1);
-        assert_eq!(clamp_g29_handbrake_button(-3), 1);
-        assert_eq!(clamp_g29_handbrake_button(26), 25);
-    }
+
+
 
     #[test]
     fn mv_text_dash_for_no_reading() {
@@ -15310,31 +13843,6 @@ mod tests {
             horn_record: Rc::new(RefCell::new(TuningSettings::neutral("horn"))),
             calibration: Rc::new(RefCell::new(None)),
             vjoy_polling: Rc::new(Cell::new(false)),
-            button_actions: Rc::new(RefCell::new(
-                DEFAULT_BUTTON_ACTIONS
-                    .iter()
-                    .map(|s| (*s).to_string())
-                    .collect(),
-            )),
-            pending_action: Rc::new(RefCell::new(None)),
-            long_press_actions: Rc::new(RefCell::new(vec!["Not set".to_string(); 12])),
-            pending_long_action: Rc::new(RefCell::new(None)),
-            selected_button: Rc::new(Cell::new(5)),
-            edit_kind: Rc::new(Cell::new(0)),
-            edit_knob: Rc::new(Cell::new(0)),
-            knob_row: Rc::new(Cell::new(0)),
-            knob_actions: Rc::new(RefCell::new([
-                [
-                    "Gear 1".to_string(),
-                    "Gear 2".to_string(),
-                    "Not set".to_string(),
-                ],
-                [
-                    "Not set".to_string(),
-                    "Not set".to_string(),
-                    "Not set".to_string(),
-                ],
-            ])),
             profiles_cache: Rc::new(RefCell::new(Vec::new())),
             games_cache: Rc::new(RefCell::new(Vec::new())),
             game_dialog_edit_id: Rc::new(RefCell::new(None)),
@@ -16117,10 +14625,6 @@ mod tests {
         let seed_with = |connect: Result<ConnectionInfo, UserError>| crate::ipc_api::LiveSeed {
             backend: "vJoy".to_string(),
             autostart: true,
-            steam_fh4_mode: false,
-            g29_spoof_mode: false,
-            g29_pedal_layout: "hidmaestro".to_string(),
-            g29_handbrake_button: 8,
             connect,
             wifi: WifiStatus {
                 ssid: None,
@@ -16239,10 +14743,6 @@ mod tests {
         let seed_with = |connect: Result<ConnectionInfo, UserError>| crate::ipc_api::LiveSeed {
             backend: "vJoy".to_string(),
             autostart: true,
-            steam_fh4_mode: false,
-            g29_spoof_mode: false,
-            g29_pedal_layout: "hidmaestro".to_string(),
-            g29_handbrake_button: 8,
             connect,
             wifi: WifiStatus {
                 ssid: None,
@@ -16989,8 +15489,8 @@ mod tests {
     // Bug 4/8: a failed backend-switch job reverts the Settings
     // radio to the backend that is actually live and toasts an
     // error — never a "Game controller is now …" success. A job
-    // that reports success for the WRONG backend (live vJoy after a
-    // HIDMaestro request — the old silent fallback) is the same
+    // that reports success for the WRONG backend (live vJoy after an
+    // Xbox request — the old silent fallback) is the same
     // failure, not a success toast. A genuine success (live backend
     // == requested) still toasts success.
     #[test]
@@ -17002,22 +15502,22 @@ mod tests {
         let (ctx, dir) = fc2_test_ctx();
         wire_callbacks(&win, &ctx);
         // SimApi reports vJoy live; the click flipped the segment
-        // to HIDMaestro.
+        // to Xbox.
         assert_eq!(ctx.api().output_backend(), "vJoy");
-        win.set_controller(0);
+        win.set_controller(1);
 
-        // 1. The switch errors (sidecar/UAC failure): radio back
+        // 1. The switch errors (driver failure): radio back
         // on vJoy, error toast with the real reason, no success.
         let started = ctx.run_job(&win, JobKind::Backend, "Switching controller…", || {
             JobDone::Backend {
-                index: 0,
+                index: 1,
                 result: Err(UserError {
                     code: "Unknown".to_string(),
                     title: "Something went wrong".to_string(),
                     what_happened: "Something went wrong.".to_string(),
                     what_to_do: "Try again.".to_string(),
                     detail: Some(
-                        "could not switch output backend to HIDMaestro: HIDMaestro sidecar failed to start."
+                        "could not switch output backend to Xbox: ViGEmBus driver is not installed."
                             .to_string(),
                     ),
                 }),
@@ -17027,14 +15527,14 @@ mod tests {
         drain_all_jobs(&ctx, &win);
         assert_eq!(
             win.get_controller(),
-            1,
+            0,
             "radio reverts to the live backend (vJoy)"
         );
         assert_eq!(win.get_status_kind().as_str(), "error");
         assert!(
             win.get_status_text()
                 .as_str()
-                .contains("sidecar failed to start"),
+                .contains("ViGEmBus driver is not installed"),
             "toast shows the real reason, got: {}",
             win.get_status_text()
         );
@@ -17045,12 +15545,12 @@ mod tests {
         );
 
         // 2. The job "succeeds" for the WRONG backend (live vJoy
-        // after a HIDMaestro request — the old silent fallback):
+        // after an Xbox request — the old silent fallback):
         // the same failure, not a success toast.
-        win.set_controller(0);
+        win.set_controller(1);
         let started = ctx.run_job(&win, JobKind::Backend, "Switching controller…", || {
             JobDone::Backend {
-                index: 0,
+                index: 1,
                 result: Ok("vJoy".to_string()),
             }
         });
@@ -17058,7 +15558,7 @@ mod tests {
         drain_all_jobs(&ctx, &win);
         assert_eq!(
             win.get_controller(),
-            1,
+            0,
             "radio reverts to the live backend (vJoy) on a mismatch"
         );
         assert_eq!(win.get_status_kind().as_str(), "error");
@@ -17077,21 +15577,21 @@ mod tests {
 
         // 3. A genuine success (live backend == requested) still
         // toasts success and keeps the segment.
-        win.set_controller(0);
+        win.set_controller(1);
         let started = ctx.run_job(&win, JobKind::Backend, "Switching controller…", || {
             JobDone::Backend {
-                index: 0,
-                result: Ok("HIDMaestro".to_string()),
+                index: 1,
+                result: Ok("Xbox".to_string()),
             }
         });
         assert!(started, "third backend job should start");
         drain_all_jobs(&ctx, &win);
-        assert_eq!(win.get_controller(), 0, "segment keeps HIDMaestro");
+        assert_eq!(win.get_controller(), 1, "segment keeps Xbox");
         assert_eq!(win.get_status_kind().as_str(), "success");
         assert!(
             win.get_status_text()
                 .as_str()
-                .contains("Game controller is now HIDMaestro"),
+                .contains("Game controller is now Xbox"),
             "genuine success still toasts, got: {}",
             win.get_status_text()
         );
@@ -17115,17 +15615,17 @@ mod tests {
         assert_eq!(win.get_backend_cooldown_secs(), 0);
 
         // 1. A switch failure arms the cooldown at 30 s.
-        win.set_controller(0);
+        win.set_controller(1);
         let started = ctx.run_job(&win, JobKind::Backend, "Switching controller…", || {
             JobDone::Backend {
-                index: 0,
+                index: 1,
                 result: Err(UserError {
                     code: "Unknown".to_string(),
                     title: "Something went wrong".to_string(),
                     what_happened: "Something went wrong.".to_string(),
                     what_to_do: "Try again.".to_string(),
                     detail: Some(
-                        "could not switch output backend to HIDMaestro: HIDMaestro sidecar failed to start."
+                        "could not switch output backend to Xbox: ViGEmBus driver is not installed."
                             .to_string(),
                     ),
                 }),
@@ -17135,7 +15635,7 @@ mod tests {
         drain_all_jobs(&ctx, &win);
         assert_eq!(
             win.get_controller(),
-            1,
+            0,
             "radio reverts to the live backend (vJoy)"
         );
         assert_eq!(
@@ -17146,7 +15646,7 @@ mod tests {
 
         // 2. While it runs, a new switch is refused (no job starts)
         // and the refusal does not re-arm the countdown.
-        ctx.start_backend_job(&win, 0);
+        ctx.start_backend_job(&win, 1);
         assert_eq!(
             win.get_busy_kind(),
             -1,
@@ -17185,7 +15685,7 @@ mod tests {
         let started = ctx.run_job(&win, JobKind::Backend, "Switching controller…", || {
             JobDone::Backend {
                 index: 1,
-                result: Ok("vJoy".to_string()),
+                result: Ok("Xbox".to_string()),
             }
         });
         assert!(started, "backend job should start");
@@ -17198,12 +15698,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // HID-4 (v2.0.12): a vJoy-requested switch failure must NOT arm
-    // the 30 s selector cooldown — the daemon storm guard counts
-    // HIDMaestro attempts only, so a failed vJoy switch (e.g. vJoy
-    // not installed) must not lock the user out of HIDMaestro.
+    // v2.0.19: ANY backend-switch failure arms the 30 s selector
+    // cooldown — the old HIDMaestro-only storm guard (HID-4,
+    // v2.0.12) is gone with that backend, so a failed vJoy switch
+    // (e.g. vJoy not installed) arms it too.
     #[test]
-    fn backend_job_vjoy_failure_does_not_arm_cooldown() {
+    fn backend_job_any_failure_arms_cooldown() {
         let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
             eprintln!("backend cooldown test skipped: no usable display/backend");
             return;
@@ -17214,11 +15714,11 @@ mod tests {
         assert_eq!(win.get_backend_cooldown_secs(), 0);
 
         // A vJoy switch failure: the error toasts, the radio stays
-        // on the live backend (vJoy), and no cooldown arms.
-        win.set_controller(1);
+        // on the live backend (vJoy), and the cooldown arms.
+        win.set_controller(0);
         let started = ctx.run_job(&win, JobKind::Backend, "Switching controller…", || {
             JobDone::Backend {
-                index: 1,
+                index: 0,
                 result: Err(UserError {
                     code: "Unknown".to_string(),
                     title: "Something went wrong".to_string(),
@@ -17232,21 +15732,21 @@ mod tests {
         drain_all_jobs(&ctx, &win);
         assert_eq!(
             win.get_controller(),
-            1,
+            0,
             "radio stays on the live backend (vJoy)"
         );
         assert_eq!(
             win.get_backend_cooldown_secs(),
-            0,
-            "a vJoy failure must not arm the cooldown"
+            30,
+            "a vJoy failure arms the cooldown too"
         );
-        // And a HIDMaestro-requested failure still arms (the
-        // mismatch arm counts too: Ok(vJoy) for a HIDMaestro
-        // request is a failure of the HIDMaestro switch).
-        win.set_controller(0);
+        // And an Xbox-requested failure arms it as well (the
+        // mismatch arm counts too: Ok(vJoy) for an Xbox
+        // request is a failure of the Xbox switch).
+        win.set_controller(1);
         let started = ctx.run_job(&win, JobKind::Backend, "Switching controller…", || {
             JobDone::Backend {
-                index: 0,
+                index: 1,
                 result: Ok("vJoy".to_string()),
             }
         });
@@ -17255,7 +15755,7 @@ mod tests {
         assert_eq!(
             win.get_backend_cooldown_secs(),
             30,
-            "a HIDMaestro-requested failure must still arm the cooldown"
+            "an Xbox-requested failure must still arm the cooldown"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -17319,8 +15819,9 @@ mod tests {
         };
         // A stale backend job stands in for the timed-out switch:
         // the 420 s Backend bound makes a 421 s old entry due.
+        // The UI asked for Xbox (1); the daemon is still on vJoy.
         let stale_backend_job = || {
-            ctx.backend_job_requested.set(Some(0));
+            ctx.backend_job_requested.set(Some(1));
             ctx.busy_jobs.borrow_mut().insert(
                 JobKind::Backend,
                 (
@@ -17334,7 +15835,7 @@ mod tests {
         };
 
         // Leg 1: the daemon is still on vJoy, the UI asked for
-        // HIDMaestro — the timeout stays silent (the re-query
+        // Xbox — the timeout stays silent (the re-query
         // reports), no cooldown arms, and the verdict is "still
         // running", not a failure. The LIVE query proves the
         // backend — `output_backend()` reads the async-filled
@@ -17378,16 +15879,16 @@ mod tests {
         );
         assert_eq!(
             win.get_controller(),
-            1,
+            0,
             "the segment re-syncs to the live backend (vJoy)"
         );
 
-        // Leg 2: the daemon HAS switched to HIDMaestro by the time
+        // Leg 2: the daemon HAS switched to Xbox by the time
         // the re-query runs — the timeout reports the success, not
         // the timeout.
         assert_eq!(
-            live_api.set_output_backend("HIDMaestro").expect("switch"),
-            "HIDMaestro"
+            live_api.set_output_backend("Xbox").expect("switch"),
+            "Xbox"
         );
         stale_backend_job();
         let before = unread();
@@ -17398,8 +15899,8 @@ mod tests {
         assert_eq!(last_title(), "Controller switched");
         assert_eq!(
             win.get_controller(),
-            0,
-            "the segment shows the switched backend (HIDMaestro)"
+            1,
+            "the segment shows the switched backend (Xbox)"
         );
         assert_eq!(
             win.get_backend_cooldown_secs(),
@@ -17409,7 +15910,7 @@ mod tests {
 
         // Leg 3 (HID P3-5, v2.0.13): the switch lands MID-POLL —
         // the daemon is still on vJoy when the re-query starts
-        // and flips to HIDMaestro 1.2 s in. A single sample would
+        // and flips to Xbox 1.2 s in. A single sample would
         // have read vJoy and reported "still running"; the polling
         // re-query must report the success. The 1.2 s delay sits
         // between the first sample (~0 s) and the last (~4 s) with
@@ -17422,7 +15923,7 @@ mod tests {
         let switcher = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(1200));
             switcher_api
-                .set_output_backend("HIDMaestro")
+                .set_output_backend("Xbox")
                 .expect("mid-poll switch");
         });
         stale_backend_job();
@@ -17444,8 +15945,8 @@ mod tests {
         );
         assert_eq!(
             win.get_controller(),
-            0,
-            "the segment shows the switched backend (HIDMaestro)"
+            1,
+            "the segment shows the switched backend (Xbox)"
         );
         assert_eq!(
             win.get_backend_cooldown_secs(),
@@ -17517,10 +16018,6 @@ mod tests {
         let seed_with = |connect: Result<ConnectionInfo, UserError>| crate::ipc_api::LiveSeed {
             backend: "vJoy".to_string(),
             autostart: true,
-            steam_fh4_mode: false,
-            g29_spoof_mode: false,
-            g29_pedal_layout: "hidmaestro".to_string(),
-            g29_handbrake_button: 8,
             connect,
             wifi: WifiStatus {
                 ssid: None,
@@ -17775,6 +16272,8 @@ mod tests {
     /// and tells the user it failed while the daemon keeps working
     /// (the v2.0.17 G29-toggle shape). Pinned against the real
     /// `timeout_for_method` table, not a copy of the numbers.
+    /// (v2.0.19: the G29-spoof assertion is gone with that toggle —
+    /// the remaining 420 s override is send-to-game, pinned below.)
     #[test]
     fn job_timeouts_exceed_ipc_bounds() {
         use rsh_ipc::timeout_for_method;
@@ -17809,10 +16308,6 @@ mod tests {
         );
         // Per-call overrides (SettingsOp kind bound is only 10 s).
         assert!(
-            LONG_JOB_TIMEOUT_SPOOF > timeout_for_method("set_g29_spoof_mode"),
-            "G29 spoof job must outlast the set_g29_spoof_mode IPC bound"
-        );
-        assert!(
             LONG_JOB_TIMEOUT_SEND > timeout_for_method("set_output_enabled"),
             "send-to-game job must outlast the set_output_enabled IPC bound"
         );
@@ -17843,9 +16338,10 @@ mod tests {
 
     /// v2.0.18: the stored timeout — not the kind default — is
     /// what `check_job_timeouts` enforces. A `SettingsOp` entry
-    /// carrying the 420 s G29 override and aged 60 s must still
-    /// be busy (the old code compared against the 10 s kind bound
-    /// and timed it out); the same entry aged 421 s must time out.
+    /// carrying a 420 s override (send-to-game) and aged 60 s must
+    /// still be busy (the old code compared against the 10 s kind
+    /// bound and timed it out); the same entry aged 421 s must
+    /// time out.
     #[test]
     fn job_timeout_override_is_enforced_not_the_kind_default() {
         let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
@@ -17862,7 +16358,7 @@ mod tests {
                 Instant::now()
                     .checked_sub(Duration::from_secs(60))
                     .expect("60 s ago exists"),
-                LONG_JOB_TIMEOUT_SPOOF,
+                LONG_JOB_TIMEOUT_SEND,
             ),
         );
         ctx.check_job_timeouts(&win);
@@ -17878,7 +16374,7 @@ mod tests {
                 Instant::now()
                     .checked_sub(Duration::from_secs(421))
                     .expect("421 s ago exists"),
-                LONG_JOB_TIMEOUT_SPOOF,
+                LONG_JOB_TIMEOUT_SEND,
             ),
         );
         ctx.check_job_timeouts(&win);
@@ -17926,7 +16422,7 @@ mod tests {
 
     /// v2.0.18 (P1-6 generalised): the busy strip shows the
     /// elapsed clock for any job, not just the Backend switch —
-    /// a 420 s G29 toggle must read as still working, not a bare
+    /// a 420 s backend switch must read as still working, not a bare
     /// spinner. The Backend stage label stays Backend-only.
     #[test]
     fn busy_elapsed_shows_for_any_job() {
@@ -17942,7 +16438,7 @@ mod tests {
                 Instant::now()
                     .checked_sub(Duration::from_secs(65))
                     .expect("65 s ago exists"),
-                LONG_JOB_TIMEOUT_SPOOF,
+                LONG_JOB_TIMEOUT_SEND,
             ),
         );
         ctx.sync_busy(&win);

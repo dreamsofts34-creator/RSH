@@ -107,22 +107,6 @@ struct LiveCache {
     autostart: Mutex<Option<bool>>,
     /// Last output backend name (also the `output_backend()` slot).
     backend: Mutex<Option<String>>,
-    /// Last Steam FH4 wheel mode flag (A2): the daemon's
-    /// `steam_fh4_mode`, default OFF. Refreshed by the slow
-    /// poller like `autostart` above.
-    steam_fh4_mode: Mutex<Option<bool>>,
-    /// Last G29 spoof mode flag: the daemon's `g29_spoof_mode`,
-    /// default OFF. Refreshed by the slow poller like
-    /// `steam_fh4_mode` above.
-    g29_spoof_mode: Mutex<Option<bool>>,
-    /// Last G29 pedal layout: the daemon's `g29_pedal_layout`
-    /// ("hidmaestro" default, "pcgamingwiki" alternate).
-    /// Refreshed by the slow poller like `g29_spoof_mode` above.
-    g29_pedal_layout: Mutex<Option<String>>,
-    /// Last G29 handbrake button: the daemon's
-    /// `g29_handbrake_button` (1–25, default 8). Refreshed by
-    /// the slow poller like `g29_spoof_mode` above.
-    g29_handbrake_button: Mutex<Option<u32>>,
     /// Module on/off by index: 0 handbrake, 1 shifter, 2 horn, 3 led
     /// (the same order [`module_index`] and the UI's `module_states`
     /// use).
@@ -176,10 +160,6 @@ impl Default for LiveCache {
             close_to_tray: Mutex::new(None),
             autostart: Mutex::new(None),
             backend: Mutex::new(None),
-            steam_fh4_mode: Mutex::new(None),
-            g29_spoof_mode: Mutex::new(None),
-            g29_pedal_layout: Mutex::new(None),
-            g29_handbrake_button: Mutex::new(None),
             modules: Mutex::new([None; 4]),
             tunings: Mutex::new(HashMap::new()),
             draft: Mutex::new(None),
@@ -409,14 +389,6 @@ pub struct LiveSeed {
     pub backend: String,
     /// Start-with-Windows flag.
     pub autostart: bool,
-    /// Steam FH4 wheel mode flag (A2).
-    pub steam_fh4_mode: bool,
-    /// G29 spoof mode flag.
-    pub g29_spoof_mode: bool,
-    /// G29 pedal layout ("hidmaestro" default).
-    pub g29_pedal_layout: String,
-    /// G29 handbrake button (1–25, default 8).
-    pub g29_handbrake_button: u32,
     /// The session `connect` verdict (the wizard's Connect step
     /// follows it; a failure notifies instead of blocking).
     pub connect: Result<ConnectionInfo, UserError>,
@@ -437,10 +409,6 @@ impl LiveSeed {
         Self {
             backend: api.output_backend(),
             autostart: api.autostart(),
-            steam_fh4_mode: api.steam_fh4_mode(),
-            g29_spoof_mode: api.g29_spoof_mode(),
-            g29_pedal_layout: api.g29_pedal_layout(),
-            g29_handbrake_button: api.g29_handbrake_button(),
             connect,
             wifi: api.wifi_status(),
         }
@@ -777,18 +745,6 @@ impl IpcApi {
         if let Ok(mut slot) = self.cache.backend.lock() {
             *slot = None;
         }
-        if let Ok(mut slot) = self.cache.steam_fh4_mode.lock() {
-            *slot = None;
-        }
-        if let Ok(mut slot) = self.cache.g29_spoof_mode.lock() {
-            *slot = None;
-        }
-        if let Ok(mut slot) = self.cache.g29_pedal_layout.lock() {
-            *slot = None;
-        }
-        if let Ok(mut slot) = self.cache.g29_handbrake_button.lock() {
-            *slot = None;
-        }
         if let Ok(mut slot) = self.cache.modules.lock() {
             *slot = [None; 4];
         }
@@ -1039,9 +995,9 @@ impl IpcApi {
     /// {reason}"`. The reason is the text after the LAST marker,
     /// split from its code at the first `": "` (the reason itself
     /// may contain `": "`). A `not_admin` code rebuilds the typed
-    /// UAC-decline error (same words as the daemon's — see
-    /// `daemon_api.rs` / `AppStateCore::HID_NOT_ADMIN`, the source
-    /// of truth); any other code keeps the daemon's reason as the
+    /// UAC-decline error (same words as the daemon's `not_admin`
+    /// decline, the source of truth); any other code keeps the
+    /// daemon's reason as the
     /// detail, so the toast names the sidecar/driver failure instead
     /// of a generic link failure. A payload without a reason (fake
     /// daemon, empty message) or a non-`Api` error (dead link,
@@ -1061,20 +1017,21 @@ impl IpcApi {
             None => (tail.trim(), ""),
         };
         if code == "not_admin" {
-            // The daemon's typed decline: `HIDMaestro needs
+            // The daemon's typed decline: `<backend> needs
             // administrator rights — approve the UAC prompt to
             // switch to it, or run RSH as administrator. vJoy needs
-            // no prompt.` (kept in sync with `HID_NOT_ADMIN`).
+            // no prompt.` (kept in sync with the daemon's
+            // `not_admin` decline).
             return UserError {
                 code: "not_admin".to_string(),
                 title: "Admin permission needed".to_string(),
                 what_happened: if reason.is_empty() {
-                    "HIDMaestro needs administrator rights to switch to it."
+                    "The game controller backend needs administrator rights to switch to it."
                         .to_string()
                 } else {
                     reason.to_string()
                 },
-                what_to_do: "Approve the Windows prompt when switching to HIDMaestro, or keep using vJoy (no permission needed)."
+                what_to_do: "Approve the Windows prompt when switching the game controller, or keep using vJoy (no permission needed)."
                     .to_string(),
                 detail: None,
             };
@@ -1204,65 +1161,6 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
                 }
             }
         }
-        // A2: `steam_fh4_mode` is not part of `SlowPollState`
-        // (that struct lives in `rsh-api`, owned by the backend
-        // team) — read it directly, best-effort, one extra
-        // round-trip per cycle. An old daemon without the method
-        // just keeps the last value (OFF while cold).
-        if let Ok(value) = client.call("steam_fh4_mode", serde_json::json!({})).await {
-            if let Some(enabled) = value
-                .get("steam_fh4_mode")
-                .and_then(serde_json::Value::as_bool)
-            {
-                if let Ok(mut slot) = cache.steam_fh4_mode.lock() {
-                    *slot = Some(enabled);
-                }
-            }
-        }
-        // G29 spoof mode: same shape as `steam_fh4_mode` above —
-        // not part of `SlowPollState`, read directly, best-effort.
-        // An old daemon without the method just keeps the last
-        // value (OFF while cold).
-        if let Ok(value) = client.call("g29_spoof_mode", serde_json::json!({})).await {
-            if let Some(enabled) = value
-                .get("g29_spoof_mode")
-                .and_then(serde_json::Value::as_bool)
-            {
-                if let Ok(mut slot) = cache.g29_spoof_mode.lock() {
-                    *slot = Some(enabled);
-                }
-            }
-        }
-        // G29 pedal layout: same shape as `g29_spoof_mode` above.
-        // An old daemon without the method just keeps the last
-        // value ("hidmaestro" while cold).
-        if let Ok(value) = client.call("g29_pedal_layout", serde_json::json!({})).await {
-            if let Some(layout) = value
-                .get("g29_pedal_layout")
-                .and_then(serde_json::Value::as_str)
-            {
-                if let Ok(mut slot) = cache.g29_pedal_layout.lock() {
-                    *slot = Some(layout.to_string());
-                }
-            }
-        }
-        // G29 handbrake button: same shape as `g29_spoof_mode`
-        // above. An old daemon without the method just keeps the
-        // last value (8 while cold).
-        if let Ok(value) = client
-            .call("g29_handbrake_button", serde_json::json!({}))
-            .await
-        {
-            if let Some(button) = value
-                .get("g29_handbrake_button")
-                .and_then(serde_json::Value::as_i64)
-                .and_then(|n| u32::try_from(n).ok())
-            {
-                if let Ok(mut slot) = cache.g29_handbrake_button.lock() {
-                    *slot = Some(button);
-                }
-            }
-        }
         cache.slow_filled.store(true, Ordering::Relaxed);
         bump_generation_if_changed(cache, epoch);
         return;
@@ -1359,22 +1257,6 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
     });
     fetch!("close_to_tray", close_to_tray, |v| {
         v.get("close_to_tray").and_then(serde_json::Value::as_bool)
-    });
-    fetch!("steam_fh4_mode", steam_fh4_mode, |v| {
-        v.get("steam_fh4_mode").and_then(serde_json::Value::as_bool)
-    });
-    fetch!("g29_spoof_mode", g29_spoof_mode, |v| {
-        v.get("g29_spoof_mode").and_then(serde_json::Value::as_bool)
-    });
-    fetch!("g29_pedal_layout", g29_pedal_layout, |v| {
-        v.get("g29_pedal_layout")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-    });
-    fetch!("g29_handbrake_button", g29_handbrake_button, |v| {
-        v.get("g29_handbrake_button")
-            .and_then(serde_json::Value::as_i64)
-            .and_then(|n| u32::try_from(n).ok())
     });
     // `list_bindings` / `knob_actions` nest their payloads under a
     // key, like their trait methods already parse them.
@@ -1519,10 +1401,6 @@ fn slow_content_hash(cache: &LiveCache) -> u64 {
     slot!(vjoy_status);
     slot!(auto_pause);
     slot!(close_to_tray);
-    slot!(steam_fh4_mode);
-    slot!(g29_spoof_mode);
-    slot!(g29_pedal_layout);
-    slot!(g29_handbrake_button);
     slot!(bindings);
     slot!(knobs);
     slot!(modules);
@@ -1964,209 +1842,6 @@ impl AppApi for IpcApi {
         }
     }
 
-    /// Cached Steam FH4 wheel mode (A2): the slow poller refreshes
-    /// it ~1 Hz (direct `steam_fh4_mode` call in `refresh_slow` —
-    /// it is not part of `SlowPollState`), so this never touches
-    /// the socket. No cache yet means OFF (the plan's default,
-    /// and the pre-poller fallback).
-    fn steam_fh4_mode(&self) -> bool {
-        self.cache
-            .steam_fh4_mode
-            .lock()
-            .ok()
-            .and_then(|slot| *slot)
-            .unwrap_or(false)
-    }
-
-    /// Set Steam FH4 wheel mode (A2): the `set_steam_fh4_mode`
-    /// IPC call, following the `set_close_to_tray` client pattern
-    /// — same `{"enabled": bool}` params, same
-    /// `{"steam_fh4_mode": bool}` reply, same cache update on
-    /// success. Failures keep the daemon's typed reason via
-    /// [`Self::api_error`] (`detailed_api_error` `code|reason`,
-    /// e.g. `steam_fh4_vjoy_only` on `HIDMaestro`) instead of
-    /// collapsing to the generic link failure (the
-    /// `set_autostart` shape).
-    fn set_steam_fh4_mode(&self, enabled: bool) -> Result<bool, UserError> {
-        let got: Result<bool, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async(
-                    "set_steam_fh4_mode",
-                    serde_json::json!({"enabled": enabled}),
-                )
-                .await?;
-            value
-                .get("steam_fh4_mode")
-                .and_then(serde_json::Value::as_bool)
-                .ok_or_else(|| {
-                    IpcError::Protocol("set_steam_fh4_mode has no steam_fh4_mode".to_string())
-                })
-        });
-        match got {
-            Ok(stored) => {
-                if let Ok(mut slot) = self.cache.steam_fh4_mode.lock() {
-                    *slot = Some(stored);
-                }
-                Ok(stored)
-            }
-            Err(e) => Err(Self::api_error(&e)),
-        }
-    }
-
-    /// Cached G29 spoof mode: the slow poller refreshes it ~1 Hz
-    /// (direct `g29_spoof_mode` call in `refresh_slow` — it is not
-    /// part of `SlowPollState`), so this never touches the socket.
-    /// No cache yet means OFF (the default, and the pre-poller
-    /// fallback).
-    fn g29_spoof_mode(&self) -> bool {
-        self.cache
-            .g29_spoof_mode
-            .lock()
-            .ok()
-            .and_then(|slot| *slot)
-            .unwrap_or(false)
-    }
-
-    /// Set G29 spoof mode: the `set_g29_spoof_mode` IPC call,
-    /// following the `set_steam_fh4_mode` pattern — same
-    /// `{"enabled": bool}` params, same
-    /// `{"g29_spoof_mode": bool}` reply, same cache update on
-    /// success. Failures keep the daemon's typed reason via
-    /// [`Self::api_error`] (`detailed_api_error` `code|reason`,
-    /// e.g. `g29_spoof_hid_only` on `vJoy`) instead of collapsing
-    /// to the generic link failure.
-    fn set_g29_spoof_mode(&self, enabled: bool) -> Result<bool, UserError> {
-        let got: Result<bool, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async(
-                    "set_g29_spoof_mode",
-                    serde_json::json!({"enabled": enabled}),
-                )
-                .await?;
-            value
-                .get("g29_spoof_mode")
-                .and_then(serde_json::Value::as_bool)
-                .ok_or_else(|| {
-                    IpcError::Protocol("set_g29_spoof_mode has no g29_spoof_mode".to_string())
-                })
-        });
-        match got {
-            Ok(stored) => {
-                if let Ok(mut slot) = self.cache.g29_spoof_mode.lock() {
-                    *slot = Some(stored);
-                }
-                Ok(stored)
-            }
-            Err(e) => Err(Self::api_error(&e)),
-        }
-    }
-
-    /// Cached G29 pedal layout: the slow poller refreshes it ~1 Hz
-    /// (direct `g29_pedal_layout` call in `refresh_slow` — it is
-    /// not part of `SlowPollState`), so this never touches the
-    /// socket. No cache yet means "hidmaestro" (the default, and
-    /// the pre-poller fallback). An unknown stored value normalizes
-    /// to "hidmaestro", so the radios never show neither option.
-    fn g29_pedal_layout(&self) -> String {
-        self.cache
-            .g29_pedal_layout
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
-            .map_or_else(
-                || "hidmaestro".to_string(),
-                |layout| crate::normalize_g29_pedal_layout(&layout).to_string(),
-            )
-    }
-
-    /// Set G29 pedal layout: the `set_g29_pedal_layout` IPC call,
-    /// following the `set_g29_spoof_mode` pattern — same
-    /// `{"layout": string}` params, same
-    /// `{"g29_pedal_layout": string}` reply, same cache update on
-    /// success. Failures keep the daemon's typed reason via
-    /// [`Self::api_error`] instead of collapsing to the generic
-    /// link failure.
-    fn set_g29_pedal_layout(&self, layout: &str) -> Result<String, UserError> {
-        let layout = crate::normalize_g29_pedal_layout(layout).to_string();
-        let got: Result<String, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async(
-                    "set_g29_pedal_layout",
-                    serde_json::json!({"layout": layout}),
-                )
-                .await?;
-            value
-                .get("g29_pedal_layout")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    IpcError::Protocol("set_g29_pedal_layout has no g29_pedal_layout".to_string())
-                })
-        });
-        match got {
-            Ok(stored) => {
-                let stored = crate::normalize_g29_pedal_layout(&stored).to_string();
-                if let Ok(mut slot) = self.cache.g29_pedal_layout.lock() {
-                    *slot = Some(stored.clone());
-                }
-                Ok(stored)
-            }
-            Err(e) => Err(Self::api_error(&e)),
-        }
-    }
-
-    /// Cached G29 handbrake button: the slow poller refreshes it
-    /// ~1 Hz (direct `g29_handbrake_button` call in
-    /// `refresh_slow` — it is not part of `SlowPollState`), so
-    /// this never touches the socket. No cache yet means 8 (the
-    /// default, and the pre-poller fallback).
-    fn g29_handbrake_button(&self) -> u32 {
-        self.cache
-            .g29_handbrake_button
-            .lock()
-            .ok()
-            .and_then(|slot| *slot)
-            .map_or(8, |button| button.clamp(1, 25))
-    }
-
-    /// Set G29 handbrake button: the `set_g29_handbrake_button`
-    /// IPC call, following the `set_g29_spoof_mode` pattern —
-    /// same `{"button": int}` params, same
-    /// `{"g29_handbrake_button": int}` reply, same cache update
-    /// on success. Failures keep the daemon's typed reason via
-    /// [`Self::api_error`] instead of collapsing to the generic
-    /// link failure.
-    fn set_g29_handbrake_button(&self, button: u32) -> Result<u32, UserError> {
-        let button = button.clamp(1, 25);
-        let got: Result<u32, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async(
-                    "set_g29_handbrake_button",
-                    serde_json::json!({"button": button}),
-                )
-                .await?;
-            value
-                .get("g29_handbrake_button")
-                .and_then(serde_json::Value::as_i64)
-                .and_then(|n| u32::try_from(n).ok())
-                .ok_or_else(|| {
-                    IpcError::Protocol(
-                        "set_g29_handbrake_button has no g29_handbrake_button".to_string(),
-                    )
-                })
-        });
-        match got {
-            Ok(stored) => {
-                let stored = stored.clamp(1, 25);
-                if let Ok(mut slot) = self.cache.g29_handbrake_button.lock() {
-                    *slot = Some(stored);
-                }
-                Ok(stored)
-            }
-            Err(e) => Err(Self::api_error(&e)),
-        }
-    }
-
     /// Cached firmware version (F5): the slow poller refreshes it
     /// ~1 Hz, so this never touches the socket. No cache yet means
     /// `"Unknown"` (the pre-poller fallback).
@@ -2207,17 +1882,15 @@ impl AppApi for IpcApi {
                     // margin; P1-1 below supersedes both numbers.
                     //
                     // P1-1 (update4-fix): 390 s. The daemon worst
-                    // case is now bounded per stage in
-                    // `rsh-output-hidmaestro` (accept 30 s + hello
-                    // 30 s + install-driver 120 s + create 120 s +
-                    // first neutral 10 s = 310 s after the UAC
+                    // case is now bounded per stage in the backend
+                    // manager (worst case 310 s after the UAC
                     // prompt is answered), plus a 60 s allowance
                     // for the user to answer the prompt (370 s).
                     // The IPC bound MUST exceed that, or a
                     // slow-but-healthy switch is reported as
                     // failed while the daemon keeps going (and may
                     // still succeed). Invariant (see
-                    // `DEFAULT_SPAWN_TIMEOUT` in the hidmaestro
+                    // `DEFAULT_SPAWN_TIMEOUT` in the backend
                     // manager): job (420 s) > IPC (390 s) > worst
                     // case incl. UAC (370 s) > worst case post-UAC
                     // (310 s). Residual: the UAC dwell itself is
@@ -3616,15 +3289,15 @@ mod tests {
         );
         assert_eq!(client.output_backend(), "vJoy");
         assert_eq!(
-            client.set_output_backend("HIDMaestro").expect("HIDMaestro"),
-            "HIDMaestro"
+            client.set_output_backend("Xbox").expect("Xbox"),
+            "Xbox"
         );
         assert_eq!(
             client.query_output_backend().as_deref(),
-            Some("HIDMaestro"),
+            Some("Xbox"),
             "live query must follow a switch at once"
         );
-        assert_eq!(client.output_backend(), "HIDMaestro");
+        assert_eq!(client.output_backend(), "Xbox");
         // Sim never pretends a backup happened.
         assert!(client.backup_now().is_err());
         // v2.0.1 BACKEND-2 over the same socket: the sim never fakes
@@ -4490,17 +4163,17 @@ mod tests {
         // generic "daemon IPC link failed". The reason itself may
         // contain ": " — only the first split is the code.
         let error = IpcApi::daemon_backend_error(&IpcError::Api(
-            "Unknown: daemon API error: Unknown: could not switch output backend to HIDMaestro: HIDMaestro could not connect: HIDMaestro sidecar failed to start.".to_string(),
+            "Unknown: daemon API error: Unknown: could not switch output backend to Xbox: Xbox could not connect: ViGEmBus driver failed to start.".to_string(),
         ));
         assert_eq!(error.code, "Unknown");
         assert_eq!(
             error.detail.as_deref(),
-            Some("could not switch output backend to HIDMaestro: HIDMaestro could not connect: HIDMaestro sidecar failed to start."),
+            Some("could not switch output backend to Xbox: Xbox could not connect: ViGEmBus driver failed to start."),
             "the full reason survives, colons included"
         );
         // A `not_admin` code rebuilds the typed UAC-decline error.
         let error = IpcApi::daemon_backend_error(&IpcError::Api(
-            "not_admin: daemon API error: not_admin: HIDMaestro needs administrator rights — approve the UAC prompt to switch to it, or run RSH as administrator. vJoy needs no prompt.".to_string(),
+            "not_admin: daemon API error: not_admin: Xbox needs administrator rights — approve the UAC prompt to switch to it, or run RSH as administrator. vJoy needs no prompt.".to_string(),
         ));
         assert_eq!(error.code, "not_admin");
         assert_eq!(error.title, "Admin permission needed");

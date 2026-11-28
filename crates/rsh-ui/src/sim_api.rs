@@ -277,10 +277,12 @@ impl AppApi for SimApi {
     }
 
     fn set_output_backend(&self, name: &str) -> Result<String, UserError> {
-        if !matches!(name, "HIDMaestro" | "vJoy") {
+        // v2.0.19: vJoy (default) / Xbox (ViGEmBus) — the HIDMaestro
+        // backend is gone.
+        if !matches!(name, "vJoy" | "Xbox") {
             return Err(UserError::from_connection(
                 rsh_api::ConnectionError::Unknown,
-                format!("unknown output backend '{name}' (expected HIDMaestro or vJoy)"),
+                format!("unknown output backend '{name}' (expected vJoy or Xbox)"),
             ));
         }
         if let Ok(mut backend) = self.backend.lock() {
