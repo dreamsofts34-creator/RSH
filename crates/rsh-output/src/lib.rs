@@ -3,22 +3,24 @@
 //! The engine only ever talks to the trait, never to a concrete backend,
 //! so it can be tested with a mock backend and no driver installed.
 //!
-//! Backends: `HIDMaestro` (default, interop path decided by the Phase G
-//! spike — G2) and vJoy (fallback, hand-written FFI — G3, see
-//! [`vjoy`]; the DLL is never bundled).
+//! Backends (v2.0.19): vJoy (default, hand-written FFI — see
+//! [`vjoy`]; the DLL is never bundled) and Xbox via ViGEmBus
+//! (fallback for games that do not accept a vJoy wheel — see
+//! [`vigem`]; the ViGEmBus driver is installed separately, the
+//! client DLL ships beside the daemon).
 //!
-//! The backend selector lives in [`selector`] (G4): [`BackendKind`]
-//! (default `HIDMaestro`, fallback vJoy, `None`) +
+//! The backend selector lives in [`selector`]: [`BackendKind`]
+//! (default vJoy, fallback Xbox, `None`) +
 //! [`switch_backend`] (runtime switch without restart, failed connect
-//! rolls back to the previous backend, `HIDMaestro` failure falls back
+//! rolls back to the previous backend, Xbox failure falls back
 //! to vJoy). The shared error type is [`OutputError`] (see
 //! [`error`] for why the trait itself still returns [`VJoyError`]).
 
 pub mod error;
 pub mod selector;
+pub mod vigem;
 pub mod vjoy;
 pub mod vjoy_config;
-pub mod wheel_check;
 
 use rsh_engine::pipeline::{OutputState, PipelinePlan};
 
@@ -26,11 +28,11 @@ pub use error::OutputError;
 pub use selector::{BackendFactories, BackendKind, SwitchOutcome, switch_backend};
 pub use vjoy::{EnvelopeCaps, VJoyError, VJoyOutput, VJoyStateKind, VJoyStatus, validate_envelope};
 pub use vjoy_config::{
-    STEAM_FH4_MARKER_VALUE, VJOY_FH4_DEVICE_ID, VJoyConfigError, WHEEL_FLAG_BYTES,
-    WHEEL_FLAG_OEM_SUBKEY, set_wheel_flag, set_wheel_flag_and_clear_marker,
-    steam_fh4_marker_present, vjoy_config_argv, wheel_flag_script,
+    STALE_OEMDATA_SUBKEY, STALE_OEMDATA_VALUE_NAME, VJOY_DEVICE_ID, VJOY_ENVELOPE_AXES,
+    VJOY_ENVELOPE_BUTTONS, VJOY_ENVELOPE_DISCRETE_POVS, VJOY_ENVELOPE_FFB_EFFECTS,
+    VJoyConfigError, delete_stale_oemdata_hkcu, vjoy_config_argv,
 };
-pub use wheel_check::{WheelCheckResult, mapping_entries, run_wheel_check};
+pub use vigem::{VigemError, VigemOutput};
 
 /// The processed state the engine hands to an output backend.
 ///
@@ -48,7 +50,7 @@ pub type ProcessedState = OutputState;
 /// ticking (same contract as the engine's `OutputSink`).
 pub trait IJoystickOutput: Send {
     /// Backend name for logs and the Output page (`"vJoy"`,
-    /// `"HIDMaestro"`).
+    /// `"Xbox"`).
     fn name(&self) -> &'static str;
 
     /// True after a successful [`try_connect`](IJoystickOutput::try_connect)
@@ -122,56 +124,7 @@ pub trait IJoystickOutput: Send {
 
     /// Clear a latched failure state on an explicit user re-select
     /// (P2, v2.0.11). Default: no-op — backends without a latch keep
-    /// it. `HIDMaestro` overrides it to clear its sidecar manager's
-    /// fallback / UAC-decline latches IN PLACE, so the re-select
-    /// retries with the SAME manager instead of a fresh factory build
-    /// (a fresh build used to defeat the manager's 2-failure latch
-    /// and clear `elevation_declined` on every attempt — the retry
-    /// storm's enabler). Only an explicit re-select calls this;
-    /// ordinary attempts reuse the latched manager and fail fast.
+    /// it. Only an explicit re-select calls this; ordinary attempts
+    /// reuse the latched state and fail fast.
     fn reset_fallback(&mut self) {}
-
-    /// Steam FH4 wheel mode (FH4 fix, v2.0.15): when on, the
-    /// backend dedupes idle updates (100 ms keepalive) and applies
-    /// a 32-count per-axis hysteresis to idle noise, so a wheel
-    /// game no longer sees a constantly-twitching controller. The
-    /// default is a no-op — only vJoy implements it (the feed that
-    /// needs quieting is the vJoy one); `HIDMaestro` ignores it.
-    /// `AppStateCore` pushes the persisted mode into the live
-    /// backend on every connect and on every toggle, so a backend
-    /// that (re)connects picks the current mode up without the
-    /// caller remembering to re-push it.
-    fn set_steam_fh4_mode(&mut self, _enabled: bool) {}
-
-    /// `G29` spoof mode (v2.0.16): when on, the backend presents the
-    /// `HIDMaestro` built-in `logitech-g29` catalog profile (VID
-    /// `0x046D` / PID `0xC24F`) instead of the custom no-brand wheel.
-    /// The default is a no-op — only `HIDMaestro` implements it
-    /// (`vJoy` has no `HIDMaestro` profile to switch; the daemon refuses
-    /// enabling on any other backend with `g29_spoof_hid_only`).
-    /// `HIDMaestro` recreates the controller with the right profile
-    /// when the mode changes while connected; a disconnected backend
-    /// just records the flag for its next connect. See
-    /// `HidMaestroOutput::set_g29_spoof_mode` for the restart
-    /// semantics. RISK: presenting Logitech's VID/PID violates
-    /// USB-IF policy as written (no enforcement found for private
-    /// hobby use); FH4 end-to-end is unproven — do not promise
-    /// auto-recognition.
-    fn set_g29_spoof_mode(&mut self, _enabled: bool) {}
-
-    /// G29 pedal layout (v2.0.17): `"hidmaestro"` (Z = accelerator,
-    /// Rz = brake, Y = clutch) or `"pcgamingwiki"` (Y = accelerator,
-    /// Rz = brake, Z = clutch — Z carries clutch because the G29
-    /// descriptor has no Slider axis). The default is a no-op — only
-    /// `HIDMaestro` implements it. Applied live (consulted on the
-    /// next tick) and at connect/recreate time from the persisted
-    /// `g29_pedal_layout` setting.
-    fn set_g29_pedal_layout(&mut self, _layout: &str) {}
-
-    /// G29 handbrake button (v2.0.17): which G29 button (1–25) the
-    /// handbrake drives (default 8). The default is a no-op — only
-    /// `HIDMaestro` implements it. Applied live (consulted on the
-    /// next tick) and at connect/recreate time from the persisted
-    /// `g29_handbrake_button` setting.
-    fn set_g29_handbrake_button(&mut self, _button: u8) {}
 }
