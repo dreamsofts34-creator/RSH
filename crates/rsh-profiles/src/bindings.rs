@@ -13,17 +13,17 @@
 //!
 //! Actions:
 //! * Game inputs — what the output backend understands: `horn`,
-//!   `shifter_up`, `shifter_down`, `gear_1`…`gear_6`, `handbrake`
-//!   (the same vocabulary as
-//!   `rsh_app_core::commands::ASSIGNABLE_ACTIONS` — the two lists
+//!   `shifter_up`, `shifter_down`, `handbrake` (the same vocabulary
+//!   as `rsh_app_core::commands::ASSIGNABLE_ACTIONS` — the two lists
 //!   must stay in sync).
 //! * App actions — things the daemon does itself on a press edge:
 //!   `profile_next` / `profile_previous` (cycle the active profile).
 //!
-//! Buttons are physical wheel buttons 1–32 or encoder virtual
-//! buttons 65–72 — the same range
+//! Buttons are physical wheel buttons 1–32 — the same range
 //! `rsh_app_core::commands::validate_button_bindings` accepts.
-//! Buttons 33–64 have no binding UI and are rejected.
+//! Buttons 33 and up have no binding UI and are rejected.
+//! (v2.0.19: encoder virtual buttons 65–72 are deleted with the
+//! encoders; H-pattern gears `gear_1`…`gear_6` are deleted too.)
 //!
 //! Load policy: a missing file means no bindings; a corrupt,
 //! oversize, or newer-schema file loads as *empty* with a warning
@@ -60,12 +60,6 @@ pub const GAME_ACTIONS: &[&str] = &[
     "horn",
     "shifter_up",
     "shifter_down",
-    "gear_1",
-    "gear_2",
-    "gear_3",
-    "gear_4",
-    "gear_5",
-    "gear_6",
     "handbrake",
 ];
 
@@ -91,15 +85,16 @@ pub fn is_assignable_action(action: &str) -> bool {
     is_game_action(action) || is_app_action(action)
 }
 
-/// Validate a button number: physical 1–32 or encoder virtual
-/// 65–72. Returns the error message, or [`None`] when valid.
+/// Validate a button number: physical 1–32 only (v2.0.19:
+/// encoder virtual buttons 65–72 are deleted). Returns the error
+/// message, or [`None`] when valid.
 #[must_use]
 pub fn validate_button(button: u8) -> Option<String> {
-    if (1..=32).contains(&button) || (65..=72).contains(&button) {
+    if (1..=32).contains(&button) {
         None
     } else {
         Some(format!(
-            "button {button} cannot be bound (physical buttons are 1-32, encoder virtual buttons 65-72)"
+            "button {button} cannot be bound (physical buttons are 1-32)"
         ))
     }
 }
@@ -128,7 +123,7 @@ pub struct BindingError {
 }
 
 impl BindingError {
-    /// Button outside 1–32 / 65–72.
+    /// Button outside 1–32.
     #[must_use]
     pub fn invalid_button(button: u8) -> Self {
         Self {
@@ -313,7 +308,7 @@ impl BindingStore {
     /// # Errors
     ///
     /// Returns [`BindingError`] with code `InvalidButton` for a
-    /// button outside 1–32 / 65–72, `UnknownAction` for an action
+    /// button outside 1–32, `UnknownAction` for an action
     /// id that is neither a game input nor an app action, and
     /// `BindingSaveFailed` when the file cannot be written.
     pub fn set(&mut self, button: u8, action: &str) -> Result<(), BindingError> {
@@ -605,9 +600,9 @@ mod tests {
         let dir = temp_dir("persist");
         let mut store = BindingStore::open(&dir);
         store.set(5, "horn").expect("bind button 5");
-        store.set(65, "profile_next").expect("bind encoder button");
+        store.set(7, "profile_next").expect("bind button 7");
         assert_eq!(store.get(5), Some("horn"));
-        assert_eq!(store.get(65), Some("profile_next"));
+        assert_eq!(store.get(7), Some("profile_next"));
         // Reopen: the bindings survive, in button order.
         let reopened = BindingStore::open(&dir);
         assert_eq!(reopened.load_warnings().len(), 0);
@@ -616,7 +611,7 @@ mod tests {
             .iter()
             .map(|(&button, action)| (button, action.as_str()))
             .collect();
-        assert_eq!(listed, vec![(5, "horn"), (65, "profile_next")]);
+        assert_eq!(listed, vec![(5, "horn"), (7, "profile_next")]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -629,6 +624,8 @@ mod tests {
         let error = store.set(33, "horn").expect_err("button 33");
         assert_eq!(error.code, "InvalidButton");
         let error = store.set(64, "horn").expect_err("button 64");
+        assert_eq!(error.code, "InvalidButton");
+        let error = store.set(65, "horn").expect_err("button 65 (encoder, deleted)");
         assert_eq!(error.code, "InvalidButton");
         let error = store.set(5, "warp_drive").expect_err("unknown action");
         assert_eq!(error.code, "UnknownAction");
@@ -656,23 +653,23 @@ mod tests {
         // normal bindings and knobs.
         let dir = temp_dir("long-press");
         let mut store = BindingStore::open(&dir);
-        store.set(5, "gear_1").expect("bind button 5");
+        store.set(5, "horn").expect("bind button 5");
         store
-            .set_long_press(5, "gear_2")
+            .set_long_press(5, "handbrake")
             .expect("bind button 5 long-press");
-        assert_eq!(store.get_long_press(5), Some("gear_2"));
-        assert_eq!(store.get(5), Some("gear_1"));
+        assert_eq!(store.get_long_press(5), Some("handbrake"));
+        assert_eq!(store.get(5), Some("horn"));
         let reopened = BindingStore::open(&dir);
         assert_eq!(reopened.load_warnings().len(), 0);
-        assert_eq!(reopened.get_long_press(5), Some("gear_2"));
-        assert_eq!(reopened.get(5), Some("gear_1"));
+        assert_eq!(reopened.get_long_press(5), Some("handbrake"));
+        assert_eq!(reopened.get(5), Some("horn"));
         // Clear only the long-press: the normal binding stands.
         let mut reopened = reopened;
         assert!(reopened.clear_long_press(5).expect("clear long-press"));
         assert_eq!(reopened.get_long_press(5), None);
-        assert_eq!(reopened.get(5), Some("gear_1"));
+        assert_eq!(reopened.get(5), Some("horn"));
         assert!(!reopened.clear_long_press(5).expect("clear absent"));
-        assert_eq!(BindingStore::open(&dir).get(5), Some("gear_1"));
+        assert_eq!(BindingStore::open(&dir).get(5), Some("horn"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -707,12 +704,12 @@ mod tests {
         let dir = temp_dir("long-press-old");
         std::fs::write(
             dir.join(BINDINGS_FILE_NAME),
-            r#"{"schemaVersion":1,"bindings":{"5":"horn"},"knobs":[["","",""],["","",""]],"longPressBindings":{"70":"horn","5":"gear_2","6":"warp_drive"}}"#,
+            r#"{"schemaVersion":1,"bindings":{"5":"horn"},"knobs":[["","",""],["","",""]],"longPressBindings":{"70":"horn","5":"handbrake","6":"warp_drive"}}"#,
         )
         .expect("write");
         let store = BindingStore::open(&dir);
         assert_eq!(store.get(5), Some("horn"));
-        assert_eq!(store.get_long_press(5), Some("gear_2"));
+        assert_eq!(store.get_long_press(5), Some("handbrake"));
         assert_eq!(store.get_long_press(70), None);
         assert_eq!(store.get_long_press(6), None);
         assert_eq!(
@@ -748,12 +745,12 @@ mod tests {
         )
         .expect("write");
         let store = BindingStore::open(&dir);
-        assert_eq!(store.list().len(), 2);
+        assert_eq!(store.list().len(), 1);
         assert_eq!(store.get(5), Some("horn"));
-        assert_eq!(store.get(65), Some("profile_next"));
+        assert_eq!(store.get(65), None, "encoder button 65 is dropped");
         assert_eq!(
             store.load_warnings().len(),
-            2,
+            3,
             "one warning per dropped entry"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -777,8 +774,8 @@ mod tests {
     #[test]
     fn action_vocabulary_splits_game_and_app() {
         assert!(is_game_action("horn"));
-        assert!(is_game_action("gear_6"));
         assert!(is_game_action("handbrake"));
+        assert!(!is_game_action("gear_6"));
         assert!(!is_game_action("profile_next"));
         assert!(is_app_action("profile_next"));
         assert!(is_app_action("profile_previous"));

@@ -1060,12 +1060,6 @@ pub const ASSIGNABLE_ACTIONS: &[&str] = &[
     "horn",
     "shifter_up",
     "shifter_down",
-    "gear_1",
-    "gear_2",
-    "gear_3",
-    "gear_4",
-    "gear_5",
-    "gear_6",
     "handbrake",
 ];
 
@@ -1106,17 +1100,18 @@ pub fn parse_button_bindings(config: &serde_json::Value) -> ButtonBindings {
     bindings
 }
 
-/// Validate parsed bindings: buttons must be physical (1–32) or encoder
-/// virtual buttons (65–72), and actions must be assignable. Buttons
-/// 33–64 have no binding UI (and no C# precedent) and are rejected.
+/// Validate parsed bindings: buttons must be physical (1–32) and
+/// actions must be assignable. Buttons 33 and up have no binding UI
+/// (and no C# precedent) and are rejected. (v2.0.19: encoder virtual
+/// buttons 65–72 and H-pattern gears `gear_1`…`gear_6` are deleted.)
 /// Returns one message per failed rule (empty = valid).
 #[must_use]
 pub fn validate_button_bindings(bindings: &ButtonBindings) -> Vec<String> {
     let mut errors = Vec::new();
     for (&button, action) in bindings {
-        if !((1..=32).contains(&button) || (65..=72).contains(&button)) {
+        if !(1..=32).contains(&button) {
             errors.push(format!(
-                "button {button} cannot be bound (physical buttons are 1-32, encoder virtual buttons 65-72)"
+                "button {button} cannot be bound (physical buttons are 1-32)"
             ));
         }
         if !ASSIGNABLE_ACTIONS.contains(&action.as_str()) {
@@ -1786,8 +1781,8 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_command_builds_payload_with_encoders() {
-        use crate::snapshot::{ConnectionState, EncoderSnapshot, PedalSnapshot, SnapshotInput};
+    fn snapshot_command_builds_payload() {
+        use crate::snapshot::{ConnectionState, PedalSnapshot, SnapshotInput};
         let stats = get_engine_stats(&rsh_engine::metrics::EngineMetrics::new(), Some(200.0));
         let snapshot = get_snapshot(SnapshotInput {
             steering_deg: -45.0,
@@ -1800,22 +1795,10 @@ mod tests {
             stats,
             active_profile_id: Some("default".to_string()),
             seq: 7,
-            encoders: vec![EncoderSnapshot {
-                index: 0,
-                count: 5,
-                delta: 5,
-                cw_button: 65,
-                ccw_button: 66,
-                cw_pressed: true,
-                ccw_pressed: false,
-            }],
             seq_gap: 0,
             tx_fail: 0,
             handbrake: 0.0,
-            gear: 0,
         });
-        assert_eq!(snapshot.encoder_buttons, vec![65]);
-        assert_eq!(snapshot.encoders.len(), 1);
         let json = serde_json::to_string(&snapshot).expect("serialize");
         assert!(json.contains("\"steeringDeg\":-45.0"), "{json}");
         assert!(json.contains("\"loopHz\":200.0"), "{json}");
@@ -1824,19 +1807,25 @@ mod tests {
     #[test]
     fn button_bindings_parse_is_tolerant_and_validation_is_strict() {
         let config = serde_json::json!({
-            "buttons": {"1": "horn", "5": "shifter_up", "65": "gear_1", "bogus": "horn", "7": 42, "9": "", "40": "horn", "3": "dance"}
+            "buttons": {"1": "horn", "5": "shifter_up", "bogus": "horn", "7": 42, "9": "", "40": "horn", "3": "dance"}
         });
         let bindings = parse_button_bindings(&config);
         // Corrupt entries (non-integer key, non-string value, empty
         // string) are dropped; out-of-range / unknown-action entries
         // parse but fail validation.
-        assert_eq!(bindings.len(), 5);
+        assert_eq!(bindings.len(), 4);
         assert_eq!(bindings.get(&1).map(String::as_str), Some("horn"));
-        assert_eq!(bindings.get(&65).map(String::as_str), Some("gear_1"));
         let errors = validate_button_bindings(&bindings);
         assert_eq!(errors.len(), 2, "errors: {errors:?}");
         assert!(errors.iter().any(|e| e.contains("button 40")));
         assert!(errors.iter().any(|e| e.contains("button 3")));
+        // Encoder virtual buttons and H-pattern gears are deleted
+        // in v2.0.19 — both fail validation now.
+        let deleted = parse_button_bindings(
+            &serde_json::json!({"buttons": {"65": "gear_1", "70": "horn"}}),
+        );
+        let errors = validate_button_bindings(&deleted);
+        assert_eq!(errors.len(), 3, "errors: {errors:?}");
         assert!(parse_button_bindings(&serde_json::json!({})).is_empty());
         assert!(parse_button_bindings(&serde_json::json!({"buttons": "horn"})).is_empty());
     }
