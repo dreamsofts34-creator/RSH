@@ -17,7 +17,7 @@
 //!   never prompts;
 //! * `AppStateCore::activate_startup_backend` activates the
 //!   selected backend (vJoy or Xbox) directly at startup —
-//!   v2.0.19 deleted the HIDMaestro backend, so there is no
+//!   v2.0.19 deleted the `HIDMaestro` backend, so there is no
 //!   elevated backend left to defer and no UAC prompt at login.
 //! * the optional elevated helper (scheduled task, option (a)) is
 //!   NOT implemented: with no elevated backend left, there is

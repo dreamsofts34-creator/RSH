@@ -459,7 +459,7 @@ fn mock_factories() -> BackendFactories {
 /// directly: with `Xbox` persisted,
 /// [`AppStateCore::activate_startup_backend_with_factories`]
 /// activates it and the Xbox factory is built exactly once — no
-/// backend is deferred at startup anymore (v2.0.19: the HIDMaestro
+/// backend is deferred at startup anymore (v2.0.19: the `HIDMaestro`
 /// sidecar + its UAC deferral are deleted). Source audit: no
 /// backend needs elevation — the Xbox and vJoy rows in
 /// `list_output_backends` carry no UAC note.
@@ -1702,23 +1702,9 @@ pub fn gate_extras_card_size_source() -> (bool, String) {
     report.finish()
 }
 
-/// Gate: responsive card gaps, source audit (cards layout fix, Bug 1).
-///
-/// Source audit: inter-card gaps are spacer Rectangles (`min-width`
-/// = the design gap, `horizontal-stretch: 0.05`) — NOT fixed
-/// `spacing` literals, which never scale with the window — and the
-/// cards that should grow use `min-width` (an explicit `width` caps
-/// max == pref, `can_grow == 0`, so the card never grows however much
-/// stretch it has). The pixel proof (gap 12 px at design width,
-/// ~19 px at 1016 px; cards 362 → 498 px) runs in
-/// `tools/gate-checks/rsh-gate-ui` (`ui-card-gap-responsive`); this
-/// audit is the fast regression net. The two deliberately fixed tool
-/// panels (Steering right column 296 px, Buttons edit panel 268 px)
-/// are NOT asserted here.
-#[must_use]
 /// Gate: backend-switch single attempt (v2.0.19).
 ///
-/// The UAC-dwell half of this gate is deleted with the HIDMaestro
+/// The UAC-dwell half of this gate is deleted with the `HIDMaestro`
 /// sidecar (no elevated spawn, no UAC prompt, no dwell). What
 /// survives is the UI audit: the backend-selected handler starts
 /// exactly one backend job (no loop), the job calls

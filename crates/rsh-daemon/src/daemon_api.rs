@@ -1376,9 +1376,6 @@ pub fn connection_changed_event(api: &DaemonApi) -> AppEvent {
 mod tests {
     use super::*;
 
-    use rsh_app_core::system::NullSink;
-    use rsh_output::{BackendFactories, IJoystickOutput, ProcessedState, VJoyError};
-
     fn temp_dir(name: &str) -> std::path::PathBuf {
         // Unique per call: several tests share `live_api()` and
         // used to wipe the SAME dir (`remove_dir_all` in here)

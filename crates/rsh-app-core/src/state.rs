@@ -3054,10 +3054,10 @@ impl AppStateCore {
     ///   while its button is already held fires its app action
     ///   once on the next tick — the edge baseline only tracks
     ///   ticks that pass through here.)
-    /// (v2.0.19: encoder virtual buttons 65–72, long-press and
-    /// double-press actions, and H-pattern `gear_N` actions are
-    /// deleted — only physical buttons 1–32 and the four surviving
-    /// game actions remain.)
+    ///   (v2.0.19: encoder virtual buttons 65–72, long-press and
+    ///   double-press actions, and H-pattern `gear_N` actions are
+    ///   deleted — only physical buttons 1–32 and the four surviving
+    ///   game actions remain.)
     fn apply_bindings(&self, output: &PipelineOutputState) -> PipelineOutputState {
         let bindings = lock(&self.bindings).list().clone();
         let pressed64 = u64::from(output.buttons);
@@ -3852,7 +3852,7 @@ impl AppStateCore {
     /// and the vJoy install link when vJoy is missing. Nothing here
     /// is invented: `installed` is a file probe, `connected` is the
     /// live backend's `is_connected()`, and non-live backends report
-    /// `connected: false`. The Xbox (ViGEmBus) driver is only probed
+    /// `connected: false`. The Xbox (`ViGEmBus`) driver is only probed
     /// at connect, so its `installed` is [`None`] (unknown).
     #[must_use]
     pub fn list_output_backends(&self) -> Vec<BackendStatus> {
@@ -7650,7 +7650,7 @@ impl OutputSink for EngineSink {
 /// There is no way to tell a v2.0.0 default apart from an explicit
 /// user `HIDMaestro` choice — the store records only the value — so
 /// this migration knowingly also moves an explicit `HIDMaestro`
-/// choice when vJoy is installed; the HIDMaestro backend was
+/// choice when vJoy is installed; the `HIDMaestro` backend was
 /// removed in v2.0.19, so there is nothing to re-pick — the
 /// migration note names the change.
 #[must_use]
@@ -7863,7 +7863,7 @@ fn run_vjoy_install_inner() -> Result<(), String> {
 }
 
 /// Builds the real backend factories for the selector: vJoy
-/// (default, this settings' device id), Xbox (ViGEmBus fallback),
+/// (default, this settings' device id), Xbox (`ViGEmBus` fallback),
 /// and the no-device sink.
 fn real_backend_factories(vjoy_device_id: u32) -> BackendFactories {
     BackendFactories {

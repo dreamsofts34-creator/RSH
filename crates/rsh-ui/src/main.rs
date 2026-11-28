@@ -5937,7 +5937,7 @@ impl Ctx {
     }
 
     /// Reset all three pedals to the Normal preset + defaults (v2.0.19,
-    /// F4 — 1-tap reset): one TuningPush job sets all three records,
+    /// F4 — 1-tap reset): one `TuningPush` job sets all three records,
     /// so the duplicate-start rule cannot swallow the 2nd/3rd push.
     /// Defaults mirror the sync fallbacks: curve 1.0 / 1.3 / 1.0,
     /// deadzone 0, bite 0, slip zone 15%, brake force 100%, ramps
@@ -5996,7 +5996,7 @@ impl Ctx {
     }
 
     /// Reset handbrake + shifter + horn to the Normal preset +
-    /// defaults (v2.0.19, F4 — 1-tap reset): one TuningPush job,
+    /// defaults (v2.0.19, F4 — 1-tap reset): one `TuningPush` job,
     /// same shape as [`Self::reset_pedals_defaults`]. Handbrake:
     /// curve 1.0 (Normal), deadzone 0, latch off, grab instant,
     /// auto-release off. Shifter: lockout 50 ms (sensitivity is a
@@ -8091,7 +8091,7 @@ impl Ctx {
     /// installed / installing / version / last install error are all
     /// real. When the call errors (sim / no daemon) the status is
     /// honestly unknown — never a fake "installed" — and the
-    /// Xbox (ViGEmBus) fallback stays the way forward. The user's
+    /// Xbox (`ViGEmBus`) fallback stays the way forward. The user's
     /// fallback choice is preserved across calls.
     /// R2-11: every write is change-guarded.
     fn sync_vjoy(&self, win: &MainWindow) {
@@ -9197,7 +9197,7 @@ fn wire_setup(win: &MainWindow, ctx: &Rc<Ctx>) {
     wire_setup_vjoy(win, ctx);
 }
 
-/// Wire the wizard's Drivers step (vJoy install / Xbox (ViGEmBus)
+/// Wire the wizard's Drivers step (vJoy install / Xbox (`ViGEmBus`)
 /// fallback). Install needs the vJoy backend (`install_vjoy` seam):
 /// until it lands the button explains itself and the fallback is
 /// the way forward — `set_output_backend("Xbox")` is real.
