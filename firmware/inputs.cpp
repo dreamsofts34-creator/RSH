@@ -12,6 +12,12 @@ static uint16_t lastHandbrakeDiag = 0;   // FW-11: handbrake trimmed-mean state
 static uint16_t lastClutchDiag = 0;      // Phase F WS5: clutch trimmed-mean state
 // D-4 (v4.0.2): shifter sensitivity (0..100, default 50) — sequential
 // gear debounce isi se chalta hai.
+// v2.0.19: ye statics W2 mein ghalti se H-pattern block ke saath delete
+// ho gaye thay (sequential debounce in par chalta hai — inputs_apply_
+// config_blob + debouncer reset inhein istemal karte hain); wapas lao.
+static uint8_t shifterSensitivity = RSH_CFG_SHIFTER_SENSITIVITY_DEFAULT;
+static uint8_t shifterDebounceMs =
+    13;  // rsh_shifter_debounce_ms(50) = 20 - 50*15/100 = 13 (formula se)
 static bool useMv = (STEER_USE_MILLIVOLTS != 0);
 static SampleGovernor governor;   // .ino window ke hisaab se update karta hai
 static uint32_t lastMvCheckMs = 0;
