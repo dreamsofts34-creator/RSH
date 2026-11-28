@@ -285,6 +285,18 @@ static void net_retry_ap_restart_() {
   apRestartRetryAtMs_ = millis() + 5000;  // dobara 5 s baad, diag dobara nahi
 }
 
+// v2.0.21 F9: AP radio tuning — HT20 force karo (Arduino/IDF default
+// HT40 hai; ~36 B control link ko throughput nahi, saaf spectrum
+// chahiye — HT40 par collision ka chance dugna). Har kamyab softAP
+// start ke baad lagao (boot/rescan net_start_ap_and_sockets se, password
+// restart seedha softAP bulata hai). Best-effort: fail ho to AP phir bhi
+// up rehta hai (default bandwidth par). API verify ki hui hai:
+// esp_wifi_set_bandwidth(wifi_interface_t, wifi_bandwidth_t),
+// WIFI_IF_AP / WIFI_BW_HT20 — esp_wifi.h (Arduino core 6.9.0 / IDF 4.4).
+static void net_apply_ap_radio_() {
+  (void)esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+}
+
 // AP + sockets ek channel par shuru karo. AP KHULA hai jab koi password
 // stored nahi (v2.2, D6 — pehli setup / password clear ke baad), warna
 // WPA2-PSK (user-set password, keystore se).
@@ -301,6 +313,7 @@ static bool net_start_ap_and_sockets(uint8_t ch) {
   WiFi.setTxPower(TX_POWER);   // softAP ke BAAD (vendor doc ke mutabiq)
 #endif
   WiFi.setSleep(false);        // nuqsan nahi; AP-mode latency is par munhasir nahi
+  net_apply_ap_radio_();       // v2.0.21 F9: HT20 (softAP ke BAAD)
   // Receive socket fail ho to bhi upar "sab theek" na kaho (audit fix)
   if (!udpHello.begin(PORT_HELLO)) return false;
   if (!udpCtrl.begin(PORT_CTRL)) return false;
@@ -770,6 +783,8 @@ static bool net_restart_ap_with_new_password() {
     net_request_ap_restart_retry_(currentChannel);
     return false;
   }
+  WiFi.setSleep(false);     // restart path: AP-start settings dobara lagao
+  net_apply_ap_radio_();    // v2.0.21 F9: HT20 (softAP ke BAAD)
   if (!udpHello.begin(PORT_HELLO) || !udpCtrl.begin(PORT_CTRL)) {
     rsh_diag_record_global(RSH_DIAG_AP_RESTART_FAIL, 1, millis());
     net_request_ap_restart_retry_(currentChannel);
@@ -935,6 +950,10 @@ bool net_serial_dispatch_control(const uint8_t *frame, size_t len,
       &serialCtrlSession, &serialCtrlCache, net_ctrl_handler, &serialCtrlCtx,
       reply_out, reply_out_len, reply_len_out);
   if (d != RSH_CTRL_DISP_REPLY) return false;
+  // v2.0.21 F1 defense-in-depth: valid serial control frame = live peer —
+  // liveness timer refresh karo (sirf HELO par munhasir nahi; PC-side
+  // 1 Hz HELO thread asal fix hai, ye sirf backup hai).
+  serialLastHelloMs = millis();
   if (serialCtrlCtx.lastCmd == RSH_CMD_GET_CAPS &&
       serialCtrlCtx.lastStatus == RSH_CTRL_OK)
     serialCapsOk = true;
@@ -945,7 +964,10 @@ bool net_serial_dispatch_control(const uint8_t *frame, size_t len,
 // (rate limit bucket: point-to-point link ke liye ek fixed key).
 size_t net_serial_ping(const uint8_t *req, int len, uint8_t *reply_out) {
   if (!req || !reply_out) return 0;
-  return net_ping_build_reply(req, len, RSH_SERIAL_PING_KEY, reply_out);
+  size_t n = net_ping_build_reply(req, len, RSH_SERIAL_PING_KEY, reply_out);
+  // v2.0.21 F1 defense-in-depth: valid ping bhi liveness hai (upar dekho).
+  if (n > 0) serialLastHelloMs = millis();
+  return n;
 }
 
 // Serial reply bhejne KE BAAD deferred actions (REBOOT/SET_PASSWORD) —

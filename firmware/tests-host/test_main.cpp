@@ -621,19 +621,24 @@ int main() {
     CHECK(rsh_pedal_should_read(true, 7) == true);           // analog: har cycle
   }
 
-  // 9) Adaptive sampling governor (D16/F5): dabao par step down (level 3 tak),
-  // sakoon par step up. Level 3 = 4 samples/axis + 100 pps fallback.
+  // 9) Adaptive sampling governor (D16/F5; v2.0.21 F6): dabao par step
+  // down (level 3 tak), sakoon par step up. Level 3 = 4 samples/axis +
+  // 100 pps fallback. F6: level-0 samples aadhe (8 steer / 4 pedal) aur
+  // step-up ke liye 2 LAGATAR kharab windows chahiye (ek transient
+  // spike governor ko 100 Hz par nahi girata).
   // Recovery: <=1 overrun wali window bhi goodWindows gine (F5 fix — pehle
   // 1 overrun bhi goodWindows reset kar deta tha, recovery kabhi nahi hoti thi).
   {
     SampleGovernor g;
-    CHECK(g.level == 0 && g.steerSamples() == 16 && g.pedalSamples() == 8);
+    CHECK(g.level == 0 && g.steerSamples() == 8 && g.pedalSamples() == 4);
     CHECK(g.sendPeriodUs() == 5000 && g.fallback100pps() == false);
-    g.update(3);                       // zyada overruns — neeche
-    CHECK(g.level == 1 && g.steerSamples() == 12 && g.pedalSamples() == 6);
-    g.update(10);
-    CHECK(g.level == 2 && g.steerSamples() == 8 && g.pedalSamples() == 4);
-    g.update(10);
+    g.update(3);                       // ek kharab window — step up NAHI (F6)
+    CHECK(g.level == 0);
+    g.update(3);                       // doosri lagatar kharab window — neeche
+    CHECK(g.level == 1 && g.steerSamples() == 6 && g.pedalSamples() == 4);
+    g.update(10); g.update(10);
+    CHECK(g.level == 2 && g.steerSamples() == 4 && g.pedalSamples() == 4);
+    g.update(10); g.update(10);
     CHECK(g.level == 3 && g.steerSamples() == 4 && g.pedalSamples() == 4);
     CHECK(g.sendPeriodUs() == 10000 && g.fallback100pps() == true);
     g.update(10);                      // is se neeche nahi
@@ -1070,8 +1075,8 @@ int main() {
     // RSH_CAPS_FW_* hi net.cpp HELLO reply ka bhi source hai (single source
     // of truth) — 4.0.0 hard-code dobara na aaye, is liye constants + string
     // dono yahan bandhe hain.
-    CHECK(RSH_CAPS_FW_MAJOR == 4 && RSH_CAPS_FW_MINOR == 0 && RSH_CAPS_FW_PATCH == 8);
-    CHECK(strcmp(FIRMWARE_VERSION, "4.0.8") == 0);
+    CHECK(RSH_CAPS_FW_MAJOR == 4 && RSH_CAPS_FW_MINOR == 0 && RSH_CAPS_FW_PATCH == 9);
+    CHECK(strcmp(FIRMWARE_VERSION, "4.0.9") == 0);
 
     // --- FW-11: default pin table mein naye modules ki rows ---
     RshCapsEntry table[20];
@@ -1112,7 +1117,7 @@ int main() {
       CHECK(blen == 18 + 8u * ntab);
       CHECK(body[0] == RSH_CTRL_OK);
       CHECK(memcmp(body + 1, mac, 6) == 0);
-      CHECK(body[7] == 4 && body[8] == 0 && body[9] == 8);   // fw 4.0.8 (Round 2 W3 FIX-1)
+      CHECK(body[7] == 4 && body[8] == 0 && body[9] == 9);   // fw 4.0.9 (Round 2 W3 FIX-1)
       CHECK(body[10] == 2 && body[11] == 2);                 // proto 2.2
       CHECK(body[12] == 8 && body[13] == 64 && body[14] == 4);
       CHECK(body[15] == 6 && body[16] == 0 && body[17] == ntab);
@@ -2314,7 +2319,7 @@ int main() {
     CHECK(rsh_caps_build_body(body, 81, mac, 6, 0, table, 8) == 0);  // 82 B body, 81 B buffer — chhota
     CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 41) == 0);
     CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 8) == 82);
-    CHECK(body[0] == RSH_CTRL_OK && body[7] == 4 && body[8] == 0 && body[9] == 8);  // fw 4.0.8 (Round 2 W3 FIX-1)
+    CHECK(body[0] == RSH_CTRL_OK && body[7] == 4 && body[8] == 0 && body[9] == 9);  // fw 4.0.9 (Round 2 W3 FIX-1)
     CHECK(body[10] == 2 && body[11] == 2);  // proto 2.2
     CHECK(body[12] == 8 && body[13] == 64 && body[14] == 4);
     CHECK(body[15] == 6 && body[17] == 8);
@@ -5034,8 +5039,8 @@ int main() {
 
     // --- F-12: version single source (version.h + modules.h + config.h) ---
     CHECK(RSH_FW_VERSION_MAJOR == 4 && RSH_FW_VERSION_MINOR == 0 &&
-          RSH_FW_VERSION_PATCH == 8);
-    CHECK(strcmp(RSH_FW_VERSION_STRING, "4.0.8") == 0);
+          RSH_FW_VERSION_PATCH == 9);
+    CHECK(strcmp(RSH_FW_VERSION_STRING, "4.0.9") == 0);
     CHECK(strcmp(FIRMWARE_VERSION, RSH_FW_VERSION_STRING) == 0);
     CHECK(RSH_CAPS_FW_MAJOR == RSH_FW_VERSION_MAJOR &&
           RSH_CAPS_FW_MINOR == RSH_FW_VERSION_MINOR &&

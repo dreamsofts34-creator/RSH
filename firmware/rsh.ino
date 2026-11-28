@@ -839,13 +839,13 @@ void loop() {
     // F-06 task mode: sampling task karta hai; yahan sirf mailbox drain
     // + send (WiFiUDP loop task mein hi — thread-safe nahi).
     RshSampleMailbox frame;
-    // PERF P2-5 (v2.0.13 polish): mailbox frame har 5 ms aata hai —
-    // frame na mile to delay(4) (~200 iter/s, net/LED phir bhi
-    // 200 Hz); frame mile to delay(1) (packet processing ke doran
-    // 1 ms spin). Pehle har iteration delay(1) thi (~1000 iter/s,
-    // idle core-0 ~3-10% busy). Net control timeouts 250 ms hain,
-    // is liye 4 ms service latency kuch nahi bigaadti; sampling
-    // task core 1 par hai, is liye delay use rokta nahi.
+    // PERF P2-5 (v2.0.13 polish; v2.0.21 F6): mailbox frame har 5 ms aata
+    // hai — PC active ho to delay(1) (frame mile ya na mile), taake
+    // sample -> UDP send mein 0-1 ms ho (pehle idle par delay(4) tha —
+    // frame ka 4 ms tak intezar, jitter ka aik zariya). PC na ho to
+    // delay(4) (~200 iter/s, net/LED phir bhi 200 Hz). Net control
+    // timeouts 250 ms hain, is liye 1 ms service latency kuch nahi
+    // bigaadti; sampling task core 1 par hai, is liye delay use rokta nahi.
     // HW-VERIFY: maxCycleUs / overruns board par pehle/baad.
     bool frameConsumed = rsh_sample_mailbox_consume(&sampleMailbox, &frame);
     if (frameConsumed) {
@@ -860,7 +860,8 @@ void loop() {
 #endif
     led_set_for_link_(active, nowMs);
     // Task mode mein loop jaldi spin kare — delay se CPU yield.
-    delay(frameConsumed ? 1 : 4);
+    // F6: PC active ho to hamesha delay(1) (frame ho ya na ho).
+    delay((frameConsumed || active) ? 1 : 4);
   } else {
 #endif
   // Wrap-safe scheduler: micros() ~71.6 min mein wrap hota hai,

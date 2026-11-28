@@ -125,18 +125,31 @@ static inline uint16_t rsh_trimmed_mean(const uint16_t *v, uint8_t n, uint8_t tr
 // Adaptive sampling governor: har window (2 s) ke overruns dekh kar
 // samples ki tadaad khud adjust hoti hai — board sust nikle to raftar
 // (200/sec) bachane ke liye samples kam, halat theek hon to wapas zyada.
-// Levels (D16): 0 = (16 steer, 8 pedal), 1 = (12, 6), 2 = (8, 4),
+// Levels (D16; v2.0.21 F6 — level-0 samples aadhe, warna per-cycle ADC
+// cost 5 ms budget ke qareeb rehta hai aur governor 100 Hz par oscillate
+// karta hai): 0 = (8 steer, 4 pedal), 1 = (6, 4), 2 = (4, 4),
 //               3 = (4, 4) + 100 pps fallback (SEND_PERIOD 10 ms).
+// Step-up (v2.0.21 F6): ek kharab window (>2 overruns) level NAHI
+// barhati — 2 LAGATAR kharab windows (4 s sustained dabao) chahiye,
+// warna ek transient spike bhi governor ko 100 Hz par gira deta hai.
+// Recovery waisi hi: 5 saaf windows (<=2 overruns) = ek step wapas.
 struct SampleGovernor {
   uint8_t level = 0;
   uint8_t goodWindows = 0;
+  uint8_t badWindows = 0;  // lagatar kharab windows (step-up ke liye 2)
   static const uint8_t kMaxLevel = 3;
+  static const uint8_t kBadWindowsToStepUp = 2;
 
   void update(uint32_t overrunsInWindow) {
     if (overrunsInWindow > 2) {
-      if (level < kMaxLevel) level++;
       goodWindows = 0;
+      if (badWindows < 255) badWindows++;
+      if (badWindows >= kBadWindowsToStepUp) {
+        if (level < kMaxLevel) level++;
+        badWindows = 0;
+      }
     } else {
+      badWindows = 0;
       // F5 fix: 0 ya 1 overrun wali window bhi goodWindows gine.
       // Pehle 1 overrun goodWindows reset kar deta tha, is liye halka
       // dabao bhi recovery ko hamesha ke liye rok deta tha.
@@ -148,10 +161,10 @@ struct SampleGovernor {
     }
   }
   uint8_t steerSamples() const {
-    return level == 0 ? 16 : (level == 1 ? 12 : (level == 2 ? 8 : 4));
+    return level == 0 ? 8 : (level == 1 ? 6 : 4);
   }
   uint8_t pedalSamples() const {
-    return level == 0 ? 8 : (level == 1 ? 6 : 4);
+    return 4;  // F6: har level par 4 (level 0 pehle 8 tha)
   }
   // Level 3 par loop 100 packets/sec par gir jata hai (D16) — 200 Hz
   // zabardasti rakhne se overrun storm hota hai; raftar bachana behtar hai.
