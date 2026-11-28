@@ -471,6 +471,15 @@ pub fn validate_tuning(tuning: &TuningSettings) -> Vec<String> {
     {
         errors.push(format!("release_ms {release_ms} is outside 0..=2000"));
     }
+    // --- Handbrake/clutch per-module tuning ---
+    // (v2.0.19: this check used to live in the deleted
+    // `validate_encoder_tuning` helper alongside the encoder/buttons
+    // checks — it survives because `bite_width` is a clutch field.)
+    if let Some(width) = tuning.bite_width
+        && !(0.05..=0.40).contains(&width)
+    {
+        errors.push(format!("bite_width {width} is outside 0.05..=0.40"));
+    }
     validate_led_horn_tuning(tuning, &mut errors);
     errors
 }
