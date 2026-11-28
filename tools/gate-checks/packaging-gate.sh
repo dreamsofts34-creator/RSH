@@ -164,8 +164,11 @@ python3 - <<'PYEOF' || fail "installer Steam FH4 OEMData check failed"
 import re
 nsi = open('installer/rsh.nsi').read()
 nsi_lines = nsi.splitlines()
-# No OEMData writes anywhere, no marker anywhere.
-assert 'steamfh4oemdata' not in nsi.lower(), (
+# No OEMData writes anywhere, no marker anywhere in code
+# (comments may still name the deleted marker).
+code_only = '\n'.join(
+    l for l in nsi_lines if not l.strip().startswith(';'))
+assert 'steamfh4oemdata' not in code_only.lower(), (
     "installer still references the SteamFh4OemData marker (deleted in v2.0.19)")
 for n, raw in enumerate(nsi_lines, 1):
     low = raw.strip().lower()
