@@ -178,7 +178,7 @@ static inline uint8_t rsh_pinmap_from_blob(const uint8_t *blob, size_t len,
   for (uint8_t i = 0; i < mc; i++) {
     const uint8_t *r = blob + RSH_CFG_HEADER_SIZE + (size_t)i * RSH_CFG_RECORD_SIZE;
     uint8_t type = r[0], slot = r[1];
-    uint8_t pinA = r[3], pinB = r[4];
+    uint8_t pinA = r[3];
     switch (type) {
       case RSH_CFG_TYPE_AXIS_ADC:
       case RSH_CFG_TYPE_AXIS_ADS1115:

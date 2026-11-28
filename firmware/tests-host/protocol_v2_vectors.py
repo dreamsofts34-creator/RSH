@@ -68,7 +68,7 @@ def status_v2_2(seq, uptime_ms, rssi, batt_pct, supply_mv, heap, overruns,
 # Layout (PROTOCOL-V2.2.md 2.2): "RSHR" | proto 2.2 | flags | sessionEcho |
 #   boardMac 6B | fw 4.0.3 | rsv | nonce 16B (=0) | deviceKey 32B (=0) |
 #   wifiPassword 24B (=0) | CRC16. Secret fields are ALWAYS zero.
-def hello_reply(flags, session_echo, board_mac, fw=(4, 0, 6)):  # fw 4.0.6
+def hello_reply(flags, session_echo, board_mac, fw=(4, 0, 7)):  # fw 4.0.7
     assert len(board_mac) == 6
     body = struct.pack("<4sBBBB", b"RSHR", 2, 2, flags, session_echo) \
         + board_mac + struct.pack("<BBBB", fw[0], fw[1], fw[2], 0) + bytes(72)
@@ -137,7 +137,7 @@ VECTORS = {
                              + b"RSHG" + bytes(12)),
   # control reply: GET_CAPS OK, reqId 1
   "ctrl_get_caps_reply": ctrl_reply(0x01, 1, 0,
-                                    TEST_MAC + bytes([4, 0, 6, 2, 2, 8, 64, 4, 6, 0, 0])),  # fw 4.0.6
+                                    TEST_MAC + bytes([4, 0, 7, 2, 2, 8, 64, 4, 6, 0, 0])),  # fw 4.0.7
   # control: SET_PASSWORD, reqId 3, no current password, new 12 chars
   "ctrl_set_password": ctrl_frame(0x0C, 3,
                                   set_password_payload(b"", b"NewPassw0rd!")),
@@ -185,7 +185,7 @@ if __name__ == "__main__":
     h = VECTORS["hello_safe_mode"]; assert len(h) == 92
     assert crc16(h[:-2]) == struct.unpack("<H", h[-2:])[0]
     assert h[4] == 2 and h[5] == 2 and h[6] == 0x04
-    assert h[14:17] == bytes([4, 0, 6]) and h[18:90] == b"\x00" * 72  # fw 4.0.6
+    assert h[14:17] == bytes([4, 0, 7]) and h[18:90] == b"\x00" * 72  # fw 4.0.7
     hp = VECTORS["hello_plain"]; assert len(hp) == 92 and hp[6] == 0 and hp[18:90] == b"\x00" * 72
     c = VECTORS["ctrl_get_caps"]; assert len(c) == 11
     assert ctrl_crc_ok(c), "good control frame must pass CRC"

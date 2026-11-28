@@ -12,13 +12,11 @@
 #include "ota_validate.h" // FW-9: OTA magic/version/size + auth gate
 #include "heap_policy.h"  // FW-10: largest-block + 5-min drop restart policy
 #include "modules.h"      // FW-11: handbrake/shifter/horn, GET_CAPS, on/off
-#include "encoders.h"     // FW-12: quadrature cumulative i16
 #include "led_patterns.h" // FW-12: LED_TEST patterns + R-L9 pin rule
 #include "led_driver.h"   // Phase G WS5: LED driver abstraction (sink boundary)
 #include "ws2812_rmt.h"   // Phase H WS2: WS2812 RMT bitstream encoder
 #include "heap_policy.h"    // FW-10 (D17)
 #include "modules.h"        // FW-11 (handbrake/shifter/horn + GET_CAPS)
-#include "encoders.h"       // FW-12 (quadrature, i16 cumulative)
 #include "led_patterns.h"   // FW-12 (LED_TEST patterns + R-L9)
 #include "safemode.h"       // FW-3 (Workstream 1: safe mode + boot counter)
 #include "config_transaction.h"  // FW-4 (Workstream 1: config transaction)
@@ -166,7 +164,7 @@ static uint32_t rng() { rng_state = rng_state * 1664525u + 1013904223u; return r
 
 // FW-8 dispatcher test handler (ctrl.h, §19): GET_CAPS -> golden minimal
 // body (17 B, pinCount 0 — protocol_v2_vectors.py ctrl_get_caps_reply
-// payload se, fw 4.0.6 / proto 2.2); GET_CFG -> 200 B body
+// payload se, fw 4.0.7 / proto 2.2); GET_CFG -> 200 B body
 // (cache-overflow path); REBOOT -> reboot flag; baqi -> UNSUPPORTED
 // (execute nahi hota).
 struct test_ctrl_ctx_t {
@@ -788,11 +786,11 @@ int main() {
       0x00, 0x00, 0x00, 0x40, 0x00, 0x10, 0x00, 0xeb, 0x52, 0x52, 0x53, 0x48,
       0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
       0x00, 0x87, 0x9d};
-    // fw patch 4.0.6 (CRC16-CCITT-FALSE, LE: 0xb2a1 — patch byte badla
+    // fw patch 4.0.7 (CRC16-CCITT-FALSE, LE: 0x5982 — patch byte badla
     // to CRC bhi badla; protocol_v2_vectors.py ka ctrl_get_caps_reply bhi dekho).
     const uint8_t ctrl_reply[29] = {0x52, 0x53, 0x48, 0x43, 0x81, 0x01, 0x00, 0x12,
-      0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x04, 0x00, 0x06, 0x02,
-      0x02, 0x08, 0x40, 0x04, 0x06, 0x00, 0x00, 0xa1, 0xb2};
+      0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x04, 0x00, 0x07, 0x02,
+      0x02, 0x08, 0x40, 0x04, 0x06, 0x00, 0x00, 0x82, 0x59};
     rsh_v2_ctrl_t cf;
     CHECK(rsh_v2_ctrl_parse_structure(ctrl_caps, sizeof(ctrl_caps), &cf) == RSH_V2_OK);
     CHECK(cf.cmd == 0x01 && cf.req_id == 1 && cf.len == 0);
@@ -804,7 +802,7 @@ int main() {
     CHECK(rsh_v2_ctrl_parse_structure(ctrl_reply, sizeof(ctrl_reply), &cf) == RSH_V2_OK);
     CHECK(cf.cmd == 0x81 && cf.payload[0] == RSH_CTRL_OK && cf.len == 18);
     CHECK(cf.payload[13] == 64);  // nBtnMax (wire)
-    CHECK(cf.payload[9] == 6);    // fw patch 4.0.6
+    CHECK(cf.payload[9] == 7);    // fw patch 4.0.7
     CHECK(cf.payload[10] == 2 && cf.payload[11] == 2);  // proto 2.2
     // build roundtrip golden se match kare
     {
@@ -987,7 +985,9 @@ int main() {
     }
   }
 
-  // 11) FW-10 heap policy (D17) + FW-11 modules + FW-12 LED/encoders.
+  // 11) FW-10 heap policy (D17) + FW-11 modules + FW-12 LED.
+  // v2.0.19: encoders DELETE (quadrature decoder + H-pattern khatam) —
+  // is section mein un ke tests ki jagah reserved-zero checks hain.
   {
     // --- FW-10: normal run mein restart nahi ---
     HeapPolicy hp;
@@ -1050,14 +1050,14 @@ int main() {
     // RSH_CAPS_FW_* hi net.cpp HELLO reply ka bhi source hai (single source
     // of truth) — 4.0.0 hard-code dobara na aaye, is liye constants + string
     // dono yahan bandhe hain.
-    CHECK(RSH_CAPS_FW_MAJOR == 4 && RSH_CAPS_FW_MINOR == 0 && RSH_CAPS_FW_PATCH == 6);
-    CHECK(strcmp(FIRMWARE_VERSION, "4.0.6") == 0);
+    CHECK(RSH_CAPS_FW_MAJOR == 4 && RSH_CAPS_FW_MINOR == 0 && RSH_CAPS_FW_PATCH == 7);
+    CHECK(strcmp(FIRMWARE_VERSION, "4.0.7") == 0);
 
     // --- FW-11: default pin table mein naye modules ki rows ---
     RshCapsEntry table[20];
     uint8_t ntab = rsh_caps_default_table(table, 20);
-    CHECK(ntab == 14);  // F-12: battery row nahi
-    int handbrakeRow = -1, hornRow = -1, ledRow = -1, shifterRows = 0, encRows = 0;
+    CHECK(ntab == 8);  // F-12: battery row nahi; v2.0.19: buttons (25/26) + encoders (4) rows nahi
+    int handbrakeRow = -1, hornRow = -1, ledRow = -1, shifterRows = 0, removedRows = 0;
     uint8_t seenPins[40] = {0};
     for (int i = 0; i < ntab; i++) {
       CHECK(table[i].pin < 40 && !seenPins[table[i].pin]);  // koi pin do dafa nahi
@@ -1077,10 +1077,10 @@ int main() {
         CHECK(table[i].pin == 21);  // R-L9: LED strip GPIO21 par
       }
       if (table[i].module == RSH_MOD_SHIFTER) shifterRows++;
-      if (table[i].module == RSH_MOD_ENCODERS) encRows++;
+      if (table[i].module == 8 || table[i].module == 9) removedRows++;  // Buttons/Encoders codes kabhi nahi
     }
     CHECK(handbrakeRow >= 0 && hornRow >= 0 && ledRow >= 0);
-    CHECK(shifterRows == 2 && encRows == 4);
+    CHECK(shifterRows == 2 && removedRows == 0);
     CHECK(rsh_caps_default_table(table, 5) == 0);   // chhota buffer -> 0
     CHECK(rsh_caps_default_table(NULL, 20) == 0);
 
@@ -1092,7 +1092,7 @@ int main() {
       CHECK(blen == 18 + 8u * ntab);
       CHECK(body[0] == RSH_CTRL_OK);
       CHECK(memcmp(body + 1, mac, 6) == 0);
-      CHECK(body[7] == 4 && body[8] == 0 && body[9] == 6);   // fw 4.0.5 (Round 2 W3 FIX-1)
+      CHECK(body[7] == 4 && body[8] == 0 && body[9] == 7);   // fw 4.0.7 (Round 2 W3 FIX-1)
       CHECK(body[10] == 2 && body[11] == 2);                 // proto 2.2
       CHECK(body[12] == 8 && body[13] == 64 && body[14] == 4);
       CHECK(body[15] == 6 && body[16] == 0 && body[17] == ntab);
@@ -1115,148 +1115,43 @@ int main() {
 
     // --- FW-11: module on/off — band module ka data packet mein nahi ---
     {
-      // Phase F WS5: 7 fields (clutch off, sequential mode — default).
+      // Phase F WS5: 5 fields (clutch off — default).
       // Handbrake slot 4 hai (pehle 3 tha — clutch ne slot 3 liya), is
       // liye sab-on mask 0x17 hai (1+2+4+16), 0x0F nahi.
-      RshModuleEnable all = {1, 1, 1, 1, 1, 0, 0};
+      RshModuleEnable all = {1, 1, 1, 1, 0};
       CHECK(rsh_stream_axis_mask(&all) == 0x17);  // steer+accel+brake+handbrake(slot 4)
-      RshModuleEnable noHb = {0, 1, 1, 1, 1, 0, 0};
+      RshModuleEnable noHb = {0, 1, 1, 1, 0};
       CHECK(rsh_stream_axis_mask(&noHb) == 0x07);  // handbrake bit clear
       CHECK(rsh_stream_axis_mask(NULL) == 0x07);   // NULL = sab band jaisa
       // Buttons: horn/shifter band hon to bits clear, baaqi nahi.
-      // Aakhri arg shifterGear (H-pattern; sequential mein 0).
-      CHECK(rsh_stream_button_bits(&all, 1, 1, 1, 1, 1, 0) == 0x1F);
-      RshModuleEnable noHorn = {1, 1, 0, 1, 1, 0, 0};
-      CHECK(rsh_stream_button_bits(&noHorn, 1, 1, 1, 1, 1, 0) == 0x0F);
-      RshModuleEnable noShift = {1, 0, 1, 1, 1, 0, 0};
-      CHECK(rsh_stream_button_bits(&noShift, 1, 1, 1, 1, 1, 0) == 0x1C);
-      CHECK(rsh_stream_button_bits(&all, 0, 0, 1, 0, 0, 0) == 0x04);  // sirf accel
+      // v2.0.19: SIRF bits 0/1/4 kabhi set hote hain (up/down/horn) —
+      // bits 2/3/5..10 reserved-zero hain, is liye sab-on = 0x13.
+      CHECK(rsh_stream_button_bits(&all, 1, 1, 1) == 0x13);
+      RshModuleEnable noHorn = {1, 1, 0, 1, 0};
+      CHECK(rsh_stream_button_bits(&noHorn, 1, 1, 0) == 0x03);
+      RshModuleEnable noShift = {1, 0, 1, 1, 0};
+      CHECK(rsh_stream_button_bits(&noShift, 1, 1, 1) == 0x10);
+      CHECK(rsh_stream_button_bits(&all, 0, 0, 1) == 0x10);  // sirf horn
+      CHECK(rsh_stream_button_bits(&all, 0, 0, 0) == 0x00);  // kuch daba nahi
+      CHECK(rsh_stream_button_bits(NULL, 1, 1, 1) == 0x00);  // NULL = sab band jaisa
       // Clutch on: slot 3 bit set hota hai (mask 0x1F).
-      RshModuleEnable withClutch = {1, 1, 1, 1, 1, 1, 0};
+      RshModuleEnable withClutch = {1, 1, 1, 1, 1};
       CHECK(rsh_stream_axis_mask(&withClutch) == 0x1F);
-      // H-pattern: gear 3 -> bit 7 (4+3), up/down bits clear.
-      RshModuleEnable hpat = {1, 1, 1, 1, 1, 0, 1};
-      CHECK(rsh_stream_button_bits(&hpat, 1, 1, 1, 1, 1, 3) == 0x9C);
-      CHECK(rsh_stream_button_bits(&hpat, 1, 1, 1, 1, 1, 0) == 0x1C);  // neutral: koi gear bit nahi
-      CHECK(rsh_stream_button_bits(&hpat, 1, 1, 1, 1, 1, 7) == 0x1C);  // gear 7 invalid
       // Enable state roundtrip + restore (baad ke tests default par chalein).
       rsh_modules_set_enabled(&noHb);
       CHECK(rsh_modules_handbrake_enabled() == 0);
       CHECK(rsh_modules_horn_enabled() == 1);
-      rsh_modules_set_enabled(&hpat);
-      CHECK(rsh_modules_shifter_mode() == 1);
-      CHECK(rsh_modules_clutch_enabled() == 0);
       rsh_modules_set_enabled(&withClutch);
       CHECK(rsh_modules_clutch_enabled() == 1);
-      CHECK(rsh_modules_shifter_mode() == 0);
       rsh_modules_set_enabled(&all);
       CHECK(rsh_modules_handbrake_enabled() == 1);
       CHECK(rsh_modules_clutch_enabled() == 0);
-      CHECK(rsh_modules_shifter_mode() == 0);
     }
 
-    // --- FW-11: H-pattern decode ---
-    CHECK(rsh_shifter_hpattern_gear(0x00) == 0);  // neutral
-    CHECK(rsh_shifter_hpattern_gear(0x01) == 1);
-    CHECK(rsh_shifter_hpattern_gear(0x02) == 2);
-    CHECK(rsh_shifter_hpattern_gear(0x20) == 6);
-    CHECK(rsh_shifter_hpattern_gear(0x03) == 0);  // 2 gears — invalid
-    CHECK(rsh_shifter_hpattern_gear(0x3F) == 0);
-    CHECK(rsh_shifter_hpattern_gear(0xFF) == 0);  // upper bits mask hote hain
-    // H-pattern + encoders conflict (shared pins 16/17/19).
-    CHECK(rsh_modules_hpattern_encoder_conflict(RSH_SHIFTER_HPATTERN, 1) == 1);
-    CHECK(rsh_modules_hpattern_encoder_conflict(RSH_SHIFTER_SEQUENTIAL, 1) == 0);
-    CHECK(rsh_modules_hpattern_encoder_conflict(RSH_SHIFTER_HPATTERN, 0) == 0);
-
-    // --- FW-12: encoders — 100 turns aage + 100 peeche = exact 0 drift ---
-    {
-      RshEncoder enc;
-      rsh_encoder_init(&enc);
-      CHECK(enc.count == 0);
-      // Pehla sample count nahi badalta.
-      rsh_encoder_step(&enc, 0, 0);
-      CHECK(enc.count == 0);
-      // Forward quadrature cycle (a,b): 00 -> 10 -> 11 -> 01 -> 00 = +4.
-      const uint8_t fwd[5][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}, {0, 0}};
-      for (int turn = 0; turn < 100; turn++) {
-        for (int detent = 0; detent < 24; detent++) {
-          for (int s = 1; s < 5; s++) rsh_encoder_step(&enc, fwd[s][0], fwd[s][1]);
-        }
-      }
-      CHECK(enc.count == 9600);   // 100 turns x 24 detents x 4 = 9600, 0 drift
-      // Reverse: 00 -> 01 -> 11 -> 10 -> 00 = -4.
-      const uint8_t rev[5][2] = {{0, 0}, {0, 1}, {1, 1}, {1, 0}, {0, 0}};
-      for (int turn = 0; turn < 100; turn++) {
-        for (int detent = 0; detent < 24; detent++) {
-          for (int s = 1; s < 5; s++) rsh_encoder_step(&enc, rev[s][0], rev[s][1]);
-        }
-      }
-      CHECK(enc.count == 0);   // wapas exact 0 — 200 turns mein 0 drift
-      // Bounce/glitch: dono bits ek saath badlen -> count nahi badalta.
-      // (Naya encoder — reverse test ka prev state yahan uljha deta.)
-      rsh_encoder_init(&enc);
-      rsh_encoder_step(&enc, 0, 0);   // pehla sample, prev=00
-      rsh_encoder_step(&enc, 1, 1);   // 00 -> 11 invalid (dono bits)
-      CHECK(enc.count == 0);
-      rsh_encoder_step(&enc, 0, 0);   // 11 -> 00 invalid (dono bits)
-      CHECK(enc.count == 0);
-      // 01 -> 10 invalid: pehle valid step se prev=01 par jao.
-      rsh_encoder_step(&enc, 0, 1);   // 00 -> 01 valid, count=-1
-      CHECK(enc.count == -1);
-      rsh_encoder_step(&enc, 1, 0);   // 01 -> 10 invalid
-      CHECK(enc.count == -1);
-      // Same state repeat -> koi count nahi.
-      rsh_encoder_step(&enc, 1, 0);
-      rsh_encoder_step(&enc, 1, 0);
-      CHECK(enc.count == -1);
-      // Phase F WS5: reversal-undo debounce — foran ulta transition
-      // pichla step cancel karta hai (bounce jora net 0, glitch gina jata hai).
-      rsh_encoder_init(&enc);
-      rsh_encoder_step(&enc, 0, 0);   // prev=00
-      rsh_encoder_step(&enc, 1, 0);   // +1 -> 1
-      CHECK(enc.count == 1);
-      rsh_encoder_step(&enc, 0, 0);   // foran wapas -> undo, 0
-      CHECK(enc.count == 0);
-      CHECK(enc.glitches == 1);
-      // Us ke baad asal motion phir se count hoti hai.
-      rsh_encoder_step(&enc, 0, 1);   // -1 -> -1
-      CHECK(enc.count == -1);
-      CHECK(enc.glitches == 1);
-      // Genuine reversal: 4 aage (+4) phir 4 peeche = wapas 0. Pehla
-      // reverse step pichle forward step se jora banata hai (net 0),
-      // baaqi 3 steps + undo = -4 — kul 0 (drift test ka chhota version).
-      rsh_encoder_init(&enc);
-      rsh_encoder_step(&enc, 0, 0);
-      rsh_encoder_step(&enc, 1, 0); rsh_encoder_step(&enc, 1, 1);
-      rsh_encoder_step(&enc, 0, 1); rsh_encoder_step(&enc, 0, 0);
-      CHECK(enc.count == 4);
-      rsh_encoder_step(&enc, 0, 1); rsh_encoder_step(&enc, 1, 1);
-      rsh_encoder_step(&enc, 1, 0); rsh_encoder_step(&enc, 0, 0);
-      CHECK(enc.count == 0);
-      // i16 wrap-aware delta.
-      CHECK(rsh_encoder_delta(-32768, 32767) == 1);
-      CHECK(rsh_encoder_delta(1000, -250) == 1250);
-      CHECK(rsh_encoder_delta(-250, 1000) == -1250);
-      CHECK(rsh_encoder_delta(5, 5) == 0);
-      // Count khud i16 wrap karta hai (int16_t overflow defined wrap).
-      enc.count = 32760;
-      enc.prev = 0; enc.seen = 1;
-      enc.lastDelta = 0; enc.prevPrev = 0;  // manual setup mukammal karo —
-      // warna pichle test ka stale lastDelta pehle step ko undo kar deta
-      // (value ittefaq se wahi aati, lekin wajah ghalat hoti).
-      rsh_encoder_step(&enc, 1, 0);  // +1 -> 32761
-      CHECK(enc.count == 32761);
-      for (int i = 0; i < 10; i++) {
-        rsh_encoder_step(&enc, 1, 1);
-        rsh_encoder_step(&enc, 0, 1);
-        rsh_encoder_step(&enc, 0, 0);
-        rsh_encoder_step(&enc, 1, 0);
-      }
-      // 32761 + 40 = 32801 -> wrap -> -32735.
-      CHECK(enc.count == -32735);
-      CHECK(rsh_encoder_delta(enc.count, 32761) == 40);
-    }
-
+    // --- v2.0.19: encoders DELETE — quadrature decoder (encoders.h)
+    // khatam; H-pattern bhi. Wire par enc hamesha 0 hota hai — ye
+    // stream-emit section mein assert hota hai, yahan koi decoder
+    // test nahi rehta.
     // --- FW-12: LED patterns + R-L9 ---
     {
       RshLedPattern cfg;
@@ -1462,10 +1357,10 @@ int main() {
     // config.h ke PIN_* se match kare ---
     uint8_t factory[256];
     size_t flen = rsh_cfg_factory_blob(factory);
-    CHECK(flen == 188);  // 8 header + 11*16 records + 4 trailer
+    CHECK(flen == 156);  // 8 header + 9*16 records + 4 trailer (v2.0.19: encoder records nahi)
     CHECK(rsh_cfg_blob_validate(factory, flen, NULL, NULL) == RSH_CTRL_OK);
     CHECK(factory[0] == 'R' && factory[1] == 'S' && factory[2] == 'H' && factory[3] == 'G');
-    CHECK(factory[4] == RSH_CFG_SCHEMA && factory[5] == 11);
+    CHECK(factory[4] == RSH_CFG_SCHEMA && factory[5] == 9);
     CHECK(factory[8 + 0 * 16 + 3] == PIN_STEER);          // AXIS slot 0
     CHECK(factory[8 + 1 * 16 + 3] == PIN_ACCEL_ADC);      // AXIS slot 1
     CHECK(factory[8 + 2 * 16 + 3] == PIN_BRAKE_ADC);      // AXIS slot 2
@@ -1474,9 +1369,7 @@ int main() {
     CHECK(factory[8 + 5 * 16 + 3] == PIN_GEAR_UP);        // BUTTON slot 0
     CHECK(factory[8 + 6 * 16 + 3] == PIN_GEAR_DOWN);      // BUTTON slot 1
     CHECK(factory[8 + 7 * 16 + 3] == PIN_HORN_BTN);       // BUTTON slot 2
-    CHECK(factory[8 + 8 * 16 + 3] == PIN_ENC1_A && factory[8 + 8 * 16 + 4] == PIN_ENC1_B);
-    CHECK(factory[8 + 9 * 16 + 3] == PIN_ENC2_A && factory[8 + 9 * 16 + 4] == PIN_ENC2_B);
-    CHECK(factory[8 + 10 * 16 + 3] == PIN_LED_STRIP);     // LED_STRIP slot 0
+    CHECK(factory[8 + 8 * 16 + 3] == PIN_LED_STRIP);      // LED_STRIP slot 0
 
     // --- Blob validation negatives (har ghalti ka sahi status + errCode) ---
     {
@@ -1498,7 +1391,7 @@ int main() {
       bad[4] = 3;
       rsh_put_u32(bad + flen - 4, rsh_crc32(bad, flen - 4));  // CRC dobara sahi
       CHECK(rsh_cfg_blob_validate(bad, flen, errs, &nerr) == RSH_CTRL_UNSUPPORTED);
-      // Size mismatch (moduleCount 11 lekin len chhoti) -> TOO_BIG, err 5
+      // Size mismatch (moduleCount 9 lekin len chhoti) -> TOO_BIG, err 5
       CHECK(rsh_cfg_blob_validate(factory, flen - 16, errs, &nerr) == RSH_CTRL_TOO_BIG);
       CHECK(errs[0] == RSH_CFG_ERR_SIZE_MISMATCH);
       CHECK(rsh_cfg_blob_validate(factory, 8, errs, &nerr) == RSH_CTRL_TOO_BIG);
@@ -1546,9 +1439,9 @@ int main() {
       size_t mlen = rsh_cfg_blob_build(manyb, many, 9, 1);
       CHECK(rsh_cfg_blob_validate(manyb, mlen, errs, &nerr) == RSH_CTRL_PIN_CONFLICT);
       CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
-      // 5 encoders (> 4) -> PIN_CONFLICT, err 2 (slots 0/1 repeat —
-      // pehla jeetta hai — gin'ti records ki hoti hai; pins sab valid
-      // pull-up pins hain, taake sirf count fail ho).
+      // 5 encoders -> UNSUPPORTED, err 3 (v2.0.19: ENCODER record hi
+      // reject hota hai — pehla record fail-closed reject, count check
+      // tak baat nahi pahunchti; slots 0/1 repeat, pins valid pull-up).
       uint8_t enc[5 * 16];
       const uint8_t enc_pins[5][2] = {{23, 19}, {16, 17}, {25, 26}, {27, 4}, {13, 14}};
       for (int i = 0; i < 5; i++)
@@ -1556,8 +1449,8 @@ int main() {
                        enc_pins[i][0], enc_pins[i][1], 0xFF, NULL);
       uint8_t encb[256];
       size_t elen = rsh_cfg_blob_build(encb, enc, 5, 1);
-      CHECK(rsh_cfg_blob_validate(encb, elen, errs, &nerr) == RSH_CTRL_PIN_CONFLICT);
-      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      CHECK(rsh_cfg_blob_validate(encb, elen, errs, &nerr) == RSH_CTRL_UNSUPPORTED);
+      CHECK(errs[0] == RSH_CFG_ERR_UNKNOWN_TYPE);
       // 65 buttons (N1: wire slot nahi) -> UNSUPPORTED, err 3
       // (65 BUTTON records — 65*16+12 = 1052 B, limit ke andar; sab
       // slot 0 — duplicate slot allowed hai, pehla jeetta hai — taake
@@ -1591,8 +1484,9 @@ int main() {
       };
       // PC default pin-map blob (PinMapBoardPush defaults): steering 34,
       // accel 35, brake 36, handbrake 32, battery 39, gear-up 27,
-      // gear-down 33, horn 4, enc1 23/19, enc2 16/17, LED 21.
-      uint8_t pc[11 * 16];
+      // gear-down 33, horn 4, LED 21.
+      // v2.0.19: enc1 23/19 + enc2 16/17 records DELETE (module khatam).
+      uint8_t pc[9 * 16];
       rsh_cfg_record(pc + 0 * 16, RSH_CFG_TYPE_AXIS_ADC, 0, 0, 34, 0xFF, 0xFF, NULL);
       rsh_cfg_record(pc + 1 * 16, RSH_CFG_TYPE_AXIS_ADC, 1, 0, 35, 0xFF, 0xFF, NULL);
       rsh_cfg_record(pc + 2 * 16, RSH_CFG_TYPE_AXIS_ADC, 2, 0, 36, 0xFF, 0xFF, NULL);
@@ -1601,16 +1495,15 @@ int main() {
       rsh_cfg_record(pc + 5 * 16, RSH_CFG_TYPE_BUTTON, 0, 0, 27, 0xFF, 0xFF, NULL);
       rsh_cfg_record(pc + 6 * 16, RSH_CFG_TYPE_BUTTON, 1, 0, 33, 0xFF, 0xFF, NULL);
       rsh_cfg_record(pc + 7 * 16, RSH_CFG_TYPE_BUTTON, 2, 0, 4, 0xFF, 0xFF, NULL);
-      rsh_cfg_record(pc + 8 * 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 19, 0xFF, NULL);
-      rsh_cfg_record(pc + 9 * 16, RSH_CFG_TYPE_ENCODER, 1, 0, 16, 17, 0xFF, NULL);
-      rsh_cfg_record(pc + 10 * 16, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
-      CHECK(v(pc, 11) == RSH_CTRL_OK);
+      rsh_cfg_record(pc + 8 * 16, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
+      CHECK(v(pc, 9) == RSH_CTRL_OK);
       // Direct full rig (pin_rules_ref.py): 5 axes + battery + 3 buttons
-      // + 2 encoders + LED 21. P2-5 note: purane preset mein BUTTON
-      // slots 3..6 bhi thay — un ka koi consumer nahi tha (silently
-      // dead), is liye COMMIT par reject hote hain; mirror blob se
-      // hata diye gaye (pin_rules_ref.py ko bhi wahi update chahiye).
-      uint8_t rig[12 * 16];
+      // + LED 21. P2-5 note: purane preset mein BUTTON slots 3..6 bhi
+      // thay — un ka koi consumer nahi tha (silently dead), is liye
+      // COMMIT par reject hote hain; mirror blob se hata diye gaye
+      // (pin_rules_ref.py ko bhi wahi update chahiye).
+      // v2.0.19: 2 encoder records DELETE.
+      uint8_t rig[10 * 16];
       rsh_cfg_record(rig + 0 * 16, RSH_CFG_TYPE_AXIS_ADC, 0, 0, 32, 0xFF, 0xFF, NULL);
       rsh_cfg_record(rig + 1 * 16, RSH_CFG_TYPE_AXIS_ADC, 1, 0, 33, 0xFF, 0xFF, NULL);
       rsh_cfg_record(rig + 2 * 16, RSH_CFG_TYPE_AXIS_ADC, 2, 0, 34, 0xFF, 0xFF, NULL);
@@ -1620,10 +1513,8 @@ int main() {
       rsh_cfg_record(rig + 6 * 16, RSH_CFG_TYPE_BUTTON, 0, 0, 4, 0xFF, 0xFF, NULL);
       rsh_cfg_record(rig + 7 * 16, RSH_CFG_TYPE_BUTTON, 1, 0, 13, 0xFF, 0xFF, NULL);
       rsh_cfg_record(rig + 8 * 16, RSH_CFG_TYPE_BUTTON, 2, 0, 14, 0xFF, 0xFF, NULL);
-      rsh_cfg_record(rig + 9 * 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 25, 0xFF, NULL);
-      rsh_cfg_record(rig + 10 * 16, RSH_CFG_TYPE_ENCODER, 1, 0, 26, 27, 0xFF, NULL);
-      rsh_cfg_record(rig + 11 * 16, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
-      CHECK(v(rig, 12) == RSH_CTRL_OK);
+      rsh_cfg_record(rig + 9 * 16, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
+      CHECK(v(rig, 10) == RSH_CTRL_OK);
       // GPIO5 (caution, boot log) allowed hai — PC + ref dono allow karte hain.
       uint8_t one[16];
       rsh_cfg_record(one, RSH_CFG_TYPE_BUTTON, 0, 0, 5, 0xFF, 0xFF, NULL);
@@ -1640,11 +1531,13 @@ int main() {
         CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
         CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
       }
-      // Input-only pin par digital: encoder 34/35, button 34 — pull-up
-      // wahan maujood hi nahi (INPUT_PULLUP), is liye reject.
+      // Input-only pin par digital: button 34 — pull-up wahan maujood
+      // hi nahi (INPUT_PULLUP), is liye reject. Encoder pins 34/35 ka
+      // check v2.0.19 mein moot hai: ENCODER record type hi reject hota
+      // hai (pin rule tak baat nahi pahunchti) — neeche UNSUPPORTED.
       rsh_cfg_record(one, RSH_CFG_TYPE_ENCODER, 0, 0, 34, 35, 0xFF, NULL);
-      CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
-      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      CHECK(v(one, 1) == RSH_CTRL_UNSUPPORTED);
+      CHECK(errs[0] == RSH_CFG_ERR_UNKNOWN_TYPE);
       rsh_cfg_record(one, RSH_CFG_TYPE_BUTTON, 0, 0, 34, 0xFF, 0xFF, NULL);
       CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
       CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
@@ -1711,9 +1604,11 @@ int main() {
       rsh_cfg_record(one, RSH_CFG_TYPE_BUTTON, 3, 0, 4, 0xFF, 0xFF, NULL);
       CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
       CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      // ENCODER slot range v2.0.19 mein moot: type hi reject hota hai
+      // (UNSUPPORTED, err 3) — slot check tak baat nahi pahunchti.
       rsh_cfg_record(one, RSH_CFG_TYPE_ENCODER, 2, 0, 23, 19, 0xFF, NULL);
-      CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
-      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      CHECK(v(one, 1) == RSH_CTRL_UNSUPPORTED);
+      CHECK(errs[0] == RSH_CFG_ERR_UNKNOWN_TYPE);
       rsh_cfg_record(one, RSH_CFG_TYPE_LED_STRIP, 1, 0, 21, 0xFF, 0xFF, NULL);
       CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
       CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
@@ -1725,8 +1620,10 @@ int main() {
       CHECK(v(one, 1) == RSH_CTRL_OK);
       rsh_cfg_record(one, RSH_CFG_TYPE_BUTTON, 2, 0, 4, 0xFF, 0xFF, NULL);
       CHECK(v(one, 1) == RSH_CTRL_OK);
+      // ENCODER boundary slot 1 bhi v2.0.19 mein reject (type hi nahi).
       rsh_cfg_record(one, RSH_CFG_TYPE_ENCODER, 1, 0, 16, 17, 0xFF, NULL);
-      CHECK(v(one, 1) == RSH_CTRL_OK);
+      CHECK(v(one, 1) == RSH_CTRL_UNSUPPORTED);
+      CHECK(errs[0] == RSH_CFG_ERR_UNKNOWN_TYPE);
       // 2 batteries / 2 LED strips (pin wale) reject — dono records
       // slot 0 (taake sirf count fail ho, P2-5 slot range nahi).
       rsh_cfg_record(two + 0, RSH_CFG_TYPE_BATTERY, 0, 0, 39, 0xFF, 0xFF, NULL);
@@ -2187,7 +2084,7 @@ int main() {
   {
     uint8_t factory[256];
     size_t flen = rsh_cfg_factory_blob(factory);
-    CHECK(flen == 188);  // Phase G C3: 11 records (pehle 7, 124 B)
+    CHECK(flen == 156);  // Phase G C3: 9 records (v2.0.19: encoders DELETE, pehle 11, 188 B)
     uint8_t newblob[256];
     size_t nlen = rsh_cfg_factory_blob(newblob);
     rsh_put_u16(newblob + 6, 2);
@@ -2375,103 +2272,62 @@ int main() {
     CHECK(heap_policy_update(&w, 85000, 50000, 310000) == 0);   // nayi baseline se -5%
   }
 
-  // 16) Modules (FW-11, modules.h): GET_CAPS table/body, on/off, H-pattern.
+  // 16) Modules (FW-11, modules.h): GET_CAPS table/body, on/off.
+  // v2.0.19: H-pattern DELETE — shifter hamesha sequential hai.
   {
-    RshCapsEntry table[14];  // F-12: battery row nahi — 15 -> 14
-    CHECK(rsh_caps_default_table(NULL, 14) == 0);
-    CHECK(rsh_caps_default_table(table, 13) == 0);  // chhota buffer
-    CHECK(rsh_caps_default_table(table, 14) == 14);
+    RshCapsEntry table[8];  // F-12: battery row nahi; v2.0.19: buttons + encoders rows nahi — 14 -> 8
+    CHECK(rsh_caps_default_table(NULL, 8) == 0);
+    CHECK(rsh_caps_default_table(table, 7) == 0);  // chhota buffer
+    CHECK(rsh_caps_default_table(table, 8) == 8);
     CHECK(table[0].pin == PIN_STEER && table[0].module == RSH_MOD_STEERING);
     CHECK(table[3].pin == PIN_HANDBRAKE_ADC && table[3].module == RSH_MOD_HANDBRAKE);
     CHECK(table[6].pin == PIN_HORN_BTN && table[6].module == RSH_MOD_HORN);
-    CHECK(table[13].pin == PIN_LED_STRIP && table[13].kind == RSH_KIND_LED_STRIP);
+    CHECK(table[7].pin == PIN_LED_STRIP && table[7].kind == RSH_KIND_LED_STRIP);
     // caps bits 5-7 hamesha 0 (§3.4).
     RshCapsEntry e = rsh_caps_entry(4, RSH_KIND_DIGITAL_IN, RSH_MOD_HORN, 0xFF);
     CHECK(e.caps == 0x1F);
     CHECK(e.reserved[0] == 0 && e.reserved[3] == 0);
-    // GET_CAPS body: 18 + 8*14 = 130 B (F-12: battery row nahi).
+    // GET_CAPS body: 18 + 8*8 = 82 B (F-12: battery row nahi; v2.0.19: buttons + encoders rows nahi).
     uint8_t mac[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
     uint8_t body[256];
-    CHECK(rsh_caps_build_body(NULL, sizeof(body), mac, 6, 0, table, 14) == 0);
-    CHECK(rsh_caps_build_body(body, 100, mac, 6, 0, table, 14) == 0);
+    CHECK(rsh_caps_build_body(NULL, sizeof(body), mac, 6, 0, table, 8) == 0);
+    CHECK(rsh_caps_build_body(body, 81, mac, 6, 0, table, 8) == 0);  // 82 B body, 81 B buffer — chhota
     CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 41) == 0);
-    CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 14) == 130);
-    CHECK(body[0] == RSH_CTRL_OK && body[7] == 4 && body[8] == 0 && body[9] == 6);  // fw 4.0.6 (Round 2 W3 FIX-1)
+    CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 8) == 82);
+    CHECK(body[0] == RSH_CTRL_OK && body[7] == 4 && body[8] == 0 && body[9] == 7);  // fw 4.0.7 (Round 2 W3 FIX-1)
     CHECK(body[10] == 2 && body[11] == 2);  // proto 2.2
     CHECK(body[12] == 8 && body[13] == 64 && body[14] == 4);
-    CHECK(body[15] == 6 && body[17] == 14);
+    CHECK(body[15] == 6 && body[17] == 8);
     CHECK(body[18 + 3 * 8] == PIN_HANDBRAKE_ADC);
     // On/off (F7): band module ka axis/button bit clear hota hai.
     // Phase F WS5: handbrake slot 4 hai (mask 0x17), clutch slot 3 off hai.
-    RshModuleEnable en = {1, 1, 1, 1, 1, 0, 0};
+    // v2.0.19: button word mein sirf bits 0/1/4 (sab-on = 0x13).
+    RshModuleEnable en = {1, 1, 1, 1, 0};
     CHECK(rsh_stream_axis_mask(&en) == 0x17);
-    CHECK(rsh_stream_button_bits(&en, 1, 1, 1, 1, 1, 0) == 0x1F);
+    CHECK(rsh_stream_button_bits(&en, 1, 1, 1) == 0x13);
     en.handbrake = 0;
     CHECK(rsh_stream_axis_mask(&en) == 0x07);  // handbrake axis bit gaya
     en.horn = 0;
-    CHECK(rsh_stream_button_bits(&en, 1, 1, 1, 1, 1, 0) == 0x0F);  // horn bit gaya
+    CHECK(rsh_stream_button_bits(&en, 1, 1, 0) == 0x03);  // horn bit gaya
     en.shifter = 0;
-    CHECK(rsh_stream_button_bits(&en, 1, 1, 1, 1, 1, 0) == 0x0C);
+    CHECK(rsh_stream_button_bits(&en, 1, 1, 1) == 0x00);  // shifter + horn dono band
+    en.horn = 1;
+    CHECK(rsh_stream_button_bits(&en, 1, 1, 1) == 0x10);  // shifter band, sirf horn
     CHECK(rsh_stream_axis_mask(NULL) == 0x07);  // NULL = core modules hi
-    // H-pattern decode: ek bit -> gear, 0 ya 2+ bits -> neutral (0).
-    CHECK(rsh_shifter_hpattern_gear(0x01) == 1);
-    CHECK(rsh_shifter_hpattern_gear(0x20) == 6);
-    CHECK(rsh_shifter_hpattern_gear(0x00) == 0);
-    CHECK(rsh_shifter_hpattern_gear(0x03) == 0);
-    CHECK(rsh_shifter_hpattern_gear(0x3F) == 0);
-    CHECK(rsh_shifter_hpattern_gear(0xFF) == 0);  // sirf low 6 bits
-    // H-pattern + encoders conflict (shared pins 16/17/19).
-    CHECK(rsh_modules_hpattern_encoder_conflict(RSH_SHIFTER_HPATTERN, 1) == 1);
-    CHECK(rsh_modules_hpattern_encoder_conflict(RSH_SHIFTER_HPATTERN, 0) == 0);
-    CHECK(rsh_modules_hpattern_encoder_conflict(RSH_SHIFTER_SEQUENTIAL, 1) == 0);
     // Global enable set/get (wapas default par restore karo).
-    RshModuleEnable off = {0, 0, 0, 0, 0, 0, 0};
+    RshModuleEnable off = {0, 0, 0, 0, 0};
     rsh_modules_set_enabled(&off);
     CHECK(rsh_modules_handbrake_enabled() == 0 && rsh_modules_led_enabled() == 0);
-    RshModuleEnable on = {1, 1, 1, 1, 1, 0, 0};
+    RshModuleEnable on = {1, 1, 1, 1, 0};
     rsh_modules_set_enabled(&on);
     CHECK(rsh_modules_handbrake_enabled() == 1 && rsh_modules_led_enabled() == 1);
-    CHECK(rsh_modules_clutch_enabled() == 0 && rsh_modules_shifter_mode() == 0);
+    CHECK(rsh_modules_clutch_enabled() == 0);
   }
 
-  // 17) Encoders + LED patterns (FW-12, encoders.h / led_patterns.h).
+  // 17) LED patterns (FW-12, led_patterns.h).
+  // v2.0.19: quadrature encoder tests DELETE (encoders.h khatam) —
+  // is section mein sirf LED patterns rehte hain.
   {
-    // Quadrature: ek poora cycle (00->10->11->01->00) = +4; ulta = -4.
-    RshEncoder enc;
-    rsh_encoder_init(&enc);
-    rsh_encoder_step(&enc, 0, 0);
-    rsh_encoder_step(&enc, 1, 0);
-    rsh_encoder_step(&enc, 1, 1);
-    rsh_encoder_step(&enc, 0, 1);
-    rsh_encoder_step(&enc, 0, 0);
-    CHECK(enc.count == 4);
-    rsh_encoder_step(&enc, 0, 1);
-    rsh_encoder_step(&enc, 1, 1);
-    rsh_encoder_step(&enc, 1, 0);
-    rsh_encoder_step(&enc, 0, 0);
-    CHECK(enc.count == 0);
-    // Glitch (dono bits ek saath) count nahi badalta — drift nahi.
-    rsh_encoder_step(&enc, 1, 1);  // 00 -> 11 ek saath
-    CHECK(enc.count == 0);
-    rsh_encoder_step(&enc, 0, 0);  // 11 -> 00 ek saath
-    CHECK(enc.count == 0);
-    // 100 turns aage + 100 peeche = exact 0 (drift test).
-    const uint8_t cyc[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
-    RshEncoder big;
-    rsh_encoder_init(&big);
-    rsh_encoder_step(&big, 0, 0);
-    for (int turn = 0; turn < 100; turn++)
-      for (int s = 1; s <= 4; s++) rsh_encoder_step(&big, cyc[s % 4][0], cyc[s % 4][1]);
-    CHECK(big.count == 400);
-    for (int turn = 0; turn < 100; turn++)
-      for (int s = 1; s <= 4; s++) rsh_encoder_step(&big, cyc[(4 - s) % 4][0], cyc[(4 - s) % 4][1]);
-    CHECK(big.count == 0);
-    // i16 wrap-aware delta (C3): 32760 -> -32756 = +20, ulta nahi.
-    CHECK(rsh_encoder_delta(-32756, 32760) == 20);
-    CHECK(rsh_encoder_delta(5, -5) == 10);
-    CHECK(rsh_encoder_delta(-32768, 32767) == 1);
-    CHECK(rsh_encoder_delta(32767, -32768) == -1);
-    // LED validate (§3.7 + R-L9): pin 21 direct rig mein, expanders mein nahi.
     RshLedPattern cfg = {RSH_LED_BLINK, 255, 0, 0, 1000, 0, 0};
     CHECK(rsh_led_pattern_validate(&cfg, 21, 0, 1) == RSH_CTRL_OK);
     CHECK(rsh_led_pattern_validate(&cfg, 21, 1, 1) == RSH_CTRL_PIN_CONFLICT);
@@ -3054,16 +2910,16 @@ int main() {
 
     // --- Full transaction: out-of-order chunks -> COMMIT (30 s) -> CONFIRM ---
     blob_v(2, newblob, &nlen);
-    CHECK(nlen == 188);  // Phase G C3: 11 records (pehle 124 B)
+    CHECK(nlen == 156);  // Phase G C3: 9 records (v2.0.19, pehle 11, 188 B)
     uint16_t pln = setcfg_pl(0, newblob, (uint16_t)nlen, 63, pl);
     fl2 = build(RSH_CMD_SET_CFG, pl, pln, frame);
     CHECK(disp(frame, fl2) == RSH_CTRL_DISP_REPLY && verified());
     CHECK(rf.payload[0] == RSH_CTRL_OK && rf.len == 5);
     CHECK(rsh_get_u16(rf.payload + 1) == 63 && rsh_get_u16(rf.payload + 3) == (uint16_t)nlen);
-    pln = setcfg_pl(126, newblob, (uint16_t)nlen, 62, pl);  // aakhri chunk pehle
+    pln = setcfg_pl(126, newblob, (uint16_t)nlen, 30, pl);  // aakhri chunk pehle (156 = 63+63+30)
     fl2 = build(RSH_CMD_SET_CFG, pl, pln, frame);
     CHECK(disp(frame, fl2) == RSH_CTRL_DISP_REPLY && verified());
-    CHECK(rf.payload[0] == RSH_CTRL_OK && rsh_get_u16(rf.payload + 1) == 125);
+    CHECK(rf.payload[0] == RSH_CTRL_OK && rsh_get_u16(rf.payload + 1) == 93);
     pln = setcfg_pl(63, newblob, (uint16_t)nlen, 63, pl);
     fl2 = build(RSH_CMD_SET_CFG, pl, pln, frame);
     CHECK(disp(frame, fl2) == RSH_CTRL_DISP_REPLY && verified());
@@ -3499,7 +3355,7 @@ int main() {
   }
 
   // 23) v2.2 stream emission (Phase E WS5, PROTOCOL-V2.2.md §1.1):
-  // faisla (active/v2) + packet build (mV axes, cumulative encoders,
+  // faisla (active/v2) + packet build (mV axes, encoders hamesha 0,
   // module gating). Packet ko wapas rsh_v2_parse_stream se parho —
   // build/parse round-trip hi contract hai.
   {
@@ -3519,17 +3375,19 @@ int main() {
     // Phase F WS5: 5 axes (clutch slot 3 + handbrake slot 4) — sab-on
     // mask 0x1F, packet 36 B (20 + 2*5 + 2*2 + 2). Clutch raw 1024 ->
     // 825 mV, handbrake raw 4095 -> 3300 mV.
-    RshModuleEnable enAll = {1, 1, 1, 1, 1, 1, 0};  // sab modules on, clutch on, sequential
-    int16_t enc2[4] = {10, -5, 0, 0};
+    // v2.0.19: enc hamesha {0,0} (n_enc 2 — wire slots barqarar hain),
+    // buttons mein sirf bits 0/1/4 (0x1F input -> 0x13 output).
+    RshModuleEnable enAll = {1, 1, 1, 1, 1};  // sab modules on, clutch on
+    int16_t enc2[4] = {0, 0, 0, 0};
     uint8_t buf[64];
     rsh_v2_stream_t parsed;
     // Sab on: steering mV 1500, accel raw 2048 -> 1650 mV, brake raw 0,
     // clutch raw 1024 -> 825 mV, handbrake raw 4095 -> 3300 mV,
-    // encoders, buttons 0x1F.
+    // enc hamesha 0, buttons 0x1F -> 0x13 (bits 2/3 strip hote hain).
     size_t n = rsh_build_v2_stream_packet(buf, sizeof(buf), 42, 123456,
                                           RSH_V2_FLAG_AXIS_INVALID, 1500, 0x01,
                                           2048, 0, 4095, enc2, 2, 0x1F, &enAll,
-                                          1024, 0);
+                                          1024);
     CHECK(n == 20 + 2 * 5 + 2 * 2 + 2);  // 36 B
     CHECK(rsh_v2_parse_stream(buf, n, &parsed) == RSH_V2_OK);
     CHECK(parsed.seq == 42 && parsed.timestamp_us == 123456);
@@ -3538,20 +3396,21 @@ int main() {
     CHECK(parsed.axes[0] == 1500 && parsed.axes[1] == 1650);
     CHECK(parsed.axes[2] == 0 && parsed.axes[3] == 825);
     CHECK(parsed.axes[4] == 3300);
-    CHECK(parsed.n_enc == 2 && parsed.enc[0] == 10 && parsed.enc[1] == -5);
-    CHECK(parsed.buttons == 0x1F);
+    CHECK(parsed.n_enc == 2 && parsed.enc[0] == 0 && parsed.enc[1] == 0);
+    CHECK(parsed.enc[2] == 0 && parsed.enc[3] == 0);
+    CHECK(parsed.buttons == 0x13);
     // Steering raw mode: 2048 raw -> 1650 mV (convert hota hai).
     n = rsh_build_v2_stream_packet(buf, sizeof(buf), 43, 1000, 0, 2048, 0x00,
-                                   0, 0, 0, enc2, 0, 0, &enAll, 0, 0);
+                                   0, 0, 0, enc2, 0, 0, &enAll, 0);
     CHECK(n == 20 + 2 * 5 + 0 + 2);
     CHECK(rsh_v2_parse_stream(buf, n, &parsed) == RSH_V2_OK);
     CHECK(parsed.axis_mask == 0x1F && parsed.axes[0] == 1650);
     CHECK(parsed.n_enc == 0);
     // Clutch band: mask 0x17 (slot 3 bit clear), 4 axes.
-    RshModuleEnable enNoClutch = {1, 1, 1, 1, 1, 0, 0};
+    RshModuleEnable enNoClutch = {1, 1, 1, 1, 0};
     n = rsh_build_v2_stream_packet(buf, sizeof(buf), 44, 1000, 0, 1500, 0x01,
                                    2048, 1024, 4095, enc2, 2, 0x1F, &enNoClutch,
-                                   2048, 0);
+                                   2048);
     CHECK(n == 20 + 2 * 4 + 2 * 2 + 2);  // 34 B
     CHECK(rsh_v2_parse_stream(buf, n, &parsed) == RSH_V2_OK);
     CHECK(parsed.axis_mask == 0x17);
@@ -3561,45 +3420,45 @@ int main() {
     CHECK(parsed.axes[3] == 0);
     CHECK(parsed.axes[4] == 3300);  // handbrake slot 4 — mask order mein aakhri
     // Handbrake band: mask 0x0F (clutch slot 3 + core), sirf 4 axes.
-    RshModuleEnable enNoHb = {0, 1, 1, 1, 1, 1, 0};
+    RshModuleEnable enNoHb = {0, 1, 1, 1, 1};
     n = rsh_build_v2_stream_packet(buf, sizeof(buf), 45, 1000, 0, 1500, 0x01,
                                    2048, 1024, 4095, enc2, 2, 0x1F, &enNoHb,
-                                   1024, 0);
+                                   1024);
     CHECK(n == 20 + 2 * 4 + 2 * 2 + 2);  // 34 B
     CHECK(rsh_v2_parse_stream(buf, n, &parsed) == RSH_V2_OK);
     CHECK(parsed.axis_mask == 0x0F);
     CHECK(parsed.axes[0] == 1500 && parsed.axes[1] == 1650 && parsed.axes[2] == 825);
     CHECK(parsed.axes[3] == 825);  // clutch slot 3 — mask order mein aakhri
-    // H-pattern: gear 2 -> button bit 6 (4+2), up/down bits clear.
-    RshModuleEnable enHpat = {1, 1, 1, 1, 1, 1, 1};
+    // v2.0.19: gear bits 5..10 kabhi set nahi hote — buttons_v1 mein
+    // sab bits (0xFF) bhi hon to sirf 0/1/4 nikalte hain.
     n = rsh_build_v2_stream_packet(buf, sizeof(buf), 46, 1000, 0, 1500, 0x01,
-                                   0, 0, 0, enc2, 0, 0x03, &enHpat, 0, 2);
+                                   0, 0, 0, enc2, 0, 0xFF, &enAll, 0);
     CHECK(rsh_v2_parse_stream(buf, n, &parsed) == RSH_V2_OK);
-    CHECK(parsed.buttons == 0x40);  // sirf gear bit 6
+    CHECK(parsed.buttons == 0x13);  // sirf up/down/horn
     // Button gating: shifter band -> bits 0,1 clear; horn band -> bit 4 clear.
-    RshModuleEnable enNoShiftHorn = {1, 0, 0, 1, 1, 0, 0};
+    RshModuleEnable enNoShiftHorn = {1, 0, 0, 1, 0};
     n = rsh_build_v2_stream_packet(buf, sizeof(buf), 47, 1000, 0, 1500, 0x01,
-                                   0, 0, 0, enc2, 0, 0x1F, &enNoShiftHorn, 0, 0);
+                                   0, 0, 0, enc2, 0, 0x1F, &enNoShiftHorn, 0);
     CHECK(rsh_v2_parse_stream(buf, n, &parsed) == RSH_V2_OK);
-    CHECK(parsed.buttons == 0x0C);  // sirf accel (bit2) + brake (bit3)
+    CHECK(parsed.buttons == 0x00);  // accel/brake bits (2/3) bhi strip — kuch nahi bachta
     // Negatives: chhota buffer, n_enc 3, reserved flags.
     CHECK(rsh_build_v2_stream_packet(buf, 10, 1, 1000, 0, 1500, 0x01, 0, 0, 0,
-                                     enc2, 2, 0, &enAll, 0, 0) == 0);
+                                     enc2, 2, 0, &enAll, 0) == 0);
     CHECK(rsh_build_v2_stream_packet(buf, sizeof(buf), 1, 1000, 0, 1500, 0x01,
-                                     0, 0, 0, enc2, 3, 0, &enAll, 0, 0) == 0);
+                                     0, 0, 0, enc2, 3, 0, &enAll, 0) == 0);
     CHECK(rsh_build_v2_stream_packet(buf, sizeof(buf), 1, 1000, 0x10, 1500, 0x01,
-                                     0, 0, 0, enc2, 0, 0, &enAll, 0, 0) == 0);
+                                     0, 0, 0, enc2, 0, 0, &enAll, 0) == 0);
     CHECK(rsh_build_v2_stream_packet(NULL, sizeof(buf), 1, 1000, 0, 1500, 0x01,
-                                     0, 0, 0, enc2, 0, 0, &enAll, 0, 0) == 0);
+                                     0, 0, 0, enc2, 0, 0, &enAll, 0) == 0);
     CHECK(rsh_build_v2_stream_packet(buf, sizeof(buf), 1, 1000, 0, 1500, 0x01,
-                                     0, 0, 0, NULL, 0, 0, &enAll, 0, 0) == 0);
+                                     0, 0, 0, NULL, 0, 0, &enAll, 0) == 0);
     // P1-1: I2C axes pehle se mV hain — mask bit set ho to wire value
     // waisi ki waisi jati hai (dobara raw->mV nahi). Mask 0x1E (slots
     // 1..4 mV, steering raw): accel 1650 -> 1650, brake 3300 -> 3300
     // (full travel), clutch 1650 -> 1650, handbrake 2659 -> 2659.
     n = rsh_build_v2_stream_packet(buf, sizeof(buf), 48, 1000, 0, 2048, 0x1E,
                                    1650, 3300, 2659, enc2, 0, 0, &enAll,
-                                   1650, 0);
+                                   1650);
     CHECK(n == 20 + 2 * 5 + 0 + 2);
     CHECK(rsh_v2_parse_stream(buf, n, &parsed) == RSH_V2_OK);
     CHECK(parsed.axes[0] == 1650);  // steering raw 2048 -> 1650 (bit clear)
@@ -3612,7 +3471,7 @@ int main() {
     // rsh_raw_to_mv mein +2047 rounding hai).
     n = rsh_build_v2_stream_packet(buf, sizeof(buf), 49, 1000, 0, 2048, 0x00,
                                    1650, 3300, 2659, enc2, 0, 0, &enAll,
-                                   1650, 0);
+                                   1650);
     CHECK(rsh_v2_parse_stream(buf, n, &parsed) == RSH_V2_OK);
     CHECK(parsed.axes[1] == 1330);  // 1650 raw -> 1330 mV
     CHECK(parsed.axes[2] == 2659);  // 3300 raw -> 2659 mV (kabhi 100% nahi)
@@ -3670,54 +3529,55 @@ int main() {
     CHECK(rsh_pw_deobfuscate(keyA, ciph, 24, back, test_sha256_fail_cb) == 0);
   }
 
-  // 25) Phase F WS5 — clutch + shifter gate mode (SET_CFG type 11) +
+  // 25) Phase F WS5 — clutch + shifter sensitivity (SET_CFG type 11) +
   // LED_TEST handler (0x0A, §3.7): blob validation/getters, module
   // apply, handler fail-closed cases.
+  // v2.0.19: gate mode DELETE — shifter hamesha sequential hai.
   {
     uint8_t errs[8];
     uint8_t nerr = 0;
     uint8_t recs[3 * 16];
     uint8_t blob[128];
 
-    // --- SHIFTER record (type 11): H-pattern valid ---
-    // Gear pins 1..3 = pinA/B/C (13,14,16), 4..6 = params[1..3] (17,18,19),
-    // params[0] = mode 1 (H-pattern).
+    // --- SHIFTER record (type 11): v2.0.19 — sequential-only ---
+    // params[0] (mode) hamesha 0 hona lazmi hai; mode 1 (H-pattern)
+    // ya 2 -> PIN_CONFLICT. Record sirf sensitivity (params[4]) ke
+    // liye rehta hai.
+    // Mode 1 (H-pattern) -> PIN_CONFLICT, err OUT_OF_RANGE.
     uint8_t hparams[10] = {1, 17, 18, 19, 0, 0, 0, 0, 0, 0};
     rsh_cfg_record(recs, RSH_CFG_TYPE_SHIFTER, 0, 0, 13, 14, 16, hparams);
     size_t hlen = rsh_cfg_blob_build(blob, recs, 1, 1);
-    CHECK(rsh_cfg_blob_validate(blob, hlen, errs, &nerr) == RSH_CTRL_OK);
-    CHECK(rsh_cfg_shifter_mode(blob, hlen) == 1);
-    // Sequential record (mode 0, pins 0xFF) + encoder record = OK.
-    uint8_t sparams[10] = {0, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0};
-    rsh_cfg_record(recs, RSH_CFG_TYPE_SHIFTER, 0, 0, 0xFF, 0xFF, 0xFF, sparams);
-    rsh_cfg_record(recs + 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 19, 0xFF, NULL);
-    size_t slen = rsh_cfg_blob_build(blob, recs, 2, 1);
-    CHECK(rsh_cfg_blob_validate(blob, slen, errs, &nerr) == RSH_CTRL_OK);
-    CHECK(rsh_cfg_shifter_mode(blob, slen) == 0);
+    CHECK(rsh_cfg_blob_validate(blob, hlen, errs, &nerr) == RSH_CTRL_PIN_CONFLICT);
+    CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
     // Mode 2 -> PIN_CONFLICT, err OUT_OF_RANGE.
     uint8_t badmode[10] = {2, 17, 18, 19, 0, 0, 0, 0, 0, 0};
     rsh_cfg_record(recs, RSH_CFG_TYPE_SHIFTER, 0, 0, 13, 14, 16, badmode);
     size_t blen = rsh_cfg_blob_build(blob, recs, 1, 1);
     CHECK(rsh_cfg_blob_validate(blob, blen, errs, &nerr) == RSH_CTRL_PIN_CONFLICT);
     CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
-    CHECK(rsh_cfg_shifter_mode(blob, blen) == 0);  // invalid blob -> default 0
-    // H-pattern + encoder record -> PIN_CONFLICT (shared pins 16/17/19).
-    rsh_cfg_record(recs, RSH_CFG_TYPE_SHIFTER, 0, 0, 13, 14, 16, hparams);
-    rsh_cfg_record(recs + 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 19, 0xFF, NULL);
-    size_t hclen = rsh_cfg_blob_build(blob, recs, 2, 1);
-    CHECK(rsh_cfg_blob_validate(blob, hclen, errs, &nerr) == RSH_CTRL_PIN_CONFLICT);
-    CHECK(errs[0] == RSH_CFG_ERR_PIN_CONFLICT);
-    // H-pattern gear pin missing (params[1] = 0xFF) -> PIN_CONFLICT.
-    uint8_t missparam[10] = {1, 0xFF, 18, 19, 0, 0, 0, 0, 0, 0};
-    rsh_cfg_record(recs, RSH_CFG_TYPE_SHIFTER, 0, 0, 13, 14, 16, missparam);
-    size_t mlen = rsh_cfg_blob_build(blob, recs, 1, 1);
-    CHECK(rsh_cfg_blob_validate(blob, mlen, errs, &nerr) == RSH_CTRL_PIN_CONFLICT);
-    // Duplicate gear pin (params[1] == pinA 13) -> PIN_CONFLICT.
-    uint8_t dupparam[10] = {1, 13, 18, 19, 0, 0, 0, 0, 0, 0};
-    rsh_cfg_record(recs, RSH_CFG_TYPE_SHIFTER, 0, 0, 13, 14, 16, dupparam);
-    size_t dplen = rsh_cfg_blob_build(blob, recs, 1, 1);
-    CHECK(rsh_cfg_blob_validate(blob, dplen, errs, &nerr) == RSH_CTRL_PIN_CONFLICT);
-    CHECK(errs[0] == RSH_CFG_ERR_PIN_CONFLICT);
+    // Sequential (mode 0) + sensitivity 80 -> OK.
+    uint8_t sparams[10] = {0, 0xFF, 0xFF, 0xFF, 80, 0, 0, 0, 0, 0};
+    rsh_cfg_record(recs, RSH_CFG_TYPE_SHIFTER, 0, 0, 0xFF, 0xFF, 0xFF, sparams);
+    size_t slen = rsh_cfg_blob_build(blob, recs, 1, 1);
+    CHECK(rsh_cfg_blob_validate(blob, slen, errs, &nerr) == RSH_CTRL_OK);
+    CHECK(rsh_cfg_shifter_sensitivity(blob, slen) == 80);
+    // Sensitivity > 100 -> PIN_CONFLICT.
+    uint8_t badsens[10] = {0, 0xFF, 0xFF, 0xFF, 101, 0, 0, 0, 0, 0};
+    rsh_cfg_record(recs, RSH_CFG_TYPE_SHIFTER, 0, 0, 0xFF, 0xFF, 0xFF, badsens);
+    size_t bslen = rsh_cfg_blob_build(blob, recs, 1, 1);
+    CHECK(rsh_cfg_blob_validate(blob, bslen, errs, &nerr) == RSH_CTRL_PIN_CONFLICT);
+    CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+    // ENCODER record (type 5) -> UNSUPPORTED, err 3 (module DELETE).
+    rsh_cfg_record(recs, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 19, 0xFF, NULL);
+    size_t elen = rsh_cfg_blob_build(blob, recs, 1, 1);
+    CHECK(rsh_cfg_blob_validate(blob, elen, errs, &nerr) == RSH_CTRL_UNSUPPORTED);
+    CHECK(errs[0] == RSH_CFG_ERR_UNKNOWN_TYPE);
+    // Sequential + encoder record -> bhi UNSUPPORTED (encoder ki wajah se).
+    rsh_cfg_record(recs, RSH_CFG_TYPE_SHIFTER, 0, 0, 0xFF, 0xFF, 0xFF, sparams);
+    rsh_cfg_record(recs + 16, RSH_CFG_TYPE_ENCODER, 1, 0, 16, 17, 0xFF, NULL);
+    size_t selen = rsh_cfg_blob_build(blob, recs, 2, 1);
+    CHECK(rsh_cfg_blob_validate(blob, selen, errs, &nerr) == RSH_CTRL_UNSUPPORTED);
+    CHECK(errs[0] == RSH_CFG_ERR_UNKNOWN_TYPE);
 
     // --- CLUTCH record (AXIS_ADC slot 3) ---
     uint8_t pin = 0xFF;
@@ -3736,18 +3596,16 @@ int main() {
     rsh_cfg_record(recs + 16, RSH_CFG_TYPE_BUTTON, 1, 0, 33, 0xFF, 0xFF, NULL);
     size_t cdlen = rsh_cfg_blob_build(blob, recs, 2, 1);
     CHECK(rsh_cfg_blob_validate(blob, cdlen, errs, &nerr) == RSH_CTRL_PIN_CONFLICT);
-    // Factory blob mein clutch nahi, mode sequential hai; LED strip hai.
+    // Factory blob mein clutch nahi; LED strip hai.
     uint8_t factory[256];
     size_t flen = rsh_cfg_factory_blob(factory);
     CHECK(rsh_cfg_has_clutch(factory, flen, &pin) == 0);
-    CHECK(rsh_cfg_shifter_mode(factory, flen) == 0);
     CHECK(rsh_cfg_led_pin(factory, flen, &pin) == 1 && pin == PIN_LED_STRIP);
     CHECK(rsh_cfg_has_expanders(factory, flen) == 0);
 
     // --- modules apply_config_blob ---
     rsh_modules_apply_config_blob(factory, flen);
     CHECK(rsh_modules_clutch_enabled() == 0);
-    CHECK(rsh_modules_shifter_mode() == 0);
     rsh_cfg_record(recs, RSH_CFG_TYPE_AXIS_ADC, 3, 0, 33, 0xFF, 0xFF, NULL);
     clen = rsh_cfg_blob_build(blob, recs, 1, 1);
     rsh_modules_apply_config_blob(blob, clen);
@@ -3758,18 +3616,19 @@ int main() {
     c35len = rsh_cfg_blob_build(blob, recs, 1, 1);
     rsh_modules_apply_config_blob(blob, c35len);
     CHECK(rsh_modules_clutch_enabled() == 1);
+    // Mode-1 (H-pattern) blob INVALID hai — apply kuch nahi badalta
+    // (fail closed); pehle wali state (clutch on) barkarar rehti hai.
     rsh_cfg_record(recs, RSH_CFG_TYPE_SHIFTER, 0, 0, 13, 14, 16, hparams);
     hlen = rsh_cfg_blob_build(blob, recs, 1, 1);
     rsh_modules_apply_config_blob(blob, hlen);
-    CHECK(rsh_modules_shifter_mode() == 1);
-    CHECK(rsh_modules_clutch_enabled() == 0);
+    CHECK(rsh_modules_clutch_enabled() == 1);
     // Kharab blob (CRC toda) -> state nahi badalti (fail closed).
     blob[hlen - 1] ^= 0xFF;
     rsh_modules_apply_config_blob(blob, hlen);
-    CHECK(rsh_modules_shifter_mode() == 1);
+    CHECK(rsh_modules_clutch_enabled() == 1);
     // Wapas default par restore karo.
     rsh_modules_apply_config_blob(factory, flen);
-    CHECK(rsh_modules_clutch_enabled() == 0 && rsh_modules_shifter_mode() == 0);
+    CHECK(rsh_modules_clutch_enabled() == 0);
 
     // --- LED_TEST handler (0x0A, §3.7) ---
     rsh_fw34_handler_ctx_t lctx;
@@ -3925,11 +3784,7 @@ int main() {
     CHECK(def.brake == PIN_BRAKE_ADC && def.handbrake == PIN_HANDBRAKE_ADC);
     CHECK(def.battery == PIN_BATTERY_ADC && def.gearUp == PIN_GEAR_UP);
     CHECK(def.gearDown == PIN_GEAR_DOWN && def.horn == PIN_HORN_BTN);
-    CHECK(def.enc1A == PIN_ENC1_A && def.enc1B == PIN_ENC1_B);
-    CHECK(def.enc2A == PIN_ENC2_A && def.enc2B == PIN_ENC2_B);
     CHECK(def.ledStrip == PIN_LED_STRIP && def.clutch == RSH_PINMAP_ABSENT);
-    CHECK(def.shifterMode == RSH_SHIFTER_MODE);
-    CHECK(def.shiftH[0] == PIN_SHIFT_H1 && def.shiftH[5] == PIN_SHIFT_H6);
 
     // --- Factory blob parse -> poora default map ---
     uint8_t factory[256];
@@ -3939,11 +3794,9 @@ int main() {
     CHECK(fm.steer == 34 && fm.accel == 35 && fm.brake == 36);
     CHECK(fm.handbrake == 32 && fm.battery == 39);
     CHECK(fm.gearUp == 27 && fm.gearDown == 33 && fm.horn == 4);
-    CHECK(fm.enc1A == 23 && fm.enc1B == 19 && fm.enc2A == 16 && fm.enc2B == 17);
     CHECK(fm.ledStrip == 21 && fm.clutch == RSH_PINMAP_ABSENT);
-    CHECK(fm.shifterMode == 0);
 
-    // --- Custom blob: steering 32, clutch 33, horn/handbrake/enc2/LED absent ---
+    // --- Custom blob: steering 32, clutch 33, horn/handbrake/LED absent ---
     uint8_t recs[8 * 16];
     uint8_t blob[256];
     rsh_cfg_record(recs + 0 * 16, RSH_CFG_TYPE_AXIS_ADC, 0, 0, 32, 0xFF, 0xFF, NULL);
@@ -3952,8 +3805,7 @@ int main() {
     rsh_cfg_record(recs + 3 * 16, RSH_CFG_TYPE_AXIS_ADC, 3, 0, 33, 0xFF, 0xFF, NULL);
     rsh_cfg_record(recs + 4 * 16, RSH_CFG_TYPE_BATTERY, 0, 0, 39, 0xFF, 0xFF, NULL);
     rsh_cfg_record(recs + 5 * 16, RSH_CFG_TYPE_BUTTON, 0, 0, 27, 0xFF, 0xFF, NULL);
-    rsh_cfg_record(recs + 6 * 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 19, 0xFF, NULL);
-    size_t clen = rsh_cfg_blob_build(blob, recs, 7, 1);
+    size_t clen = rsh_cfg_blob_build(blob, recs, 6, 1);
     CHECK(rsh_cfg_blob_validate(blob, clen, NULL, NULL) == RSH_CTRL_OK);
     RshPinMap cm;
     CHECK(rsh_pinmap_from_blob(blob, clen, &cm) == 1);
@@ -3961,14 +3813,10 @@ int main() {
     CHECK(cm.clutch == 33 && cm.battery == 39 && cm.gearUp == 27);
     CHECK(cm.handbrake == RSH_PINMAP_ABSENT && cm.gearDown == RSH_PINMAP_ABSENT);
     CHECK(cm.horn == RSH_PINMAP_ABSENT && cm.ledStrip == RSH_PINMAP_ABSENT);
-    CHECK(cm.enc1A == 23 && cm.enc1B == 19);
-    CHECK(cm.enc2A == RSH_PINMAP_ABSENT && cm.enc2B == RSH_PINMAP_ABSENT);
-    CHECK(cm.shifterMode == 0);
-    // Modules presence: clutch on, handbrake/LED/horn off, encoders on (enc1).
+    // Modules presence: clutch on, handbrake/LED/horn off.
     rsh_modules_apply_config_blob(blob, clen);
     CHECK(rsh_modules_clutch_enabled() == 1);
     CHECK(rsh_modules_handbrake_enabled() == 0);
-    CHECK(rsh_modules_encoders_enabled() == 1);
     CHECK(rsh_modules_led_enabled() == 0);
     CHECK(rsh_modules_horn_enabled() == 0);
     CHECK(rsh_modules_shifter_enabled() == 1);
@@ -4014,16 +3862,18 @@ int main() {
     RshPinMap dm;
     CHECK(rsh_pinmap_from_blob(dblob, dlen, &dm) == 1);
     CHECK(dm.steer == 34);
-    // --- Aadha encoder (sirf pinA) -> poora encoder absent ---
+    // --- v2.0.19: ENCODER record wala blob INVALID hai — from_blob 0
+    // deta hai (fail closed). Sirf pinA wala aadha record bhi reject
+    // hota hai (pehle poora encoder absent hota tha — ab record hi nahi).
     rsh_cfg_record(drec + 0 * 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 0xFF, 0xFF, NULL);
     dlen = rsh_cfg_blob_build(dblob, drec, 1, 1);
-    CHECK(rsh_pinmap_from_blob(dblob, dlen, &dm) == 1);
-    CHECK(dm.enc1A == RSH_PINMAP_ABSENT && dm.enc1B == RSH_PINMAP_ABSENT);
+    CHECK(rsh_cfg_blob_validate(dblob, dlen, NULL, NULL) == RSH_CTRL_UNSUPPORTED);
+    CHECK(rsh_pinmap_from_blob(dblob, dlen, &dm) == 0);
 
     // --- Round 2 W3 FIX-2: rsh_pinmap_uses_pin — fixed pedal-button pins
     // (25/26) blob ke kisi aur function ko diye gaye hon to 1 (inputs.cpp
     // unhein fixed button ke tor par parhna band karta hai — warna ek hi
-    // pin do button bits deta). Factory blob mein 25/26 kisi ko nahi.
+    // pin do kaam karta). Factory blob mein 25/26 kisi ko nahi.
     {
       RshPinMap fm;
       CHECK(rsh_pinmap_from_blob(factory, flen, &fm) == 1);
@@ -4033,61 +3883,57 @@ int main() {
       CHECK(rsh_pinmap_uses_pin(&fm, 21) == 1);   // LED strip
       CHECK(rsh_pinmap_uses_pin(&fm, 0xFF) == 0);
       CHECK(rsh_pinmap_uses_pin(NULL, 25) == 0);
-      // Full-rig style: encoder 1 pins 23/25 — pin 25 istemal mein hai.
-      rsh_cfg_record(drec + 0 * 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 25, 0xFF, NULL);
+      // Full-rig style: BUTTON slot 0 pin 25 par — pin 25 istemal mein hai.
+      rsh_cfg_record(drec + 0 * 16, RSH_CFG_TYPE_BUTTON, 0, 0, 25, 0xFF, 0xFF, NULL);
       dlen = rsh_cfg_blob_build(dblob, drec, 1, 1);
       RshPinMap em;
       CHECK(rsh_pinmap_from_blob(dblob, dlen, &em) == 1);
+      CHECK(em.gearUp == 25);
       CHECK(rsh_pinmap_uses_pin(&em, 25) == 1);
-      CHECK(rsh_pinmap_uses_pin(&em, 23) == 1);
       CHECK(rsh_pinmap_uses_pin(&em, 26) == 0);
       CHECK(rsh_pinmap_uses_pin(&em, 27) == 0);
     }
 
-    // --- H-pattern blob: mode 1, gear pins, encoders off ---
+    // --- v2.0.19: SHIFTER mode-1 (H-pattern) blob INVALID hai —
+    // from_blob 0 deta hai (fail closed). Sequential SHIFTER record
+    // valid hai lekin pinmap se kuch nahi leta (sensitivity alag se
+    // parhi jati hai — §25 mein covered).
     uint8_t hparams[10] = {1, 17, 18, 19, 0, 0, 0, 0, 0, 0};
     rsh_cfg_record(recs + 0 * 16, RSH_CFG_TYPE_AXIS_ADC, 0, 0, 34, 0xFF, 0xFF, NULL);
     rsh_cfg_record(recs + 1 * 16, RSH_CFG_TYPE_AXIS_ADC, 1, 0, 35, 0xFF, 0xFF, NULL);
     rsh_cfg_record(recs + 2 * 16, RSH_CFG_TYPE_AXIS_ADC, 2, 0, 36, 0xFF, 0xFF, NULL);
     rsh_cfg_record(recs + 3 * 16, RSH_CFG_TYPE_SHIFTER, 0, 0, 13, 14, 16, hparams);
     size_t hlen = rsh_cfg_blob_build(blob, recs, 4, 1);
-    CHECK(rsh_cfg_blob_validate(blob, hlen, NULL, NULL) == RSH_CTRL_OK);
+    CHECK(rsh_cfg_blob_validate(blob, hlen, NULL, NULL) == RSH_CTRL_PIN_CONFLICT);
     RshPinMap hm;
-    CHECK(rsh_pinmap_from_blob(blob, hlen, &hm) == 1);
-    CHECK(hm.shifterMode == 1);
-    CHECK(hm.shiftH[0] == 13 && hm.shiftH[1] == 14 && hm.shiftH[2] == 16);
-    CHECK(hm.shiftH[3] == 17 && hm.shiftH[4] == 18 && hm.shiftH[5] == 19);
-    rsh_modules_apply_config_blob(blob, hlen);
-    CHECK(rsh_modules_shifter_mode() == 1);
-    CHECK(rsh_modules_shifter_enabled() == 1);
-    CHECK(rsh_modules_encoders_enabled() == 0);  // H-pattern mein encoders nahi
+    CHECK(rsh_pinmap_from_blob(blob, hlen, &hm) == 0);
 
     // --- GET_CAPS table factory blob se == default table (entry by entry) ---
-    // F-12: BATTERY row hata di (GPIO39 kabhi sample nahi hota) — 15 -> 14.
-    RshCapsEntry defTable[14];
+    // F-12: BATTERY row hata di (GPIO39 kabhi sample nahi hota);
+    // v2.0.19: buttons + encoders rows nahi — 14 -> 8.
+    RshCapsEntry defTable[8];
     RshCapsEntry blobTable[40];
-    CHECK(rsh_caps_default_table(defTable, 14) == 14);
-    CHECK(rsh_caps_table_from_pinmap(&fm, blobTable, 40) == 14);
-    for (int i = 0; i < 14; i++) {
+    CHECK(rsh_caps_default_table(defTable, 8) == 8);
+    CHECK(rsh_caps_table_from_pinmap(&fm, blobTable, 40) == 8);
+    for (int i = 0; i < 8; i++) {
       CHECK(blobTable[i].pin == defTable[i].pin);
       CHECK(blobTable[i].kind == defTable[i].kind);
       CHECK(blobTable[i].module == defTable[i].module);
       CHECK(blobTable[i].caps == defTable[i].caps);
     }
-    // --- GET_CAPS table custom blob se: 10 rows, horn/enc2/LED nahi ---
+    // --- GET_CAPS table custom blob se: 5 rows, horn/handbrake/LED nahi ---
     RshPinMap cm2;
-    // Custom blob dobara banao (blob mein ab H-pattern blob hai).
+    // Custom blob dobara banao (blob mein ab mode-1 SHIFTER blob hai).
     rsh_cfg_record(recs + 0 * 16, RSH_CFG_TYPE_AXIS_ADC, 0, 0, 32, 0xFF, 0xFF, NULL);
     rsh_cfg_record(recs + 1 * 16, RSH_CFG_TYPE_AXIS_ADC, 1, 0, 35, 0xFF, 0xFF, NULL);
     rsh_cfg_record(recs + 2 * 16, RSH_CFG_TYPE_AXIS_ADC, 2, 0, 36, 0xFF, 0xFF, NULL);
     rsh_cfg_record(recs + 3 * 16, RSH_CFG_TYPE_AXIS_ADC, 3, 0, 33, 0xFF, 0xFF, NULL);
     rsh_cfg_record(recs + 4 * 16, RSH_CFG_TYPE_BATTERY, 0, 0, 39, 0xFF, 0xFF, NULL);
     rsh_cfg_record(recs + 5 * 16, RSH_CFG_TYPE_BUTTON, 0, 0, 27, 0xFF, 0xFF, NULL);
-    rsh_cfg_record(recs + 6 * 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 19, 0xFF, NULL);
-    clen = rsh_cfg_blob_build(blob, recs, 7, 1);
+    clen = rsh_cfg_blob_build(blob, recs, 6, 1);
     CHECK(rsh_pinmap_from_blob(blob, clen, &cm2) == 1);
     uint8_t ntab = rsh_caps_table_from_pinmap(&cm2, blobTable, 40);
-    CHECK(ntab == 9);  // F-12: battery row nahi — steer/accel/brake/clutch/gearUp + 2 fixed btn + enc1A/B
+    CHECK(ntab == 5);  // F-12: battery row nahi — steer/accel/brake/clutch/gearUp
     CHECK(blobTable[0].pin == 32 && blobTable[0].module == RSH_MOD_STEERING);
     CHECK(blobTable[3].pin == 33 && blobTable[3].module == RSH_MOD_CLUTCH);
     CHECK(blobTable[4].pin == 27 && blobTable[4].module == RSH_MOD_SHIFTER);
@@ -4096,18 +3942,12 @@ int main() {
     for (int i = 0; i < ntab; i++)
       if (blobTable[i].module == RSH_MOD_BATTERY) hasBattery = true;
     CHECK(!hasBattery);
-    bool hasHorn = false, hasLed = false, hasEnc2 = false;
+    bool hasHorn = false, hasLed = false;
     for (int i = 0; i < ntab; i++) {
       if (blobTable[i].module == RSH_MOD_HORN) hasHorn = true;
       if (blobTable[i].module == RSH_MOD_LED) hasLed = true;
-      if (blobTable[i].pin == 16 || blobTable[i].pin == 17) hasEnc2 = true;
     }
-    CHECK(!hasHorn && !hasLed && !hasEnc2);
-    // H-pattern table: 3 axes + 6 gear rows + 2 fixed buttons = 11.
-    CHECK(rsh_caps_table_from_pinmap(&hm, blobTable, 40) == 11);
-    CHECK(blobTable[3].pin == 13 && blobTable[3].module == RSH_MOD_SHIFTER);
-    CHECK(blobTable[7].pin == 18 && blobTable[7].module == RSH_MOD_SHIFTER);
-    CHECK(blobTable[8].pin == 19 && blobTable[8].module == RSH_MOD_SHIFTER);
+    CHECK(!hasHorn && !hasLed);
     // NULL / chhota out -> 0.
     CHECK(rsh_caps_table_from_pinmap(NULL, blobTable, 40) == 0);
     CHECK(rsh_caps_table_from_pinmap(&fm, NULL, 40) == 0);
@@ -4115,171 +3955,54 @@ int main() {
 
     // Wapas default par restore karo (factory blob — sab on, clutch off).
     rsh_modules_apply_config_blob(factory, flen);
-    CHECK(rsh_modules_clutch_enabled() == 0 && rsh_modules_shifter_mode() == 0);
+    CHECK(rsh_modules_clutch_enabled() == 0);
     CHECK(rsh_modules_handbrake_enabled() == 1);
-    CHECK(rsh_modules_encoders_enabled() == 1);
     CHECK(rsh_modules_led_enabled() == 1);
     CHECK(rsh_modules_horn_enabled() == 1);
   }
 
-  // 26) Phase G WS5 — board-side verify (sandbox): encoder 200-turn
-  // stress + i16 wrap + bounce, shifter gate state machine, clutch
-  // slot sweep (GPIO33 path), LED driver abstraction (led_driver.h).
+  // 26) Phase G WS5 — board-side verify (sandbox): shifter sequential
+  // button bits, clutch slot sweep (GPIO33 path), LED driver
+  // abstraction (led_driver.h).
+  // v2.0.19: encoder stress tests + H-pattern gate machine DELETE.
   {
-    const uint8_t cyc[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
-
-    // --- Encoder 200-turn stress: 200 aage (+800) + 200 peeche = exact 0.
-    // FW-12 gate 100 turns tha — ye us ka double hai (200 turns 0 drift).
-    RshEncoder e200;
-    rsh_encoder_init(&e200);
-    rsh_encoder_step(&e200, 0, 0);
-    for (int turn = 0; turn < 200; turn++)
-      for (int s = 1; s <= 4; s++) rsh_encoder_step(&e200, cyc[s % 4][0], cyc[s % 4][1]);
-    CHECK(e200.count == 800);
-    CHECK(e200.glitches == 0);  // clean rotation mein koi glitch nahi
-    for (int turn = 0; turn < 200; turn++)
-      for (int s = 1; s <= 4; s++) rsh_encoder_step(&e200, cyc[(4 - s) % 4][0], cyc[(4 - s) % 4][1]);
-    CHECK(e200.count == 0);
-
-    // --- i16 wrap stress: wrap boundary ke paar ghumao, wapas aao.
-    // 32760 + 40 steps -> 32800 wraps to -32736; delta phir bhi +40.
-    RshEncoder w;
-    rsh_encoder_init(&w);
-    w.count = 32760;
-    rsh_encoder_step(&w, 0, 0);
-    for (int t = 0; t < 10; t++)
-      for (int s = 1; s <= 4; s++) rsh_encoder_step(&w, cyc[s % 4][0], cyc[s % 4][1]);
-    CHECK(w.count == -32736);
-    CHECK(rsh_encoder_delta(w.count, 32760) == 40);
-    for (int t = 0; t < 10; t++)
-      for (int s = 1; s <= 4; s++) rsh_encoder_step(&w, cyc[(4 - s) % 4][0], cyc[(4 - s) % 4][1]);
-    CHECK(w.count == 32760);
-    CHECK(rsh_encoder_delta(w.count, -32736) == -40);
-    // Neeche wali boundary: -32760 - 40 -> -32800 wraps to 32736.
-    RshEncoder wmin;
-    rsh_encoder_init(&wmin);
-    wmin.count = -32760;
-    rsh_encoder_step(&wmin, 0, 0);
-    for (int t = 0; t < 10; t++)
-      for (int s = 1; s <= 4; s++) rsh_encoder_step(&wmin, cyc[(4 - s) % 4][0], cyc[(4 - s) % 4][1]);
-    CHECK(wmin.count == 32736);
-    CHECK(rsh_encoder_delta(wmin.count, -32760) == -40);
-
-    // --- Bounce/reversal stress (seeded LCG — deterministic): 300 rounds,
-    // har round 1-4 clean cycles (aage ya peeche) + 0-2 bounce pairs
-    // (ek qadam aage + foran wapas). Bounce pair ka net 0 hona chahiye —
-    // aakhri count sirf clean cycles ka hona chahiye.
-    RshEncoder eb;
-    rsh_encoder_init(&eb);
-    rsh_encoder_step(&eb, 0, 0);
-    uint8_t idx = 0;  // cyc mein maujooda state (0..3)
-    int expected = 0;
-    int bouncePairs = 0;
-    uint32_t lcg = 12345;
-    for (int round = 0; round < 300; round++) {
-      lcg = lcg * 1103515245u + 12345u;
-      int fwd = (int)((lcg >> 16) & 1u);
-      lcg = lcg * 1103515245u + 12345u;
-      int cycles = 1 + (int)((lcg >> 16) % 4u);
-      for (int c = 0; c < cycles; c++) {
-        for (int s = 0; s < 4; s++) {
-          idx = (uint8_t)((idx + (fwd ? 1 : 3)) & 3);
-          rsh_encoder_step(&eb, cyc[idx][0], cyc[idx][1]);
-        }
-        expected += fwd ? 4 : -4;
-      }
-      lcg = lcg * 1103515245u + 12345u;
-      int bounces = (int)((lcg >> 16) % 3u);
-      for (int bp = 0; bp < bounces; bp++) {
-        // Ek qadam aage (kisi bhi disha), foran wapas — net 0.
-        uint8_t back = idx;
-        idx = (uint8_t)((idx + 1) & 3);
-        rsh_encoder_step(&eb, cyc[idx][0], cyc[idx][1]);
-        idx = back;
-        rsh_encoder_step(&eb, cyc[idx][0], cyc[idx][1]);
-        bouncePairs++;
-      }
-    }
-    CHECK(eb.count == (int16_t)expected);
-    CHECK(bouncePairs > 0);  // bounce waqai inject hue
-    CHECK(eb.glitches >= (uint32_t)bouncePairs);  // har bounce pair 1 glitch
-    // --- Invalid-transition burst: dono bits ek saath 500 dafa — count 0.
-    RshEncoder eg;
-    rsh_encoder_init(&eg);
-    rsh_encoder_step(&eg, 0, 0);
-    for (int i = 0; i < 500; i++) {
-      rsh_encoder_step(&eg, 1, 1);  // 00 -> 11
-      CHECK(eg.count == 0);
-      rsh_encoder_step(&eg, 0, 0);  // 11 -> 00
-      CHECK(eg.count == 0);
-    }
-    CHECK(eg.glitches == 1000);
-    // Glitch ke baad decoder recover karta hai: ek clean cycle = +4.
-    for (int s = 1; s <= 4; s++) rsh_encoder_step(&eg, cyc[s % 4][0], cyc[s % 4][1]);
-    CHECK(eg.count == 4);
-
-    // --- Shifter gate state machine: sequential <-> H-pattern switch.
-    // Sequential: up/down bits; gear value nazar-andaz hoti hai.
-    RshModuleEnable enSeq = {1, 1, 1, 1, 1, 0, 0};
-    CHECK(rsh_stream_button_bits(&enSeq, 1, 0, 0, 0, 0, 3) == 0x01);
-    CHECK(rsh_stream_button_bits(&enSeq, 0, 1, 0, 0, 0, 6) == 0x02);
-    CHECK(rsh_stream_button_bits(&enSeq, 1, 1, 0, 0, 0, 0) == 0x03);
-    // H-pattern: sirf gear bits 5..10; up/down nazar-andaz hote hain.
-    RshModuleEnable enH = {1, 1, 1, 1, 1, 0, 1};
-    CHECK(rsh_stream_button_bits(&enH, 1, 1, 0, 0, 0, 0) == 0x00);
-    for (uint8_t g = 1; g <= 6; g++)
-      CHECK(rsh_stream_button_bits(&enH, 0, 0, 0, 0, 0, g) == (1u << (4u + g)));
-    CHECK(rsh_stream_button_bits(&enH, 0, 0, 0, 0, 0, 7) == 0x00);  // gear 7 invalid
-    // Gear sequence 1->6->neutral, beech mein invalid (2 bits) -> neutral,
-    // phir decoder foran recover (stateless — agli gear sahi).
-    CHECK(rsh_shifter_hpattern_gear(0x01) == 1);
-    CHECK(rsh_shifter_hpattern_gear(0x02) == 2);
-    CHECK(rsh_shifter_hpattern_gear(0x04) == 3);
-    CHECK(rsh_shifter_hpattern_gear(0x08) == 4);
-    CHECK(rsh_shifter_hpattern_gear(0x10) == 5);
-    CHECK(rsh_shifter_hpattern_gear(0x20) == 6);
-    CHECK(rsh_shifter_hpattern_gear(0x00) == 0);
-    CHECK(rsh_shifter_hpattern_gear(0x03) == 0);  // gear 1+2 ek saath — invalid
-    CHECK(rsh_shifter_hpattern_gear(0x10) == 5);  // recover
-    // Packet level par mode switch: wahi physical inputs, alag bits.
-    // Sequential packet: up+down dabaye -> buttons 0x03.
+    // --- v2.0.19: encoder stress tests DELETE (quadrature decoder
+    // khatam — 200-turn drift, i16 wrap, bounce/reversal, invalid-
+    // transition burst sab encoders.h par the). Wire par enc hamesha
+    // 0 hota hai — §23 mein assert hota hai.
+    // --- Shifter (sequential-only, v2.0.19): up/down bits; gear value
+    // ka koi matlab nahi (H-pattern DELETE — koi gear decode nahi).
+    RshModuleEnable enSeq = {1, 1, 1, 1, 0};
+    CHECK(rsh_stream_button_bits(&enSeq, 1, 0, 0) == 0x01);
+    CHECK(rsh_stream_button_bits(&enSeq, 0, 1, 0) == 0x02);
+    CHECK(rsh_stream_button_bits(&enSeq, 1, 1, 0) == 0x03);
+    CHECK(rsh_stream_button_bits(&enSeq, 1, 1, 1) == 0x13);
+    // Packet level: up+down dabaye -> buttons 0x03.
     int16_t enc0[4] = {0, 0, 0, 0};
     uint8_t pbuf[64];
     rsh_v2_stream_t pp;
     size_t pn = rsh_build_v2_stream_packet(pbuf, sizeof(pbuf), 1, 1000, 0, 1500, 0x01,
-                                           0, 0, 0, enc0, 0, 0x03, &enSeq, 0, 0);
+                                           0, 0, 0, enc0, 0, 0x03, &enSeq, 0);
     CHECK(pn > 0 && rsh_v2_parse_stream(pbuf, pn, &pp) == RSH_V2_OK);
     CHECK(pp.buttons == 0x03);
-    // H-pattern packet: up/down dabaye + gear 3 -> sirf gear bit 7 (0x80).
-    pn = rsh_build_v2_stream_packet(pbuf, sizeof(pbuf), 2, 1000, 0, 1500, 0x01,
-                                    0, 0, 0, enc0, 0, 0x03, &enH, 0, 3);
-    CHECK(pn > 0 && rsh_v2_parse_stream(pbuf, pn, &pp) == RSH_V2_OK);
-    CHECK(pp.buttons == 0x80);
-    // H-pattern + encoders ek saath: conflict (shared pins 16/17/19) —
-    // is halat mein encoders report 0 hote hain (inputs.cpp else branch).
-    CHECK(rsh_modules_hpattern_encoder_conflict(RSH_SHIFTER_HPATTERN, 1) == 1);
-    pn = rsh_build_v2_stream_packet(pbuf, sizeof(pbuf), 3, 1000, 0, 1500, 0x01,
-                                    0, 0, 0, enc0, 0, 0x00, &enH, 0, 0);
-    CHECK(pn > 0 && rsh_v2_parse_stream(pbuf, pn, &pp) == RSH_V2_OK);
-    CHECK(pp.n_enc == 0);  // H-pattern mode mein encoders nahi bheje jate
 
     // --- Clutch board-side path (GPIO33, slot 3): raw -> mV sweep.
     // inputs.cpp clutch on hone par avg_pedal(PIN_CLUTCH_ADC) parhta hai;
     // yahan pure path (raw counts -> stream packet slot 3) verify hota hai.
-    RshModuleEnable enC = {1, 1, 1, 1, 1, 1, 0};  // clutch on
+    RshModuleEnable enC = {1, 1, 1, 1, 1};  // clutch on
     const uint16_t craw[5] = {0, 1024, 2048, 3072, 4095};
     const uint16_t cmv[5] = {0, 825, 1650, 2476, 3300};
     for (int i = 0; i < 5; i++) {
       pn = rsh_build_v2_stream_packet(pbuf, sizeof(pbuf), 10, 1000, 0, 1500, 0x01,
-                                      0, 0, 0, enc0, 0, 0x00, &enC, craw[i], 0);
+                                      0, 0, 0, enc0, 0, 0x00, &enC, craw[i]);
       CHECK(pn > 0 && rsh_v2_parse_stream(pbuf, pn, &pp) == RSH_V2_OK);
       CHECK(pp.axis_mask == 0x1F);
       CHECK(pp.axes[3] == cmv[i]);  // clutch slot 3
     }
     // Clutch band: raw 4095 bhi slot 3 mein nahi jata (mask bit clear).
-    RshModuleEnable enNoC = {1, 1, 1, 1, 1, 0, 0};
+    RshModuleEnable enNoC = {1, 1, 1, 1, 0};
     pn = rsh_build_v2_stream_packet(pbuf, sizeof(pbuf), 11, 1000, 0, 1500, 0x01,
-                                    0, 0, 4095, enc0, 0, 0x00, &enNoC, 4095, 0);
+                                    0, 0, 4095, enc0, 0, 0x00, &enNoC, 4095);
     CHECK(pn > 0 && rsh_v2_parse_stream(pbuf, pn, &pp) == RSH_V2_OK);
     CHECK(pp.axis_mask == 0x17);
     CHECK(pp.axes[3] == 0);       // clutch slot khaali
@@ -4815,7 +4538,7 @@ int main() {
     CHECK(dec.frames_ok == 1);
   }
 
-  // ============ §34: firmware v4.0.6 (F-01..F-16, v2.2) ============
+  // ============ §34: firmware v4.0.7 (F-01..F-16, v2.2) ============
   // Net.cpp / rsh.ino wiring (AP open/password, serial HELO, horn OR)
   // host par nahi chalti — wo pio build + real-board HIL se cover hoti
   // hai (gate doc). Yahan pure logic hai. Pairing khatam (D1/D7):
@@ -4916,10 +4639,10 @@ int main() {
     CHECK(rsh_cfg_led_config(blob, llen, &lc) == 1);
     CHECK(lc.pattern_id == 1 && lc.r == 10 && lc.g == 20 && lc.b == 30);
     CHECK(lc.brightness == 50);
-    // Factory blob (11 records, 188 B) mein LED_CONFIG nahi -> strip off.
+    // Factory blob (9 records, 156 B) mein LED_CONFIG nahi -> strip off.
     uint8_t fblob[256];
     size_t flen2 = rsh_cfg_factory_blob(fblob);
-    CHECK(flen2 == 188);
+    CHECK(flen2 == 156);
     CHECK(rsh_cfg_led_config(fblob, flen2, &lc) == 0);
     // Negative: pattern 5, brightness 101, duplicate, pins set -> reject.
     uint8_t badp[10] = {5, 10, 20, 30, 50, 0, 0, 0, 0, 0};
@@ -5238,8 +4961,8 @@ int main() {
 
     // --- F-12: version single source (version.h + modules.h + config.h) ---
     CHECK(RSH_FW_VERSION_MAJOR == 4 && RSH_FW_VERSION_MINOR == 0 &&
-          RSH_FW_VERSION_PATCH == 6);
-    CHECK(strcmp(RSH_FW_VERSION_STRING, "4.0.6") == 0);
+          RSH_FW_VERSION_PATCH == 7);
+    CHECK(strcmp(RSH_FW_VERSION_STRING, "4.0.7") == 0);
     CHECK(strcmp(FIRMWARE_VERSION, RSH_FW_VERSION_STRING) == 0);
     CHECK(RSH_CAPS_FW_MAJOR == RSH_FW_VERSION_MAJOR &&
           RSH_CAPS_FW_MINOR == RSH_FW_VERSION_MINOR &&
@@ -5495,7 +5218,8 @@ int main() {
     CHECK(ads.converting == 0);  // ch0 dobara start (next_idx aage nahi gaya tha)
 
     // --- 26b) Pinmap: I2C kinds assign hote hain (FW-01 bug: pehle nahi hote the) ---
-    uint8_t i2c_recs[7 * 16];
+    // v2.0.19: 7th record (ENCODER 23/19) DELETE — blob 6 records.
+    uint8_t i2c_recs[6 * 16];
     uint8_t p_as5600[10] = {0, 2, 0, 0, 0, 0, 0, 0, 0, 0};  // params[1]=2 -> 900°
     uint8_t p_ch0[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     uint8_t p_ch2[10] = {2, 0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -5508,9 +5232,8 @@ int main() {
     rsh_cfg_record(i2c_recs + 3 * 16, RSH_CFG_TYPE_BUTTON, 0, 0, 27, 0xFF, 0xFF, NULL);
     rsh_cfg_record(i2c_recs + 4 * 16, RSH_CFG_TYPE_BUTTON, 1, 0, 33, 0xFF, 0xFF, NULL);
     rsh_cfg_record(i2c_recs + 5 * 16, RSH_CFG_TYPE_BATTERY, 0, 0, 39, 0xFF, 0xFF, NULL);
-    rsh_cfg_record(i2c_recs + 6 * 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 19, 0xFF, NULL);
     uint8_t i2c_blob[256];
-    size_t i2c_len = rsh_cfg_blob_build(i2c_blob, i2c_recs, 7, 1);
+    size_t i2c_len = rsh_cfg_blob_build(i2c_blob, i2c_recs, 6, 1);
     CHECK(rsh_cfg_blob_validate(i2c_blob, i2c_len, NULL, NULL) == RSH_CTRL_OK);
     RshPinMap im;
     CHECK(rsh_pinmap_from_blob(i2c_blob, i2c_len, &im) == 1);
