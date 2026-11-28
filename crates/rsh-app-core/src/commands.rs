@@ -2002,18 +2002,18 @@ mod tests {
         let live = rsh_protocol::factory_default_blob();
         // Full editor map, no clutch: handbrake must stay slot 4, the
         // shifter up/down BUTTON records and the battery must survive.
-        let merged = merge_pin_map_into_blob(
-            &live,
-            &[
-                assignment("steering", 34),
-                assignment("accelerator", 35),
-                assignment("brake", 36),
-                assignment("handbrake", 32),
-                assignment("horn", 4),
-                assignment("led", 21),
-            ],
-        )
-        .expect("merge succeeds");
+        // v2.0.20: the factory blob (9 records) carries NO encoder
+        // records — encoders were deleted in v2.0.19 — so the merged
+        // blob has none either; the merge does not invent them.
+        let pins = [
+            assignment("steering", 34),
+            assignment("accelerator", 35),
+            assignment("brake", 36),
+            assignment("handbrake", 32),
+            assignment("horn", 4),
+            assignment("led", 21),
+        ];
+        let merged = merge_pin_map_into_blob(&live, &pins).expect("merge succeeds");
         let find = |rec_type: u8, slot: u8| {
             merged
                 .records
@@ -2027,9 +2027,47 @@ mod tests {
         assert_eq!(find(record_type::BUTTON, 1), Some(33), "shifter-down kept");
         assert_eq!(find(record_type::BUTTON, 2), Some(4));
         assert_eq!(find(record_type::BATTERY, 0), Some(39), "battery kept");
-        assert_eq!(find(record_type::ENCODER, 0), Some(23), "encoders kept");
-        assert_eq!(find(record_type::ENCODER, 1), Some(16));
+        assert_eq!(
+            find(record_type::ENCODER, 0),
+            None,
+            "no encoders in factory blob"
+        );
+        assert_eq!(
+            find(record_type::ENCODER, 1),
+            None,
+            "no encoders in factory blob"
+        );
         assert_eq!(merged.cfg_version, live.cfg_version);
+        // The merge itself still preserves encoder records when the
+        // live blob has them (a pre-v2.0.19 board blob): v2.0.20
+        // removed them from the factory blob, it did not change merge
+        // semantics — the firmware validator strips them on stage
+        // instead (firmware/config_transaction.h).
+        let mut old_live = rsh_protocol::factory_default_blob();
+        old_live
+            .records
+            .push(ConfigRecord::new(record_type::ENCODER, 0, 23, 19, 0xFF));
+        old_live
+            .records
+            .push(ConfigRecord::new(record_type::ENCODER, 1, 16, 17, 0xFF));
+        let merged_old = merge_pin_map_into_blob(&old_live, &pins).expect("merge succeeds");
+        let find_old = |rec_type: u8, slot: u8| {
+            merged_old
+                .records
+                .iter()
+                .find(|r| r.rec_type == rec_type && r.slot == slot)
+                .map(|r| r.pin_a)
+        };
+        assert_eq!(
+            find_old(record_type::ENCODER, 0),
+            Some(23),
+            "encoder kept when live blob has it"
+        );
+        assert_eq!(
+            find_old(record_type::ENCODER, 1),
+            Some(16),
+            "encoder kept when live blob has it"
+        );
     }
 
     #[test]
