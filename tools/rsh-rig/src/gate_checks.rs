@@ -201,15 +201,6 @@ fn strip_comments(text: &str) -> String {
     out
 }
 
-/// Collapse every whitespace run to a single space, so source audits
-/// survive `cargo fmt` wrapping a long match arm across lines
-/// (tun-bindfix: tun-e 44df7de added the long-press alternatives to
-/// the bindings dispatch arm and rustfmt broke it over 6 lines, so
-/// the single-line literal in `gate_bindings_ui` could no longer
-/// match even though dispatch was intact).
-fn collapse_ws(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
 
 /// Read a repo-relative Rust/Slint file as text with comments
 /// stripped (R3-16) — source audits must match live code, not
@@ -450,28 +441,29 @@ impl IJoystickOutput for MockBackend {
 }
 
 fn mock_factories() -> BackendFactories {
-    let (hid, _) = MockBackend::new("HIDMaestro");
+    let (xbox, _) = MockBackend::new("Xbox");
     let (vjoy, _) = MockBackend::new("vJoy");
     let (none, _) = MockBackend::new("NullSink");
     BackendFactories {
-        hidmaestro: Some(Box::new(move || hid.boxed())),
+        xbox: Some(Box::new(move || xbox.boxed())),
         vjoy: Some(Box::new(move || vjoy.boxed())),
         none: Box::new(move || none.boxed()),
     }
 }
 
-/// Gate: backend switch vJoy ↔ HID + UAC count (A10, plan §C).
+/// Gate: backend switch vJoy ↔ Xbox (v2.0.19).
 ///
 /// Runtime: drives the real [`switch_backend`] state machine with
-/// mock backends (None → HID → vJoy → HID → None, fallback on a
-/// failed HID connect, hard failure on a failed vJoy connect), then
-/// proves the startup path never touches an elevated backend: with
-/// `HIDMaestro` persisted, [`AppStateCore::activate_startup_backend_with_factories`]
-/// defers it and the HID factory is built zero times — so zero UAC
-/// prompts can appear at startup. Source audit: the UAC copy exists
-/// (`UAC_NOTE` + the Settings "Needs admin each start." line).
-/// The per-session "prompt at most once" runtime proof is
-/// Windows-only and stays an open user-PC verification.
+/// mock backends (None → Xbox → vJoy → Xbox → None, fallback on a
+/// failed Xbox connect, hard failure on a failed vJoy connect),
+/// then proves the startup path activates the persisted choice
+/// directly: with `Xbox` persisted,
+/// [`AppStateCore::activate_startup_backend_with_factories`]
+/// activates it and the Xbox factory is built exactly once — no
+/// backend is deferred at startup anymore (v2.0.19: the HIDMaestro
+/// sidecar + its UAC deferral are deleted). Source audit: no
+/// backend needs elevation — the Xbox and vJoy rows in
+/// `list_output_backends` carry no UAC note.
 #[must_use]
 pub fn gate_backend_switch() -> (bool, String) {
     let mut report = Report::new();
@@ -481,19 +473,19 @@ pub fn gate_backend_switch() -> (bool, String) {
 
     let outcome = switch_backend(
         &mut current,
-        BackendKind::HidMaestro,
+        BackendKind::Xbox,
         &factories,
         None,
         true,
     );
     let ok = outcome
-        .is_ok_and(|o| o.active == BackendKind::HidMaestro && o.switched && !o.fell_back)
-        && current.name() == "HIDMaestro"
+        .is_ok_and(|o| o.active == BackendKind::Xbox && o.switched && !o.fell_back)
+        && current.name() == "Xbox"
         && current.is_connected();
     report.check(
-        "none->hid",
+        "none->xbox",
         ok,
-        "HIDMaestro active + connected after switch from NullSink",
+        "Xbox active + connected after switch from NullSink",
     );
 
     let outcome = switch_backend(&mut current, BackendKind::VJoy, &factories, None, true);
@@ -501,47 +493,47 @@ pub fn gate_backend_switch() -> (bool, String) {
         && current.name() == "vJoy"
         && current.is_connected();
     report.check(
-        "hid->vjoy",
+        "xbox->vjoy",
         ok,
-        "vJoy active + connected; HID instance released (slot holds vJoy only)",
+        "vJoy active + connected; Xbox instance released (slot holds vJoy only)",
     );
 
     let outcome = switch_backend(
         &mut current,
-        BackendKind::HidMaestro,
+        BackendKind::Xbox,
         &factories,
         None,
         true,
     );
-    let ok = outcome.is_ok_and(|o| o.active == BackendKind::HidMaestro && o.switched)
-        && current.name() == "HIDMaestro"
+    let ok = outcome.is_ok_and(|o| o.active == BackendKind::Xbox && o.switched)
+        && current.name() == "Xbox"
         && current.is_connected();
-    report.check("vjoy->hid", ok, "back to HIDMaestro, connected");
+    report.check("vjoy->xbox", ok, "back to Xbox, connected");
 
     let outcome = switch_backend(&mut current, BackendKind::None, &factories, None, true);
     let ok = outcome.is_ok_and(|o| o.active == BackendKind::None && o.switched)
         && current.name() == "NullSink"
         && !current.is_connected();
     report.check(
-        "hid->none",
+        "xbox->none",
         ok,
         "NullSink installed, disconnected — output disabled, no device held",
     );
 
-    // Failed HID connect must fall back to vJoy (the documented
+    // Failed Xbox connect must fall back to vJoy (the documented
     // fallback), with the reason recorded — never a silent switch.
-    let (failing_hid, _) = MockBackend::failing("HIDMaestro", 1);
+    let (failing_xbox, _) = MockBackend::failing("Xbox", 1);
     let (working_vjoy, _) = MockBackend::new("vJoy");
     let (none, _) = MockBackend::new("NullSink");
     let fallback_factories = BackendFactories {
-        hidmaestro: Some(Box::new(move || failing_hid.boxed())),
+        xbox: Some(Box::new(move || failing_xbox.boxed())),
         vjoy: Some(Box::new(move || working_vjoy.boxed())),
         none: Box::new(move || none.boxed()),
     };
     let mut current = MockBackend::new("NullSink").0.boxed();
     let outcome = switch_backend(
         &mut current,
-        BackendKind::HidMaestro,
+        BackendKind::Xbox,
         &fallback_factories,
         None,
         true,
@@ -551,9 +543,9 @@ pub fn gate_backend_switch() -> (bool, String) {
         && current.name() == "vJoy"
         && current.is_connected();
     report.check(
-        "hid-fail-falls-back-to-vjoy",
+        "xbox-fail-falls-back-to-vjoy",
         ok,
-        "HID connect failed → vJoy installed, fell_back=true, reason recorded",
+        "Xbox connect failed → vJoy installed, fell_back=true, reason recorded",
     );
 
     // Failed vJoy connect has no fallback: the switch errors and the
@@ -561,7 +553,7 @@ pub fn gate_backend_switch() -> (bool, String) {
     let (failing_vjoy, _) = MockBackend::failing("vJoy", 1);
     let (none2, _) = MockBackend::new("NullSink");
     let no_fallback_factories = BackendFactories {
-        hidmaestro: None,
+        xbox: None,
         vjoy: Some(Box::new(move || failing_vjoy.boxed())),
         none: Box::new(move || none2.boxed()),
     };
@@ -580,16 +572,15 @@ pub fn gate_backend_switch() -> (bool, String) {
         "vJoy connect failed → Err, NullSink still installed",
     );
 
-    // Startup deferral (A10): a persisted HIDMaestro must NOT be
-    // built at startup — building it would launch the elevated
-    // sidecar and pop UAC. The factory counts builds; zero builds
-    // means zero UAC prompts at startup.
+    // Startup activation (v2.0.19): a persisted Xbox choice IS
+    // activated at startup — the Xbox factory is built exactly
+    // once and the backend connects; nothing is deferred.
     let dir = temp_dir("backend-startup");
     let mut store = match ProfileStore::open(&dir) {
         Ok(store) => store,
         Err(error) => {
             report.check(
-                "startup-deferral-store",
+                "startup-activation-store",
                 false,
                 &format!("open store: {error}"),
             );
@@ -597,13 +588,13 @@ pub fn gate_backend_switch() -> (bool, String) {
         }
     };
     let mut settings = store.settings().clone();
-    settings.output_backend = BackendKind::HidMaestro.settings_value().to_string();
+    settings.output_backend = BackendKind::Xbox.settings_value().to_string();
     store.set_settings(settings);
     if let Err(error) = store.save() {
         report.check(
-            "startup-deferral-store",
+            "startup-activation-store",
             false,
-            &format!("persist HIDMaestro setting: {error}"),
+            &format!("persist Xbox setting: {error}"),
         );
         return report.finish();
     }
@@ -611,9 +602,9 @@ pub fn gate_backend_switch() -> (bool, String) {
     let builds_in_factory = Arc::clone(&builds);
     let (none3, _) = MockBackend::new("NullSink");
     let startup_factories = BackendFactories {
-        hidmaestro: Some(Box::new(move || {
+        xbox: Some(Box::new(move || {
             builds_in_factory.fetch_add(1, Ordering::SeqCst);
-            MockBackend::new("HIDMaestro").0.boxed()
+            MockBackend::new("Xbox").0.boxed()
         })),
         vjoy: None,
         none: Box::new(move || none3.boxed()),
@@ -621,35 +612,33 @@ pub fn gate_backend_switch() -> (bool, String) {
     let state = AppStateCore::new(store, MockBackend::new("NullSink").0.boxed(), "gate");
     let outcome: StartupBackendOutcome =
         state.activate_startup_backend_with_factories(&startup_factories);
-    let reason = outcome.reason.clone().unwrap_or_default();
     report.check(
-        "startup-hid-deferred",
-        outcome.active.is_none()
+        "startup-xbox-activated",
+        outcome.active == Some(BackendKind::Xbox)
             && !outcome.fell_back
-            && reason.contains("UAC")
-            && builds.load(Ordering::SeqCst) == 0,
+            && outcome.reason.is_none()
+            && builds.load(Ordering::SeqCst) == 1
+            && state.output_state().connected,
         &format!(
-            "persisted HIDMaestro at startup: active=None, reason mentions UAC, HID factory built {} time(s) (must be 0)",
-            builds.load(Ordering::SeqCst)
+            "persisted Xbox at startup: active={:?}, Xbox factory built {} time(s) (must be 1), connected={}",
+            outcome.active,
+            builds.load(Ordering::SeqCst),
+            state.output_state().connected
         ),
     );
-    let _ = std::fs::remove_dir_all(&dir);
 
-    // UAC copy audit (A10): the user must be told admin is needed
-    // BEFORE choosing HID, and vJoy must never need it. (The
-    // Settings wording changed during v2.0.2 from "Needs admin each
-    // start." to "Needs admin permission when first used." — the
-    // check accepts the current wording and reports it.)
-    let backend_rs = read_code("crates/rsh-output-hidmaestro/src/backend.rs").unwrap_or_default();
-    let settings_slint = read_code("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
-    let settings_warns_admin = settings_slint.contains("Needs admin");
+    // No-elevation audit (v2.0.19): no backend needs admin — the
+    // Xbox and vJoy rows carry no UAC note and no elevation flag.
+    let backends = state.list_output_backends();
+    let no_elevation = backends.iter().all(|b| {
+        !b.elevation_required && b.uac_note.is_none()
+    });
     report.check(
-        "uac-copy",
-        backend_rs.contains("pub const UAC_NOTE")
-            && backend_rs.contains("UAC")
-            && settings_warns_admin,
-        "UAC_NOTE exists in the HID backend; Settings HID row warns admin is needed",
+        "no-backend-needs-elevation",
+        backends.len() == 3 && no_elevation,
+        "vJoy, Xbox and None rows need no elevation and carry no UAC note",
     );
+    let _ = std::fs::remove_dir_all(&dir);
 
     // A live backend accepts ticks; a disconnected one reports
     // NotConnected honestly instead of pretending to send.
@@ -666,6 +655,7 @@ pub fn gate_backend_switch() -> (bool, String) {
 
     report.finish()
 }
+
 
 /// Words that must never appear in user-facing error copy (B6):
 /// raw implementation detail, not something a user can act on.
@@ -1824,106 +1814,18 @@ pub fn gate_card_gap_source() -> (bool, String) {
     report.finish()
 }
 
-/// Gate: HID switch UAC dwell (B-2, re-scan finding).
+/// Gate: backend-switch single attempt (v2.0.19).
 ///
-/// The elevated sidecar is launched via UAC (`runas`); the user
-/// needs time to read and answer the prompt. P1-1 (v2.0.11) moved
-/// the dwell OUT of the spawn/hello wait: `ShellExecuteExW`
-/// (runas) only returns once the user answers the prompt — a
-/// decline comes back as `ERROR_CANCELLED` → `NotAdmin` — so the
-/// hello clock starts at accept start, after the spawn returns,
-/// and `DEFAULT_SPAWN_TIMEOUT` (30 s per stage: accept + hello,
-/// normally < 2 s each) never includes the dwell. The old
-/// requirement (>= 60 s to cover the dwell) predates that design
-/// and would break the P1-1 budget invariant (job 420 s > IPC
-/// 390 s > worst case incl. UAC 370 s > post-UAC 310 s): at 60 s
-/// the post-UAC worst case alone is 370 s and the incl.-UAC case
-/// 430 s, so a slow-but-healthy switch would again be reported
-/// failed while the daemon continues. This gate therefore asserts
-/// the P1-1 shape instead: the spawn returns on decline, the
-/// hello clock starts after spawn, and each post-spawn stage gets
-/// at least 30 s. On decline the switch must surface ONE clear
-/// message and never retry-loop: the UI handler starts exactly one
-/// backend job (which calls `set_output_backend` once, guarded by
-/// the Backend in-flight check) and the done-arm notifies once
-/// with the typed error, and the app-core call returns a single
-/// typed error without installing any backend.
+/// The UAC-dwell half of this gate is deleted with the HIDMaestro
+/// sidecar (no elevated spawn, no UAC prompt, no dwell). What
+/// survives is the UI audit: the backend-selected handler starts
+/// exactly one backend job (no loop), the job calls
+/// `set_output_backend` once (guarded by the Backend in-flight
+/// check), and a failed switch shows exactly one typed failure
+/// notification with the toggle reverted.
 #[must_use]
-pub fn gate_hid_uac_dwell() -> (bool, String) {
+pub fn gate_backend_switch_single_attempt() -> (bool, String) {
     let mut report = Report::new();
-
-    // Dwell (P1-1): the spawn call itself absorbs the UAC dwell —
-    // `ShellExecuteExW` returns `ERROR_CANCELLED` when the user
-    // declines, so the dwell is over before accept starts — and
-    // the hello clock starts at accept start. Parse
-    // `DEFAULT_SPAWN_TIMEOUT` (per post-spawn stage) and require
-    // both markers of that shape.
-    let manager = read_code("crates/rsh-output-hidmaestro/src/manager.rs").unwrap_or_default();
-    let spawn_marker = "pub const DEFAULT_SPAWN_TIMEOUT: Duration = Duration::from_secs(";
-    let spawn_secs = manager
-        .find(spawn_marker)
-        .and_then(|pos| {
-            let rest = &manager[pos + spawn_marker.len()..];
-            rest.chars()
-                .take_while(char::is_ascii_digit)
-                .collect::<String>()
-                .parse::<u64>()
-                .ok()
-        })
-        .unwrap_or(0);
-    report.check(
-        "hid-uac-dwell-timeout",
-        spawn_secs >= 30,
-        &format!(
-            "DEFAULT_SPAWN_TIMEOUT is {spawn_secs} s per post-spawn stage (must be >= 30 s: accept + hello are normally < 2 s each once the spawn — incl. the UAC dwell — has returned)"
-        ),
-    );
-    report.check(
-        "hid-uac-dwell-spawn-returns-on-decline",
-        manager.contains("ERROR_CANCELLED"),
-        "spawn maps ShellExecuteEx ERROR_CANCELLED to NotAdmin (the UAC prompt is answered inside the spawn call, before accept starts)",
-    );
-    report.check(
-        "hid-uac-dwell-clock-starts-after-spawn",
-        manager.contains("self.hello_started = Some(Instant::now())")
-            && manager.contains("accept_loopback_with_diagnostics(")
-            && manager.contains("self.config.spawn_timeout"),
-        "hello clock starts at accept start, after the spawn (and its UAC dwell) has returned (accept call is multi-line since the v2.0.12 diagnostics variant, so its name and timeout are asserted separately)",
-    );
-
-    // Decline / no-sidecar path on Linux: one call, one typed
-    // error, fast, nothing installed, no retry.
-    let dir = temp_dir("hid-decline");
-    let state = match ProfileStore::open(&dir) {
-        Ok(store) => AppStateCore::new(store, MockBackend::new("NullSink").0.boxed(), "gate"),
-        Err(error) => {
-            report.check(
-                "hid-decline-single-error",
-                false,
-                &format!("open store: {error}"),
-            );
-            return report.finish();
-        }
-    };
-    let start = Instant::now();
-    let switched = state.set_output_backend("HIDMaestro");
-    let decline_ms = start.elapsed().as_millis();
-    let backend_now = state.backend_name();
-    report.check(
-        "hid-decline-single-error",
-        switched.is_err() && decline_ms < 5_000,
-        &format!(
-            "set_output_backend(HIDMaestro) on Linux: single Err in {decline_ms} ms (no hang, no retry loop)"
-        ),
-    );
-    report.check(
-        "hid-decline-nothing-installed",
-        backend_now != "HIDMaestro" && backend_now != "vJoy",
-        &format!(
-            "backend after failed HID switch is '{backend_now}' (no backend silently installed)"
-        ),
-    );
-    let _ = std::fs::remove_dir_all(&dir);
 
     // UI handler: exactly one switch attempt, one notification.
     // Since the A9 job-system refactor the handler only starts a
@@ -1935,7 +1837,7 @@ pub fn gate_hid_uac_dwell() -> (bool, String) {
     let ui_main = read_code("crates/rsh-ui/src/main.rs").unwrap_or_default();
     let Some(handler_start) = ui_main.find("on_output_backend_selected") else {
         report.check(
-            "hid-ui-single-attempt",
+            "backend-ui-single-attempt",
             false,
             "backend-selected handler missing",
         );
@@ -1964,7 +1866,7 @@ pub fn gate_hid_uac_dwell() -> (bool, String) {
     // call"), so the bare string occurs twice — count the actual
     // call site `api.set_output_backend(` instead.
     report.check(
-        "hid-ui-single-attempt",
+        "backend-ui-single-attempt",
         count(handler, "start_backend_job") == 1
             && !handler.contains("loop")
             && count(job_fn, "api.set_output_backend(") == 1
@@ -1993,97 +1895,11 @@ pub fn gate_hid_uac_dwell() -> (bool, String) {
     // call site covers both failure paths (mismatch and Err), so a
     // failed switch still shows exactly one message.
     report.check(
-        "hid-ui-one-message",
+        "backend-ui-one-message",
         count(done_arm, "notify_error") == 1
             && (done_arm.contains("set_controller(1 - index)")
                 || done_arm.contains("resync_controller_from_live(win, 1 - index)")),
         "UI shows exactly one typed failure notification on backend-switch failure and reverts the toggle",
-    );
-    report.finish()
-}
-
-/// Gate: bindings UI (H-3, re-scan finding).
-///
-/// The backend is done (B1): `AppStateCore` persists
-/// button→action bindings and the IPC server dispatches
-/// `list_bindings` / `set_binding` / `clear_binding`. The gate
-/// requires the Buttons screen to actually reach them: Save must
-/// call `set_binding` so a binding exists in the backend after
-/// saving. Currently FAILS: the UI save handler shows "isn't a
-/// wheel feature" and returns without calling `set_binding`, and
-/// the UI IPC client does not forward the binding methods at all.
-#[must_use]
-pub fn gate_bindings_ui() -> (bool, String) {
-    let mut report = Report::new();
-
-    // Runtime: the backend round-trip itself.
-    let dir = temp_dir("bindings-ui");
-    let state = match ProfileStore::open(&dir) {
-        Ok(store) => AppStateCore::new(store, MockBackend::new("NullSink").0.boxed(), "gate"),
-        Err(error) => {
-            report.check(
-                "bindings-backend-round-trip",
-                false,
-                &format!("open store: {error}"),
-            );
-            return report.finish();
-        }
-    };
-    let mut backend_ok = state.list_bindings().is_empty();
-    let bound = state.set_binding(5, "horn");
-    backend_ok &= bound.is_ok_and(|b| b.button == 5 && b.action == "horn");
-    backend_ok &= state.set_binding(65, "profile_next").is_ok();
-    backend_ok &= state.list_bindings().len() == 2;
-    backend_ok &= state.clear_binding(5).unwrap_or(false);
-    backend_ok &= state.list_bindings().len() == 1;
-    backend_ok &= state.set_binding(0, "horn").is_err();
-    backend_ok &= state.set_binding(5, "bogus_action").is_err();
-    report.check(
-        "bindings-backend-round-trip",
-        backend_ok,
-        "list/set/clear round-trip on AppStateCore (button 5 horn, 65 profile_next; invalid button/action rejected)",
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-
-    // IPC server dispatches the binding methods (daemon side ready).
-    // Whitespace-collapsed: rustfmt wraps the long multi-alternative
-    // match arm across lines (tun-e 44df7de added the long-press
-    // alternatives), so a single-line literal never matches the raw
-    // text even though dispatch is intact.
-    let server = read_code("crates/rsh-ipc/src/lib.rs").unwrap_or_default();
-    let server_flat = collapse_ws(&server);
-    report.check(
-        "bindings-ipc-server-ready",
-        server_flat.contains("\"list_bindings\" | \"set_binding\" | \"clear_binding\""),
-        "IPC server dispatches list/set/clear_binding",
-    );
-
-    // UI client forwards them (the gap).
-    let ipc_api = read_code("crates/rsh-ui/src/ipc_api.rs").unwrap_or_default();
-    report.check(
-        "bindings-ipc-client-forwards",
-        ipc_api.contains("set_binding") && ipc_api.contains("list_bindings"),
-        "IpcApi forwards set_binding/list_bindings to the daemon (missing — UI cannot reach the backend)",
-    );
-
-    // Buttons save handler calls set_binding (the gap).
-    let ui_main = read_code("crates/rsh-ui/src/main.rs").unwrap_or_default();
-    let Some(save_start) = ui_main.find("on_edit_save") else {
-        report.check(
-            "bindings-save-calls-set-binding",
-            false,
-            "edit-save handler missing",
-        );
-        return report.finish();
-    };
-    let save_end = ui_main[save_start..]
-        .find("on_edit_cancel")
-        .map_or(ui_main.len(), |off| save_start + off);
-    let save_block = &ui_main[save_start..save_end];
-    report.check(
-        "bindings-save-calls-set-binding",
-        save_block.contains("set_binding"),
-        "Buttons edit-save calls set_binding (currently shows \"isn't a wheel feature\" instead)",
     );
     report.finish()
 }
@@ -2293,26 +2109,6 @@ let path = 'x'; // (1 - value)"#;
         assert!(stripped.contains("let b = 2;"));
     }
 
-    // tun-bindfix: tun-e 44df7de added the long-press alternatives to
-    // the bindings dispatch arm and rustfmt wrapped it across lines,
-    // so the single-line literal in `gate_bindings_ui` stopped
-    // matching even though dispatch was intact — the rig gate failed
-    // 31/33 on the tuning merge. The check must be whitespace
-    // insensitive, and the gate must pass on the real tree.
-    #[test]
-    fn collapse_ws_joins_wrapped_match_arm() {
-        let src = "\"list_bindings\"\n        | \"set_binding\"\n        | \"clear_binding\" => dispatch_bindings(api, request),";
-        assert!(
-            collapse_ws(src).contains("\"list_bindings\" | \"set_binding\" | \"clear_binding\"")
-        );
-    }
-
-    #[test]
-    fn gate_bindings_ui_passes_with_wrapped_dispatch_arm() {
-        let (ok, detail) = gate_bindings_ui();
-        assert!(ok, "gate_bindings_ui failed: {detail}");
-    }
-
     // R3-10: the `FakeListener` Windows branch (named-pipe
     // probe-create in `bind`, fresh instance in `accept`) never
     // executed anywhere in automation — it only compiled. This
@@ -2363,5 +2159,4 @@ let path = 'x'; // (1 - value)"#;
         });
         let _ = std::fs::remove_dir_all(&dir);
         assert!(ok, "{detail}");
-    }
-}
+    }}

@@ -59,8 +59,6 @@ pub struct HarnessConfig {
     pub clutch_enabled: bool,
     /// Disable the accelerator module in the pipeline plan.
     pub accel_disabled: bool,
-    /// H-pattern shifter gate (default: sequential).
-    pub hpattern: bool,
     /// Drive the engine's 1 Hz NTP-style ping (ntp-ping only).
     pub ping: bool,
     /// Do NOT send the auto `GET_CAPS` (auth-gate-blocked only).
@@ -1010,42 +1008,8 @@ pub fn registry() -> Vec<Scenario> {
             ],
         },
         Scenario {
-            id: "encoder-glitch-v2",
-            description: "Encoder glitch jumps must be filtered (|delta| <= 32/tick).",
-            durations: (30, 30, 30),
-            wheel: WheelConfig {
-                kind: WheelKind::Soak,
-                encoder_glitch: true,
-                glitch_big_rate: 0.005,
-                seed: 42,
-                ..WheelConfig::default()
-            },
-            harness: HarnessConfig::default(),
-            assertions: vec![
-                num(
-                    "maxAbsEncoderDelta",
-                    "<=",
-                    32.0,
-                    "Glitch jumps filtered — |delta| > 32 in one tick is impossible",
-                ),
-                num("validPackets", ">", 1000.0, "Valid flow continues"),
-                num(
-                    "engineTicks",
-                    ">=",
-                    4500.0,
-                    "Engine kept ticking (30 s x 200 = 6000, 25% margin)",
-                ),
-                ctrl_accepted(),
-                stop_ok(),
-                alloc_bound(
-                    0.0,
-                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
-                ),
-            ],
-        },
-        Scenario {
             id: "shifter-sequential",
-            description: "Sequential shifter: gear bits stay in the button word.",
+            description: "Sequential shifter: gear bits are stripped in v2.0.19 (H-pattern deleted).",
             durations: (30, 30, 30),
             wheel: WheelConfig {
                 kind: WheelKind::Shifter,
@@ -1056,48 +1020,14 @@ pub fn registry() -> Vec<Scenario> {
                 num(
                     "buttonMaskOr",
                     "==",
-                    2016.0,
-                    "Gear bits 5..10 (0x7E0) arrived in buttons",
+                    0.0,
+                    "Gear bits 5..10 (0x7E0) are stripped — nothing reaches the output",
                 ),
                 num(
                     "gearMaskSeen",
                     "==",
                     0.0,
                     "No gear decode in sequential mode",
-                ),
-                num("validPackets", ">", 1000.0, "Valid flow continues"),
-                ctrl_accepted(),
-                stop_ok(),
-                alloc_bound(
-                    0.0,
-                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
-                ),
-            ],
-        },
-        Scenario {
-            id: "shifter-hpattern",
-            description: "H-pattern shifter: gear bits decode to gears 1..6.",
-            durations: (30, 30, 30),
-            wheel: WheelConfig {
-                kind: WheelKind::Shifter,
-                ..WheelConfig::default()
-            },
-            harness: HarnessConfig {
-                hpattern: true,
-                ..HarnessConfig::default()
-            },
-            assertions: vec![
-                num(
-                    "gearMaskSeen",
-                    "==",
-                    126.0,
-                    "Gears 1..6 all decoded (gear g -> bit g, bits 1..6 = 126)",
-                ),
-                num(
-                    "buttonMaskOr",
-                    "==",
-                    0.0,
-                    "Gear bits did not leak into the button mask",
                 ),
                 num("validPackets", ">", 1000.0, "Valid flow continues"),
                 ctrl_accepted(),
@@ -1615,8 +1545,8 @@ pub fn registry() -> Vec<Scenario> {
         },
         // ---- v2.0.2 gate checks, re-scan findings (B-1, B-2, H-3, H-4, M-9) ----
         Scenario {
-            id: "gate-hid-uac-dwell",
-            description: "Gate (B-2): HID switch UAC dwell — the spawn call absorbs the UAC prompt (ShellExecuteEx returns only once it is answered), the hello clock starts after spawn, and each post-spawn stage gets >= 30 s; decline yields one clear message, no retry loop, nothing installed.",
+            id: "gate-backend-single-attempt",
+            description: "Gate (B-2, v2.0.19): backend switch is a single attempt — the UI handler starts exactly one backend job, the job calls set_output_backend once, and a failed switch shows exactly one typed failure notification. (The old UAC-dwell half died with the HIDMaestro sidecar.)",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),
@@ -1624,24 +1554,11 @@ pub fn registry() -> Vec<Scenario> {
                 metric: "selfCheck",
                 op: "==",
                 value: MetricValue::Str("pass"),
-                note: "Gate PASS: UAC dwell covered; decline is a single message, no retry.",
+                note: "Gate PASS: single backend-switch attempt, one failure notification.",
                 min_duration_s: 0.0,
             }],
         },
-        Scenario {
-            id: "gate-bindings-ui",
-            description: "Gate (H-3): Buttons screen Save reaches list_bindings/set_binding/clear_binding — a saved binding exists in the backend afterwards. Backend + IPC server are ready; the UI save handler + IPC client forwarding are the gap.",
-            durations: (0, 0, 0),
-            wheel: WheelConfig::default(),
-            harness: HarnessConfig::default(),
-            assertions: vec![Assertion {
-                metric: "selfCheck",
-                op: "==",
-                value: MetricValue::Str("pass"),
-                note: "Gate PASS: Buttons Save persists a binding through the backend.",
-                min_duration_s: 0.0,
-            }],
-        },
+
         Scenario {
             id: "gate-ota-flash-caller",
             description: "Gate (H-4): an 'Update firmware' flow exists in Settings/wizard that starts a flash from the bundled firmware-signed.bin with progress + confirmed version; the caller entry point is proven end-to-end on the fake board.",

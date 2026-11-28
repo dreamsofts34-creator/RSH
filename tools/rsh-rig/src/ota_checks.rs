@@ -480,8 +480,10 @@ pub fn self_check_upgrade_preserve() -> (bool, String) {
             || !settings.autostart
             || settings.esp_ip != "192.168.4.100"
             || settings.vjoy_device_id != 3
-            || settings.output_backend != "HIDMaestro"
-            || settings.hid_maestro_profile_id != "hm-7"
+            // v2.0.19: a persisted "HIDMaestro" backend migrates to
+            // vJoy on load (the backend is deleted), and the
+            // `hid_maestro_profile_id` setting is dropped with it.
+            || settings.output_backend != "VJoy"
             || settings.log_level != "Debug"
             || !settings.wizard_completed
             || settings.auto_switch_profiles
