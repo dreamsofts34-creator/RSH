@@ -809,13 +809,12 @@ impl ProcessSpawner for SystemSpawner {
                 let mut ok = win32::Process32FirstW(snapshot, &raw mut entry);
                 while ok != 0 {
                     let pid = entry.th32_process_id;
-                    if pid != 0 {
-                        if let Some(image) = self.exe_path(pid) {
-                            if paths_equal(&image, exe) {
-                                found = Some(pid);
-                                break;
-                            }
-                        }
+                    if pid != 0
+                        && let Some(image) = self.exe_path(pid)
+                        && paths_equal(&image, exe)
+                    {
+                        found = Some(pid);
+                        break;
                     }
                     ok = win32::Process32NextW(snapshot, &raw mut entry);
                 }
