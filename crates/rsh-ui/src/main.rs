@@ -939,9 +939,6 @@ enum JobKind {
     /// Profile operations (F6, v2.0.3): activate / create /
     /// duplicate / delete / rename / link / save / discard.
     ProfileOp,
-    /// Button / knob mapping (F6, v2.0.3): set / clear binding,
-    /// set knob action.
-    BindingOp,
     /// Capture (F6, v2.0.3): centre / pedal min-max.
     CaptureOp,
     /// Learn poll (F6, v2.0.3): the 1 Hz `take_learned_button` /
@@ -1029,7 +1026,6 @@ impl JobKind {
             JobKind::Transport
             | JobKind::RawAvailable
             | JobKind::ProfileOp
-            | JobKind::BindingOp
             | JobKind::CaptureOp
             | JobKind::LearnOp
             | JobKind::LearnToggle => Duration::from_secs(5),
@@ -1051,7 +1047,6 @@ impl JobKind {
             // in-flight reconnect / backend switch.
             JobKind::TuningPush => 7,
             JobKind::ProfileOp => 8,
-            JobKind::BindingOp => 9,
             JobKind::CaptureOp => 10,
             JobKind::LearnOp => 11,
             // R2-35: the toggle has its OWN strip slot (17), not
@@ -2909,20 +2904,6 @@ impl Ctx {
         );
         set_if_changed(win.get_unsaved(), self.unsaved.get(), |v| {
             win.set_unsaved(v);
-        });
-        // H10: pressed-index comes ONLY from live button state — the
-        // first pressed wheel button (1–12) highlights its tile
-        // (including while learning — the physical button being held
-        // lights up); -1 when nothing is pressed.
-        let pressed_index = if live {
-            (0..12)
-                .find(|i| snap.button_mask & (1_u64 << i) != 0)
-                .unwrap_or(-1)
-        } else {
-            -1
-        };
-        set_if_changed(win.get_pressed_index(), pressed_index, |v| {
-            win.set_pressed_index(v);
         });
         // Pedal mini-curve markers (A1): live pct + cached feel.
         {
@@ -13589,7 +13570,6 @@ mod tests {
             (JobKind::RawAvailable, 5),
             (JobKind::TuningPush, 7),
             (JobKind::ProfileOp, 8),
-            (JobKind::BindingOp, 9),
             (JobKind::CaptureOp, 10),
             (JobKind::LearnOp, 11),
             // R2-35: the toggle has its own strip slot (17, see
