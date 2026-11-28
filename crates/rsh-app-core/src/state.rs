@@ -8667,13 +8667,15 @@ where
 /// must be plain `#[test]`, never `#[tokio::test]`.
 ///
 /// DS-02 (P0 audit): the only in-runtime caller was the daemon
-/// manager loop's tray "Restart wheel" path (now `spawn_blocking`,
-/// see `rsh-daemon/src/main.rs`); every other caller reaches here
-/// via IPC dispatch on `spawn_blocking` (safe — no runtime context)
-/// or from a plain thread / test. As a backstop this function now
-/// FAILS with an error instead of panicking when it is called from
-/// inside a runtime: a future misuse degrades one command instead
-/// of killing its caller task.
+/// manager loop's tray "Restart wheel" path (now a plain
+/// `std::thread::spawn` thread, see `rsh-daemon/src/main.rs` —
+/// `spawn_blocking` misfired the guard under tokio 1.54.1, v2.0.20
+/// Bug 3); every other caller reaches here via IPC dispatch on
+/// `spawn_blocking` (safe — no runtime context) or from a plain
+/// thread / test. As a backstop this function now FAILS with an
+/// error instead of panicking when it is called from inside a
+/// runtime: a future misuse degrades one command instead of
+/// killing its caller task.
 fn block_on_control<R>(future: impl Future<Output = Result<R, String>>) -> Result<R, String> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return Err(

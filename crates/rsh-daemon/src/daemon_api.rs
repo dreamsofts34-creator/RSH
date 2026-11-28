@@ -362,6 +362,27 @@ impl DaemonApi {
     }
 }
 
+/// v2.0.20 (Bug 3): run an H5 control call on a plain thread and
+/// join it. `block_on_control` builds its own tokio runtime, so it
+/// must run with NO runtime context — but IPC dispatch runs
+/// handlers on `spawn_blocking`, whose worker enters a runtime
+/// context (proven with a scratch probe under tokio 1.54.1:
+/// `Handle::try_current()` is `Ok` there), so every H5 call via
+/// IPC failed with the DS-02 error instead of reaching the board.
+/// A plain `std::thread::spawn` thread has no context; the join
+/// waits for the outcome. The work must be `Send + 'static` — in
+/// practice it only ever captures an `Arc<AppStateCore>` plus owned
+/// values. A panicked thread surfaces as an error, never a panic
+/// in the IPC handler.
+fn on_plain_thread<R: Send + 'static>(
+    work: impl FnOnce() -> Result<R, String> + Send + 'static,
+) -> Result<R, String> {
+    std::thread::spawn(work)
+        .join()
+        .map_err(|_| "control thread panicked".to_string())
+        .and_then(|inner| inner)
+}
+
 impl AppApi for DaemonApi {
     fn version(&self) -> String {
         app_version().to_string()
@@ -390,6 +411,15 @@ impl AppApi for DaemonApi {
             ApiTransport::Wifi => TransportKind::Udp,
             ApiTransport::Usb => TransportKind::Serial,
         };
+        // v2.0.20 (Bug 1): record the requested transport FIRST —
+        // the watchdog rebuild and the manager retry rebuild on the
+        // RECORDED transport (`transport_request().0`), and nothing
+        // ever recorded it here, so a USB connect that later stalled
+        // was silently rebuilt on Wi-Fi (the default). The IPC
+        // payload carries no address, so the recorded address is
+        // empty (serial re-detects the port; Wi-Fi reads `esp_ip`
+        // from settings when reporting).
+        self.state.set_transport_request(kind, String::new());
         let outcome = self
             .state
             .connect_transport_with_outcome(kind)
@@ -495,8 +525,12 @@ impl AppApi for DaemonApi {
         // the board on the new password and the message must say
         // so plainly.
         let previous_password = self.state.stored_wifi_password();
-        self.state
-            .set_password(password)
+        // v2.0.20 (Bug 3): `set_password` is an H5 control call
+        // (`block_on_control`) — it must run on a plain thread, not
+        // on this IPC `spawn_blocking` worker (DS-02 otherwise).
+        let state = Arc::clone(&self.state);
+        let password_owned = password.to_string();
+        on_plain_thread(move || state.set_password(&password_owned))
             .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))?;
         // D8: the WLAN profile update is part of the same call.
         // On Linux this returns manual instructions (the daemon
@@ -511,7 +545,10 @@ impl AppApi for DaemonApi {
             // Best-effort: whatever happens, the message states the
             // partial state plainly with the manual rejoin step.
             return Err(match previous_password {
-                Some(previous) => match self.state.set_password(&previous) {
+                Some(previous) => match on_plain_thread({
+                    let state = Arc::clone(&self.state);
+                    move || state.set_password(&previous)
+                }) {
                     Ok(()) => UserError::from_connection(
                         ConnectionError::Unknown,
                         format!(
@@ -718,9 +755,11 @@ impl AppApi for DaemonApi {
     }
 
     fn shifter_sensitivity(&self) -> Result<Option<u8>, UserError> {
-        let config = self
-            .state
-            .get_config()
+        // v2.0.20 (Bug 3): `get_config` is an H5 control call — it
+        // must run on a plain thread, not on this IPC
+        // `spawn_blocking` worker (DS-02 otherwise).
+        let state = Arc::clone(&self.state);
+        let config = on_plain_thread(move || state.get_config())
             .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))?;
         Ok(shifter_sensitivity_from_config(&config))
     }
@@ -739,15 +778,23 @@ impl AppApi for DaemonApi {
                 "shifter sensitivity {sensitivity} is outside 0..=100"
             )));
         }
-        let config = self.state.get_config().map_err(&err)?;
-        let updated = set_shifter_sensitivity_in_config(&config, sensitivity).map_err(&err)?;
-        self.state.stage_config(&updated).map_err(&err)?;
-        self.state.commit_config().map_err(&err)?;
-        if let Err(confirm_err) = self.state.confirm_config().map_err(&err) {
-            let _ = self.state.rollback_config();
-            return Err(confirm_err);
-        }
-        Ok(sensitivity)
+        // v2.0.20 (Bug 3): the whole config transaction is H5
+        // control calls — the sequence runs on one plain thread,
+        // not on this IPC `spawn_blocking` worker (DS-02
+        // otherwise). The board-side transaction is unchanged.
+        let state = Arc::clone(&self.state);
+        on_plain_thread(move || {
+            let config = state.get_config()?;
+            let updated = set_shifter_sensitivity_in_config(&config, sensitivity)?;
+            state.stage_config(&updated)?;
+            state.commit_config()?;
+            if let Err(confirm_err) = state.confirm_config() {
+                let _ = state.rollback_config();
+                return Err(confirm_err);
+            }
+            Ok(sensitivity)
+        })
+        .map_err(err)
     }
 
     fn draft_status(&self) -> Option<DraftStatus> {
@@ -1454,6 +1501,70 @@ mod tests {
         assert_eq!(
             plain.connect_started, None,
             "a plain read carries no connect outcome"
+        );
+        let _ = api.disconnect();
+        let _ = api.state.stop_engine();
+    }
+
+    /// v2.0.20 (Bug 3): `connect` records the requested transport
+    /// BEFORE connecting — the watchdog rebuild reads
+    /// `transport_request().0`, and before this fix nothing ever
+    /// recorded it, so a USB wheel that stalled was rebuilt on
+    /// Wi-Fi. No serial board exists in the sandbox, so the USB
+    /// connect itself errors — but the record must already say
+    /// Serial, because the record (not the outcome) is what the
+    /// rebuild follows.
+    #[test]
+    fn connect_records_requested_transport_before_connecting() {
+        let (api, _dir) = live_api();
+        assert_eq!(
+            api.state.transport_request().0,
+            TransportKind::Udp,
+            "default is Wi-Fi"
+        );
+        let result = api.connect(ApiTransport::Usb);
+        assert!(result.is_err(), "no serial board in the sandbox");
+        assert_eq!(
+            api.state.transport_request().0,
+            TransportKind::Serial,
+            "the USB request is recorded even though the connect failed"
+        );
+        let _ = api.disconnect();
+        let _ = api.state.stop_engine();
+    }
+
+    /// v2.0.20 (Bug 3): H5 control calls via the IPC dispatch shape
+    /// (`spawn_blocking` inside a runtime) must reach the board
+    /// instead of failing with the DS-02 guard error. No board
+    /// exists in the sandbox, so the call fails — but with a
+    /// board-unreachable error (HELLO timeout), never DS-02.
+    /// `set_shifter_sensitivity` is the probe: its first step is
+    /// `get_config`, an H5 call. (Pre-fix this failed with
+    /// "control command called from inside a tokio runtime" — the
+    /// same root cause as the tray restart. `set_wifi_password`
+    /// shares the fix via `on_plain_thread`.)
+    #[test]
+    fn h5_control_call_from_ipc_spawn_blocking_reaches_the_board() {
+        let (api, _dir) = live_api();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let result = rt.block_on(async {
+            let api = Arc::clone(&api);
+            tokio::task::spawn_blocking(move || api.set_shifter_sensitivity(50))
+                .await
+                .expect("blocking task")
+        });
+        let err = result.expect_err("no board in the sandbox — must fail");
+        let detail = err.detail.clone().unwrap_or_default();
+        assert!(
+            !detail.contains("DS-02") && !detail.contains("inside a tokio runtime"),
+            "must not fail with the DS-02 guard error: {detail}"
+        );
+        assert!(
+            detail.contains("HELLO") || detail.contains("board"),
+            "must have reached the board exchange, got: {detail}"
         );
         let _ = api.disconnect();
         let _ = api.state.stop_engine();

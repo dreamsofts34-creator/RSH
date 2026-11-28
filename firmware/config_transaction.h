@@ -198,6 +198,65 @@ static inline size_t rsh_cfg_blob_build(uint8_t *out, const uint8_t *records,
   return total;
 }
 
+// ---------- Legacy migration (v2.0.20 / RC-2) ----------
+// 2.0.15-era stored blob (11 records, 2 ENCODER records samet) ko
+// 4.0.7 ka validator reject karta hai (type 5 -> UNSUPPORTED), is
+// liye boot factory fallback leta tha — jis mein clutch record NAHI
+// hai, to clutch hamesha 0 rehta tha. Ye helper sirf BOOT migration
+// ke liye hai (rsh.ino): ENCODER records nikaal kar blob dobara
+// banata hai (header count + CRC32 naye), baaqi records byte-for-byte
+// waisi hi. Validator UNTOUCHED hai — naya SET_CFG commit abhi bhi
+// ENCODER records fail-closed reject karta hai (v2.0.19); sirf
+// pehle se stored purana blob migrate hota hai.
+//   blob: source blob (len bytes), out: kam az kam len bytes ka
+//     buffer (in-place allowed: `out == blob` — kept records sirf
+//     aage copy hote hain, kabhi peeche nahi, kyun ke destination
+//     index hamesha source index se <= hota hai).
+//   Return: nayi length (> 0), ya 0 — koi ENCODER record nahi, ya
+//     source ki shape/CRC kharab hai. Khaas taur par: source CRC32
+//     pehle verify hoti hai — corrupt blob ki "migration" usay
+//     naya CRC de kar saaf nahi karti.
+static inline size_t rsh_cfg_strip_encoder_records(const uint8_t *blob, size_t len,
+                                                   uint8_t *out) {
+  if (!blob || !out) return 0;
+  if (len < RSH_CFG_HEADER_SIZE + RSH_CFG_TRAILER_SIZE) return 0;
+  if (blob[0] != 'R' || blob[1] != 'S' || blob[2] != 'H' || blob[3] != 'G') return 0;
+  if (blob[4] != RSH_CFG_SCHEMA) return 0;
+  uint8_t mc = blob[5];
+  if (len != (size_t)RSH_CFG_HEADER_SIZE + (size_t)RSH_CFG_RECORD_SIZE * mc +
+                 RSH_CFG_TRAILER_SIZE)
+    return 0;
+  // Source CRC32 pehle: corrupt blob migrate nahi hota.
+  if (rsh_crc32(blob, len - RSH_CFG_TRAILER_SIZE) !=
+      rsh_get_u32(blob + len - RSH_CFG_TRAILER_SIZE))
+    return 0;
+  uint8_t kept = 0;
+  uint8_t removed = 0;
+  for (uint8_t i = 0; i < mc; i++) {
+    const uint8_t *r = blob + RSH_CFG_HEADER_SIZE + (size_t)i * RSH_CFG_RECORD_SIZE;
+    if (r[0] == RSH_CFG_TYPE_ENCODER) {
+      removed++;
+      continue;
+    }
+    memcpy(out + RSH_CFG_HEADER_SIZE + (size_t)kept * RSH_CFG_RECORD_SIZE, r,
+           RSH_CFG_RECORD_SIZE);
+    kept++;
+  }
+  if (removed == 0) return 0;
+  out[0] = 'R';
+  out[1] = 'S';
+  out[2] = 'H';
+  out[3] = 'G';
+  out[4] = RSH_CFG_SCHEMA;
+  out[5] = kept;
+  rsh_put_u16(out + 6, rsh_get_u16(blob + 6));
+  size_t total = (size_t)RSH_CFG_HEADER_SIZE + (size_t)RSH_CFG_RECORD_SIZE * kept +
+                 RSH_CFG_TRAILER_SIZE;
+  rsh_put_u32(out + total - RSH_CFG_TRAILER_SIZE,
+              rsh_crc32(out, total - RSH_CFG_TRAILER_SIZE));
+  return total;
+}
+
 // Factory default blob — POORA pin map (§3.6 slot scheme, PC builder
 // jaisa; Phase G C3). Replace semantics hai (pinmap.h): jis function ka
 // record NAHI hai, board usay sample NAHI karta — is liye factory blob

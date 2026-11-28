@@ -1,10 +1,76 @@
 # Changelog — RSH (Real Sim Hub)
 
 All notable changes to the RSH app and firmware. Current versions:
-**app v2.0.19 · firmware v4.0.7 · protocol v2.2 (frozen)**.
+**app v2.0.20 · firmware v4.0.8 · protocol v2.2 (frozen)**.
 Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
+
+## [2.0.20] — 2026-11-28 (regression hunt: v2.0.15→v2.0.19 bisect — handbrake rail freeze, legacy config loss, transport-record + retry + tray bugs)
+
+App 2.0.20 + firmware 4.0.8 (protocol v2.2 frozen — no wire-format
+change: the stream still carries one `axis_invalid` bit, the config
+blob shape is unchanged).
+
+**RC-1: released handbrake no longer freezes every axis.** A
+released handbrake sits at rail (0) by design, and the firmware
+health check flagged that as rail-stuck (`axisInvalidMask |=
+0x10`) — the pipeline then held all five axes at their last good
+values while the wheel moved. Two layers close it. First, the
+handbrake health check no longer runs the rail test at all
+(button-mode/I2C axes never did). Second — the actual closer,
+from the user's own patch (`rsh-fw-handbrake-fix.zip`, verified
+in-tree): `inputs_axis_invalid()` now looks at mask bits 0–3
+only, so handbrake bit 4 is diagnostic-only and never raises
+the global stream flag. The rail fix alone was NOT enough: an
+unplugged/floating handbrake pin trips the jitter rule too (EMA
+> 150 counts) with no rail involved, so only the mask keeps bit
+4 out of the flag. The pipeline's P2-1 hold is per-axis now:
+when `axis_invalid` is set, only the axis whose sample sits at
+rail (0 or 3300 mV) is held — every other axis keeps flowing
+live. When no axis is at rail (the flag came from jitter or an
+I2C failure, which no frame value can identify), the old
+hold-everything behaviour stays as the safe fallback.
+
+**RC-2: a 2.0.15-era stored config blob loads again.** Firmware
+4.0.7's validator rejects ENCODER (type 5) records, so a stored
+11-record blob from 2.0.15 failed validation at boot and fell
+back to the 9-record factory blob — which has no clutch record,
+so the clutch read 0 forever. Boot now migrates: when the stored
+`cur` (or `lkg`) blob fails to load, the firmware strips the
+ENCODER records, revalidates (the source CRC must check out
+first — a corrupt blob is never laundered), and loads the
+migrated blob, saving it back to its NVS slot so the migration
+runs once. New SET_CFG commits still reject ENCODER records
+fail-closed, exactly as in v2.0.19.
+
+**Transport bugs (pre-existing).** `DaemonApi::connect` now
+records the requested transport before connecting, so the
+watchdog rebuild and the manager retry rebuild on the transport
+the user actually asked for instead of silently falling back to
+Wi-Fi. A transport switch clicked while a retry is already in
+flight is now treated as a failure in the UI: the toggle reverts
+and a "retry in flight, try again" message shows, instead of the
+UI showing the new transport while the daemon stays on the old
+one. Tray "Restart wheel" no longer fails with the DS-02 tokio
+error: it runs on a plain `std::thread::spawn` thread (no
+runtime context) instead of `spawn_blocking`, whose worker
+closure runs with a runtime context entered under tokio 1.54.1.
+The same root cause broke every H5 control call made through
+IPC (the IPC server also dispatches on `spawn_blocking`), so
+`set_wifi_password`, `set_shifter_sensitivity`, and the
+`shifter_sensitivity` getter now run their board calls on a
+plain thread too — before this fix, setting the Wi-Fi password
+or the shifter sensitivity from the app always failed with
+DS-02.
+
+**Factory blob mismatch (PC side).** The Rust
+`factory_default_blob()` still carried 11 records / 188 B
+with 2 ENCODER records, while the firmware factory blob is 9
+records / 156 B (encoders deleted in v2.0.19) — PC and
+firmware disagreed on what "factory" means. The Rust blob now
+matches the firmware exactly (9 records, 156 B); the affected
+tests were updated to the new sizes.
 
 ## [2.0.19] — 2026-11-28 (cleanup + ViGEmBus Xbox backend: only 7 inputs remain)
 

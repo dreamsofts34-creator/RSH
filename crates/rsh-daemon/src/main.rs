@@ -336,27 +336,31 @@ async fn manager_loop(
                     None => log_line(verbose, &format!("tray: unknown game '{key}' — ignored")),
                 },
                 TrayAction::RestartWheel => {
-                    // DS-02 (P0): `restart_wheel` is a sync H5 command
-                    // built on `block_on_control` (fresh runtime +
-                    // `block_on`) — calling it here, inside this tokio
-                    // task, panics ("Cannot start a runtime from
-                    // within a runtime") and kills the manager loop
-                    // silently (proven with a scratch tokio probe).
-                    // Run it on the blocking pool instead, where
-                    // there is no runtime context; the loop awaits
-                    // the outcome and logs it like every other
-                    // tray action.
+                    // v2.0.20 (Bug 3): `restart_wheel` is a sync H5
+                    // command built on `block_on_control` (fresh
+                    // runtime + `block_on`) — it must run on a
+                    // thread with NO tokio runtime context, or the
+                    // DS-02 guard errors ("control command called
+                    // from inside a tokio runtime"). `spawn_blocking`
+                    // used to be that thread, but under tokio
+                    // 1.54.1 the blocking pool enters the runtime
+                    // context before running the closure, so the
+                    // guard misfired and every tray restart failed
+                    // with DS-02. A plain `std::thread::spawn`
+                    // thread has no runtime context at all; joining
+                    // it here waits for the outcome exactly like
+                    // the old `spawn_blocking(...).await` did (the
+                    // manager loop already waits out this action,
+                    // and the runtime has 2 workers, so one blocked
+                    // worker stalls nothing else).
                     let state = Arc::clone(&api.state);
-                    match tokio::task::spawn_blocking(move || state.restart_wheel()).await {
+                    match std::thread::spawn(move || state.restart_wheel()).join() {
                         Ok(Ok(())) => log_line(verbose, "tray: wheel restart requested"),
                         Ok(Err(error)) => {
                             log_line(verbose, &format!("tray: wheel restart failed: {error}"));
                         }
-                        Err(error) => {
-                            log_line(
-                                verbose,
-                                &format!("tray: wheel restart task failed: {error}"),
-                            );
+                        Err(_) => {
+                            log_line(verbose, "tray: wheel restart task failed: thread panicked");
                         }
                     }
                 }
@@ -3195,6 +3199,39 @@ mod tests {
         assert_eq!(pipe_in_use_backoff(4), Duration::from_millis(800));
         assert_eq!(pipe_in_use_backoff(5), Duration::from_secs(1));
         assert_eq!(pipe_in_use_backoff(100), Duration::from_secs(1));
+    }
+
+    /// v2.0.20 (Bug 3): the tray "Restart wheel" path — a plain
+    /// `std::thread::spawn` thread from inside the tokio runtime —
+    /// must run `restart_wheel` past the DS-02 guard. No board in
+    /// the sandbox, so it fails — but with a board-unreachable
+    /// error, never DS-02. (Pre-fix, `spawn_blocking` misfired the
+    /// guard and every tray restart failed with DS-02; a scratch
+    /// probe under tokio 1.54.1 showed `Handle::try_current()` is
+    /// `Ok` inside `spawn_blocking` and `Err` on a plain thread.)
+    #[test]
+    fn tray_restart_wheel_on_plain_thread_reaches_the_board() {
+        let dir = temp_dir("tray-restart-plain-thread");
+        let state = Arc::new(AppStateCore::open_with_null_sink(&dir).expect("open state"));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let result = rt.block_on(async {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || state.restart_wheel())
+                .join()
+                .expect("restart thread")
+        });
+        let err = result.expect_err("no board in the sandbox — must fail");
+        assert!(
+            !err.contains("DS-02") && !err.contains("inside a tokio runtime"),
+            "must not fail with the DS-02 guard error: {err}"
+        );
+        assert!(
+            err.contains("HELLO") || err.contains("board"),
+            "must have reached the board exchange, got: {err}"
+        );
     }
 
     #[test]

@@ -1259,7 +1259,7 @@ fn self_check_config_transaction() -> (bool, String) {
         return (false, "factory blob encode failed".into());
     };
     // Chunk the blob at 64 B per SET_CFG (NOT the 1024 B wire max):
-    // the factory blob is 188 B, so 1024 B chunks would make it a
+    // the factory blob is 156 B, so 1024 B chunks would make it a
     // single chunk and the "incomplete staging" case below could not
     // be incomplete — start(chunks[0]) would already hold the whole
     // blob and finish() would (correctly) succeed. At 64 B the blob

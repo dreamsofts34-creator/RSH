@@ -248,7 +248,7 @@ def main():
 
     h = parse_hello(vec.VECTORS["hello_safe_mode"])
     check(h["flags"] == 0x04 and h["session_echo"] == 1, "hello safe-mode: flags/sessionEcho")
-    check(h["board_mac"] == vec.TEST_MAC and h["fw"] == (4, 0, 7), "hello safe-mode: mac/fw 4.0.7")
+    check(h["board_mac"] == vec.TEST_MAC and h["fw"] == (4, 0, 8), "hello safe-mode: mac/fw 4.0.8")
     check(h["nonce"] == b"\x00" * 16 and h["device_key"] == b"\x00" * 32,
           "hello safe-mode: nonce/device_key zero (reserved)")
     check(h["wifi_password"] == b"\x00" * 24, "hello safe-mode: wifi password zero (reserved)")
@@ -272,8 +272,8 @@ def main():
           "ctrl reply: cmd 0x81, status OK")
     check(r["payload"][1:7] == vec.TEST_MAC and r["payload"][13] == 64,
           "ctrl reply: GET_CAPS body (mac, nBtnMax 64)")
-    check(r["payload"][9] == 7 and r["payload"][10] == 2 and r["payload"][11] == 2,
-          "ctrl reply: fw 4.0.7 / proto 2.2")
+    check(r["payload"][9] == 8 and r["payload"][10] == 2 and r["payload"][11] == 2,
+          "ctrl reply: fw 4.0.8 / proto 2.2")
     check(vec.ctrl_crc_ok(vec.VECTORS["ctrl_get_caps_reply"]), "ctrl reply: CRC verifies")
     sp = parse_ctrl_structure(vec.VECTORS["ctrl_set_password"])
     check(sp["cmd"] == 0x0C and sp["req_id"] == 3, "ctrl SET_PASSWORD: fields")

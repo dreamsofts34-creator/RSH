@@ -253,7 +253,20 @@ bool inputs_axis_is_mv(uint8_t slot) {
 }
 SampleGovernor &inputs_governor() { return governor; }
 uint8_t inputs_axis_invalid_mask() { return axisInvalidMask; }
-bool inputs_axis_invalid() { return axisInvalidMask != 0; }
+// v2.0.20 fix (user patch rsh-fw-handbrake-fix.zip, verified): the
+// wire carries ONE axis-invalid flag and the PC holds EVERY axis
+// (steering included) at its last good value while it is set.
+// F-04 (4.0.6) added handbrake health (bit 4) into that global
+// flag — an unplugged/floating handbrake pin (GPIO32 is ON in the
+// factory map) then froze steering + pedals completely (4.0.5
+// never looked at the handbrake). Bit 4 stays in the per-axis
+// mask (kept for diagnostics) but no longer raises the global
+// flag; steering, accel, brake and clutch (bits 0-3) behave
+// exactly as in 4.0.5. NOTE: the railTest=false fix below alone
+// was NOT enough — a floating pin trips the JITTER rule too
+// (EMA > 150 counts, inputs.h), which sets 0x10 with no rail
+// involved; only the mask keeps bit 4 out of the flag.
+bool inputs_axis_invalid() { return rsh_axis_invalid_from_mask(axisInvalidMask); }
 
 void inputs_set_pedal_analog(bool accelAnalog, bool brakeAnalog) {
   accelAnalogMode = accelAnalog;
@@ -593,13 +606,21 @@ InputSample inputs_read() {
     axisInvalidMask |= 0x08;
   // F-04: handbrake health (slot 4) — pehle koi coverage nahi thi.
   // Button mode mein rail test nahi (4095/0 binary); I2C par bhi nahi.
+  // v2.0.20 (RC-1): analog handbrake par bhi rail test KABHI nahi —
+  // chhora hua (released) handbrake rail par (0) hi hota hai, ye
+  // fault nahi hai, is liye released handbrake ka 0x10 diagnostic
+  // mask mein bhi nahi aana chahiye. Ye fix AKELA freeze band
+  // nahi karta — floating pin jitter rule se bhi 0x10 lagata hai
+  // (inputs.h) — freeze ko asal mein `inputs_axis_invalid()` ka
+  // bits 0-3 mask band karta hai (upar, user patch). Jitter rule
+  // aur I2C-validity bit abhi bhi mask mein chalte hain
+  // (diagnostics), lekin flag tak nahi pahunchte.
   if (rsh_pinmap_axis_present(&pinMap, RSH_PINMAP_AXIS_HANDBRAKE) &&
       healthHandbrake.update(s.handbrake,
                              axis_rail_(RSH_PINMAP_AXIS_HANDBRAKE,
                                         pinMap.handbrake),
                              othersForHandbrake, nowMs,
-                             !pinMap.handbrakeButtonMode &&
-                                 !axis_is_i2c(RSH_PINMAP_AXIS_HANDBRAKE)))
+                             false))
     axisInvalidMask |= 0x10;
   // FW-01: I2C axis fail (NACK / magnet ghayab) -> invalid bit (last
   // value rehti hai — health check alag se rail-stuck bhi pakad sakta

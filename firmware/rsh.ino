@@ -193,6 +193,18 @@ static void fw34_boot_setup() {
   fw34_lkg_len = (lkglen > 0
                   && rsh_cfg_blob_validate(fw34_lkg, lkglen, NULL, NULL) == RSH_CTRL_OK)
                  ? lkglen : 0;
+  // v2.0.20 (RC-2): 2.0.15-era LKG blob (ENCODER records samet)
+  // validate nahi hota — strip karke migrate karo (aik dafa; wapas
+  // "lkg" slot mein save ho jata hai), warna clutch wala purana blob
+  // zaya ho kar factory fallback (clutch nahi) par jata.
+  if (lkglen > 0 && fw34_lkg_len == 0) {
+    size_t mlen = rsh_cfg_strip_encoder_records(fw34_lkg, lkglen, fw34_lkg);
+    if (mlen > 0 &&
+        rsh_cfg_blob_validate(fw34_lkg, mlen, NULL, NULL) == RSH_CTRL_OK) {
+      fw34_lkg_len = (uint16_t)mlen;
+      fw34_slot_save(cfgPref, "lkg", fw34_lkg, fw34_lkg_len);
+    }
+  }
   rsh_boot_src_t src = rsh_boot_decide_source(&bootCounter, fw34_lkg_len > 0 ? 1 : 0);
   bootCounter.using_lkg = (src == RSH_BOOT_SRC_LAST_KNOWN_GOOD) ? 1 : 0;
   // F-02: is boot ka source agle boot ke crash record ke liye persist karo.
@@ -205,8 +217,21 @@ static void fw34_boot_setup() {
   }
   uint8_t loaded = 0;
   uint16_t blen = fw34_slot_load(cfgPref, "cur", fw34_scratch);
-  if (src == RSH_BOOT_SRC_CURRENT && blen > 0)
+  if (src == RSH_BOOT_SRC_CURRENT && blen > 0) {
     loaded = (rsh_cfg_txn_load_current(&cfgTxn, fw34_scratch, blen) == RSH_CTRL_OK);
+    // v2.0.20 (RC-2): 2.0.15-era stored blob (ENCODER records samet)
+    // load nahi hota — strip karke migrate karo aur wapas "cur"
+    // slot mein save karo (aik dafa), warna factory fallback
+    // (9 records, clutch nahi) clutch ko hamesha 0 kar deta.
+    if (!loaded) {
+      size_t mlen = rsh_cfg_strip_encoder_records(fw34_scratch, blen, fw34_scratch);
+      if (mlen > 0 &&
+          rsh_cfg_txn_load_current(&cfgTxn, fw34_scratch, mlen) == RSH_CTRL_OK) {
+        loaded = 1;
+        fw34_slot_save(cfgPref, "cur", fw34_scratch, (uint16_t)mlen);
+      }
+    }
+  }
   if (!loaded && fw34_lkg_len > 0)
     loaded = (rsh_cfg_txn_load_current(&cfgTxn, fw34_lkg, fw34_lkg_len) == RSH_CTRL_OK);
   if (!loaded) {  // factory fallback — config kabhi brick nahi karti
