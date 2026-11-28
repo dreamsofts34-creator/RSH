@@ -754,6 +754,8 @@ mod tests {
                 e2e_ms: None,
                 seq_gap: 7,
                 tx_fail: 3,
+                arrival_gap_ms_p99: None,
+                age_at_output_ms_p99: None,
                 ipc_p50_ms: None,
                 ipc_p99_ms: None,
                 ipc_per_method_ms: Vec::new(),

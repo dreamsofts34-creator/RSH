@@ -31,6 +31,9 @@ export component OverviewPage inherits PageScaffold {
     in property <float> clutch;
     in property <bool> daemon-live;
     in property <bool> connected;
+    // F3 (v2.0.21): the LIVE transport (0 Wi-Fi, 1 USB) — the
+    // Disconnect button labels itself from this.
+    in property <int> conn-transport: 0;
     // M-2 (v2.0.2): the specific fatal reason from
     // read_daemon_status() — "" while there is none. Shown as an
     // error banner with Reconnect instead of the generic line below.
@@ -57,6 +60,8 @@ export component OverviewPage inherits PageScaffold {
     callback remove-game(string);
     callback open-diagnostics();
     callback reconnect();
+    // F3 (v2.0.21): explicit disconnect of the live transport.
+    callback disconnect();
     callback open-profile-popover();
     // Phase 2 (Wi-Fi gap): true while the daemon's last activation
     // error is Unreachable — the banner then names the fix
@@ -123,6 +128,15 @@ export component OverviewPage inherits PageScaffold {
                     spacing: 6px;
                     Text { text: "RSH Wheel"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                     Pill { label: connected ? "Online" : "Offline"; bg: connected ? Theme.ok-bg : Theme.err-bg; fg: connected ? Theme.ok : Theme.bad; }
+                    // F3 (v2.0.21): Disconnect, next to the pill —
+                    // one button per transport, labelled for the
+                    // transport that is actually connected, shown
+                    // only while connected. `visible` (not `if`)
+                    // keeps the row's layout space while
+                    // disconnected, so the card never changes size.
+                    // Disabled while its job runs (busy-kind 19);
+                    // the busy strip shows "Disconnecting…" meanwhile.
+                    Btn { label: conn-transport == 1 ? "Disconnect USB" : "Disconnect Wi-Fi"; visible: connected; disabled: busy-kind == 19; clicked => { disconnect(); } }
                 }
                 Text { text: firmware-line; font-size: Theme.fs-hint; color: Theme.mute; }
                 Rectangle { vertical-stretch: 1; }

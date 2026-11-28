@@ -15,10 +15,13 @@ export component SteeringPage inherits HorizontalLayout {
     // in the centre card), left/right balance, centre trim.
     in property <bool> advanced: false;
     in property <bool> invert: false;
-    in property <float> lock-frac: 1.0;
-    in property <string> lock-text: "900°";
-    in property <float> smoothing: 0.3;
-    in property <string> smoothing-text: "30%";
+    // v2.0.21 P2 factory defaults (360° lock, 0% smoothing) —
+    // pre-sync placeholders; the window re-syncs them from the
+    // live tuning within one frame.
+    in property <float> lock-frac: (360.0 - 270.0) / 630.0;
+    in property <string> lock-text: "360°";
+    in property <float> smoothing: 0.0;
+    in property <string> smoothing-text: "0%";
     in property <float> balance: 0.5;
     in property <string> balance-text: "0%";
     in property <float> trim: 0.5;

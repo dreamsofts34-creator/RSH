@@ -98,7 +98,9 @@ pub struct ModuleTuning {
     /// Curve strength, `-1..=1` (0 = linear). Positive softens the
     /// centre (progressive), negative sharpens it.
     pub curve_strength: f32,
-    /// One Euro smoothing, `0..=1` (0 = off). Default `0.3`.
+    /// One Euro smoothing, `0..=1` (0 = off). Default `0.0`
+    /// (v2.0.21 P2 — the old `0.3` lagged the primary axis; the
+    /// 0.1 µF cap + trimmed mean handle the noise instead).
     pub smoothing: f32,
     /// Range minimum in millivolts. Default `300`.
     pub min_mv: u16,
@@ -183,7 +185,14 @@ impl Default for ModuleTuning {
             enabled: true,
             deadzone: 0.02,
             curve_strength: 0.0,
-            smoothing: 0.3,
+            // v2.0.21 P2: smoothing off by default (was 0.3). The
+            // per-module press/release ramps stay at the legacy
+            // 150/100 ms here — this struct default is
+            // module-agnostic, so the per-module values live in
+            // `rsh_api::{default_press_ms, default_release_ms}`
+            // (throttle 100/50, brake 0/50, clutch 50/300), which
+            // `get_tuning` applies before the plan is built.
+            smoothing: 0.0,
             min_mv: DEFAULT_MIN_MV,
             max_mv: DEFAULT_MAX_MV,
             center_mv: DEFAULT_CENTER_MV,
@@ -222,7 +231,7 @@ impl ModuleTuning {
         let mut out = *self;
         out.deadzone = clamp_finite(self.deadzone, 0.0, 0.5, 0.02);
         out.curve_strength = clamp_finite(self.curve_strength, -1.0, 1.0, 0.0);
-        out.smoothing = clamp_finite(self.smoothing, 0.0, 1.0, 0.3);
+        out.smoothing = clamp_finite(self.smoothing, 0.0, 1.0, 0.0);
         out.scale = clamp_finite(self.scale, 0.2, 1.0, 1.0);
         // --- Steering per-module tuning ---
         out.scale_left = clamp_finite(self.scale_left, 0.2, 1.0, 1.0);
@@ -1634,7 +1643,9 @@ mod tests {
             ..super::ModuleTuning::default()
         };
         let clean = tuning.sanitized();
-        assert_eq!(clean.smoothing, 0.3);
+        // v2.0.21 P2: a non-finite smoothing falls back to the new
+        // factory default 0.0 (off), not the old 0.3.
+        assert_eq!(clean.smoothing, 0.0);
         assert_eq!(clean.scale, 1.0);
     }
 

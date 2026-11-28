@@ -453,6 +453,19 @@ pub struct DiagStats {
     /// End-to-end latency p99 in milliseconds (ping-derived).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub e2e_ms: Option<f64>,
+    /// Inter-arrival gap p99 in milliseconds (F4, v2.0.21 Phase 0):
+    /// the p99 gap between packet arrivals at the PC reader thread.
+    /// [`None`] until the daemon measures it — the acceptance bar
+    /// is p99 ≤ 6 ms. (The old `jitter_ms_p99` is board-timestamp
+    /// jitter, not network jitter — this is the PC-side measure.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrival_gap_ms_p99: Option<f64>,
+    /// Age-at-output p99 in milliseconds (F4, v2.0.21 Phase 0):
+    /// the p99 age of the frame the engine last wrote to the
+    /// output (PC arrival → `send_output`). [`None`] until the
+    /// daemon measures it — the acceptance bar is p99 ≤ 6 ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_at_output_ms_p99: Option<f64>,
     /// `seqGap` counter from the latest status packet.
     pub seq_gap: u64,
     /// `txFail` counter from the latest status packet.

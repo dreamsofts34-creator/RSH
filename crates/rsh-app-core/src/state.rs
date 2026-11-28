@@ -4098,6 +4098,12 @@ impl AppStateCore {
             e2e_ms: stats.e2e_ms,
             seq_gap: snapshot.seq_gap,
             tx_fail: snapshot.tx_fail,
+            // F4 (v2.0.21 Phase 0): the core does not measure the
+            // PC-side arrival gap / age-at-output — the daemon's
+            // `DaemonApi::diag_stats` fills these in once the
+            // engine exposes them.
+            arrival_gap_ms_p99: None,
+            age_at_output_ms_p99: None,
             // DS-82: the core does not know the IPC latency — only
             // the daemon's `DaemonApi::diag_stats` fills these in.
             ipc_p50_ms: None,
@@ -6667,9 +6673,10 @@ impl AppStateCore {
 
     /// The tuning for one module: the session's validated tuning when
     /// one was set, else the active profile's stored tuning converted
-    /// to the frontend shape, else the neutral default (deadzone 0,
-    /// linear curve, full 0–3300 mV span, no smoothing). Nothing here
-    /// is invented data — the default is the documented neutral tuning.
+    /// to the frontend shape, else the factory default (deadzone 2%
+    /// — v2.0.21 P2: kills pot idle drift on noisy 50k pots — linear
+    /// curve, full 0–3300 mV span, no smoothing). Nothing here is
+    /// invented data — the default is the documented factory tuning.
     /// The module id is canonicalized first (C-MOD-1: `"accel"` →
     /// `"accelerator"`), so a caller using either spelling reads the
     /// same tuning. The extended fields (C-TUNE-1: min/max mV, bite
@@ -6721,7 +6728,11 @@ impl AppStateCore {
         let is_clutch = module == "clutch";
         TuningSettings {
             module,
-            deadzone: 0.0,
+            // v2.0.21 P2: 2% deadzone kills pot idle drift (the old
+            // 0% let a noisy 50k pot wander off-centre); the engine's
+            // `ModuleTuning::default` already uses 0.02, so the
+            // fresh-branch default finally agrees with it.
+            deadzone: 2.0,
             curve,
             min_mv: 0.0,
             max_mv: 3300.0,
@@ -11006,9 +11017,11 @@ mod tests {
     #[test]
     fn tuning_validates_stores_and_falls_back_to_neutral() {
         let (state, _dir) = test_state();
-        // Neutral default for a module with no tuning anywhere.
+        // Factory default for a module with no tuning anywhere
+        // (v2.0.21 P2: 2% deadzone, linear curve, full span, no
+        // smoothing).
         let neutral = state.get_tuning("steering");
-        assert_eq!(neutral.deadzone, 0.0);
+        assert_eq!(neutral.deadzone, 2.0);
         assert_eq!(neutral.curve, 1.0);
         assert_eq!(neutral.max_mv, 3300.0);
         // Invalid tuning is rejected, never stored.
@@ -11016,7 +11029,7 @@ mod tests {
         bad.module = "brake".to_string();
         bad.deadzone = 99.0;
         assert!(state.set_tuning(&bad).is_err());
-        assert_eq!(state.get_tuning("brake").deadzone, 0.0);
+        assert_eq!(state.get_tuning("brake").deadzone, 2.0);
         // Valid tuning stores, survives a get, and lands in the draft
         // (L4) — NOT in the stored profile: a fresh store over the
         // same dir still sees the old tuning until Save.
@@ -11180,7 +11193,7 @@ mod tests {
         // …Discard reverts the live tuning and frees the switch.
         assert!(state.discard_draft());
         assert!(!state.draft_dirty());
-        assert_eq!(state.get_tuning("brake").deadzone, 0.0);
+        assert_eq!(state.get_tuning("brake").deadzone, 2.0);
         assert_eq!(state.get_tuning("brake").bite_point, None);
         assert_eq!(state.get_tuning("brake").saturation, None);
         state
@@ -11227,10 +11240,11 @@ mod tests {
     fn pipeline_plan_carries_draft_tuning_and_bite_point() {
         let (state, _dir) = test_state();
         let _ = activate_first_profile(&state);
-        // Default plan: clutch disabled, neutral steering.
+        // Default plan: clutch disabled, neutral steering (v2.0.21
+        // P2: the factory deadzone is 2%, i.e. 0.02 as a fraction).
         let plan = state.build_pipeline_plan();
         assert!(!plan.clutch.enabled);
-        assert_eq!(plan.steering.deadzone, 0.0);
+        assert_eq!(plan.steering.deadzone, 0.02);
         // --- Brake per-module tuning ---
         // Default plan: saturation 1.0 (full travel = full brake).
         assert!((plan.brake.saturation - 1.0).abs() < f32::EPSILON);
@@ -11295,23 +11309,29 @@ mod tests {
     fn pedal_ramps_and_combined_pedals_round_trip_to_plan() {
         let (state, _dir) = test_state();
         let _ = activate_first_profile(&state);
-        // Task defaults on a fresh profile: accel 100/50, brake
-        // press 50, clutch release 300, combined off.
+        // Task defaults on a fresh profile (v2.0.21 F7/P2): accel
+        // 100/50, brake press 0 (instant) / release 50, clutch
+        // press 50 / release 300, combined off.
         let accel = state.get_tuning("accelerator");
         assert_eq!(accel.press_ms, Some(100.0));
         assert_eq!(accel.release_ms, Some(50.0));
         assert_eq!(accel.combine_pedals, Some(false));
-        assert_eq!(state.get_tuning("brake").press_ms, Some(50.0));
+        assert_eq!(state.get_tuning("brake").press_ms, Some(0.0));
+        assert_eq!(state.get_tuning("brake").release_ms, Some(50.0));
+        assert_eq!(state.get_tuning("clutch").press_ms, Some(50.0));
         assert_eq!(state.get_tuning("clutch").release_ms, Some(300.0));
         let plan = state.build_pipeline_plan();
         assert!((plan.accelerator.press_ms - 100.0).abs() < f32::EPSILON);
         assert!((plan.accelerator.release_ms - 50.0).abs() < f32::EPSILON);
-        assert!((plan.brake.press_ms - 50.0).abs() < f32::EPSILON);
+        assert!((plan.brake.press_ms - 0.0).abs() < f32::EPSILON);
+        assert!((plan.brake.release_ms - 50.0).abs() < f32::EPSILON);
+        assert!((plan.clutch.press_ms - 50.0).abs() < f32::EPSILON);
         assert!((plan.clutch.release_ms - 300.0).abs() < f32::EPSILON);
         assert!(!plan.combine_pedals);
-        // A side with no per-module ramp keeps the global (150/100).
-        assert!((plan.brake.release_ms - 100.0).abs() < f32::EPSILON);
-        assert!((plan.clutch.press_ms - 150.0).abs() < f32::EPSILON);
+        // A module with no per-module ramp (steering) keeps the
+        // profile's global ramp (150/100).
+        assert!((plan.steering.press_ms - 150.0).abs() < f32::EPSILON);
+        assert!((plan.steering.release_ms - 100.0).abs() < f32::EPSILON);
         // Edit: brake press 200, clutch release 800, combined on —
         // all land in the plan and read back.
         let mut brake = state.get_tuning("brake");
@@ -11336,8 +11356,9 @@ mod tests {
 
     /// Bug 7 (PC-test fix): steering invert + lock round-trip —
     /// `get_tuning` reports the profile defaults (not inverted,
-    /// 900°), a `set_tuning` with invert + 540° lock lands in the
-    /// live plan (inverted, scale 0.6), and a Save persists both
+    /// 360° — v2.0.21 P2 factory default), a `set_tuning` with
+    /// invert + 540° lock lands in the live plan (inverted, scale
+    /// 0.6), and a Save persists both
     /// fields so a reopened store reads them back.
     #[test]
     fn steering_invert_and_lock_round_trip_through_plan_and_store() {
@@ -11347,8 +11368,8 @@ mod tests {
         assert_eq!(tuning.invert, Some(false), "default is not inverted");
         assert_eq!(
             tuning.steering_lock_deg,
-            Some(900.0),
-            "default is full lock"
+            Some(360.0),
+            "default is the 360° factory lock (v2.0.21 P2)"
         );
         let mut steering = tuning;
         steering.invert = Some(true);
@@ -11381,9 +11402,10 @@ mod tests {
     /// Steering per-module tuning (S2+S3): balance + centre trim
     /// round-trip — `get_tuning` reports the profile defaults
     /// (even, untrimmed), a `set_tuning` with +20% balance and
-    /// −4% trim lands in the live plan (left scale 0.8, right
-    /// scale clamped to 1.0, centre shifted by −4% of the
-    /// half-span), and a Save persists both.
+    /// −4% trim lands in the live plan (left scale 0.32, right
+    /// scale 0.48 — base is the 0.4 factory lock, v2.0.21 P2 —
+    /// centre shifted by −4% of the half-span), and a Save persists
+    /// both.
     #[test]
     fn steering_balance_and_trim_round_trip_through_plan_and_store() {
         let (state, dir) = test_state();
@@ -11403,12 +11425,12 @@ mod tests {
             .expect("set steering balance+trim");
         let plan = state.build_pipeline_plan();
         assert!(
-            (plan.steering.scale_left - 0.8).abs() < f32::EPSILON,
-            "balance +20% → left scale 0.8 (base 1.0)"
+            (plan.steering.scale_left - 0.32).abs() < f32::EPSILON,
+            "balance +20% → left scale 0.32 (base 0.4)"
         );
         assert!(
-            (plan.steering.scale_right - 1.0).abs() < f32::EPSILON,
-            "balance +20% → right scale clamps to 1.0"
+            (plan.steering.scale_right - 0.48).abs() < f32::EPSILON,
+            "balance +20% → right scale 0.48 (base 0.4)"
         );
         assert_eq!(
             plan.steering.center_mv, 1734,
