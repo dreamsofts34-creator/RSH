@@ -640,6 +640,10 @@ fn spawn_reader(
     Builder::new()
         .name("rsh-udp-reader".to_owned())
         .spawn(move || {
+            // F10 (v2.0.21): the reader runs a step above normal so
+            // a busy game thread cannot delay the socket pickup.
+            #[cfg(windows)]
+            raise_reader_priority();
             let result = catch_unwind(AssertUnwindSafe(|| {
                 reader_loop(&socket, &expected, &senders, &counters, &shutdown);
             }));
@@ -647,6 +651,27 @@ fn spawn_reader(
                 counters.reader_panics.fetch_add(1, Ordering::Relaxed);
             }
         })
+}
+
+/// Raise the calling thread to above-normal priority (F10,
+/// v2.0.21): the UDP reader thread must not wait behind a busy
+/// game thread to pick frames off the socket — every millisecond
+/// of scheduling delay here is input latency. Windows-only; the
+/// Linux reader is a plain blocking `recv` with no equivalent
+/// per-thread call in this codebase. Best effort — a failure is
+/// ignored: the reader works at normal priority too. MMCSS
+/// (`AvSetMmThreadCharacteristics`, the real-time-class step) is a
+/// follow-up, not this change.
+#[cfg(windows)]
+fn raise_reader_priority() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+    };
+    // SAFETY: plain Win32 call on the current thread's
+    // pseudo-handle (never closed); the result is best-effort.
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
 }
 
 /// The reader loop: `recv`, sender-filter, demux by magic, parse, forward.

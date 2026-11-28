@@ -50,6 +50,7 @@
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use rsh_protocol::ping::PingFrame;
@@ -171,6 +172,16 @@ const PING_REPLY_CHANNEL_CAPACITY: usize = 8;
 /// deferred, never dropped — so the cap cannot reintroduce
 /// coalescing, it only bounds drain latency.
 const MAX_FRAMES_PER_TICK: usize = 32;
+/// Newest frames kept per tick (F8, v2.0.21): when a burst arrives
+/// (Wi-Fi stall + catch-up, or double-send), the pipeline only ever
+/// outputs the LAST processed frame — processing 30 stale frames to
+/// reach the same output is wasted work. The drain keeps the newest
+/// 4 and drops the older ones as stale (counted in
+/// `stale_dropped`); the sequence gap the next accepted frame
+/// records is the honest PC-side loss for them. 4 (not 1) so a
+/// press/release edge pair straddling the trim boundary is not
+/// silently swallowed.
+const KEEP_NEWEST_FRAMES: usize = 4;
 /// Maximum age of a `btnsEx` value without a status-packet refresh
 /// (HID P2-3): the extended packet arrives at ~1 Hz, so 2 s without
 /// one means the source is gone — the value must age out instead of
@@ -182,6 +193,21 @@ const MAX_STATUS_PER_TICK: usize = 2 * STATUS_CHANNEL_CAPACITY;
 /// Max ping replies drained per tick (L-1: 2× the 8-slot channel
 /// capacity).
 const MAX_PING_REPLIES_PER_TICK: usize = 2 * PING_REPLY_CHANNEL_CAPACITY;
+
+/// What woke the run loop (F5 event-driven output, v2.0.21) —
+/// see [`WheelEngine::wait_wake`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Wake {
+    /// The 5 ms tick (or the parked sleep) fired.
+    Tick,
+    /// A frame arrived at the source (already stored in
+    /// `pending_frame` for the next drain).
+    Frame,
+    /// The source dropped (`next_frame` returned [`None`]).
+    SourceDropped,
+    /// Stop was requested.
+    Stop,
+}
 
 /// Source of decoded stream frames for the engine.
 ///
@@ -436,7 +462,19 @@ pub struct WheelEngine<S: PacketSource> {
     stop_rx: watch::Receiver<bool>,
     /// Reused per-tick drain buffer (PERF P2-1): `drain_source`
     /// fills this instead of allocating a fresh `Vec` per tick.
-    tick_frames: Vec<StreamFrame>,
+    /// Each frame carries its engine-receipt instant (F4): the
+    /// arrival-gap and age-at-output measurements are stamped at
+    /// receipt, not at tick time.
+    tick_frames: Vec<(StreamFrame, Instant)>,
+    /// Frame that woke the run loop (F5): `wait_wake` stores the
+    /// frame `next_frame` delivered here instead of dropping it,
+    /// and `drain_source` yields it first.
+    pending_frame: Option<(StreamFrame, Instant)>,
+    /// Receipt instant of the last ACCEPTED frame (F4): the
+    /// arrival-gap series and the age-at-output measurement are
+    /// anchored here — duplicates never move it (a duplicate
+    /// retransmission's arrival would corrupt both series).
+    last_accepted_arrival: Option<Instant>,
     /// Receiver for live pipeline plans (L4 pipeline push), [`None`]
     /// when no plan sender is attached. A `watch` channel carries
     /// only the latest plan, so a slider drag that sends ten plans
@@ -482,6 +520,8 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
             stop_rx,
             plan_rx: None,
             tick_frames: Vec::new(),
+            pending_frame: None,
+            last_accepted_arrival: None,
         }
     }
 
@@ -579,32 +619,90 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
                     if timer_guard.is_none() {
                         timer_guard = Some(TimerResolutionGuard::acquire());
                     }
-                    tokio::select! {
-                        _ = ticker.tick() => self.on_tick().await,
-                        result = self.stop_rx.changed() => {
-                            if Self::stop_fired(&result, &self.stop_rx) {
-                                break;
-                            }
+                    // F5 (v2.0.21): the loop wakes on frame arrival
+                    // as well as on the tick — the output no longer
+                    // waits up to 5 ms for the next tick boundary.
+                    match self.wait_wake(ticker.tick()).await {
+                        Wake::Tick | Wake::Frame | Wake::SourceDropped => {
+                            self.on_tick().await;
                         }
+                        Wake::Stop => break,
                     }
                 } else {
                     timer_guard = None;
                     // DS-31: parked — one sleep instead of a 200 Hz
                     // interval. The delay never runs past a due
-                    // reconnect (see `parked_tick_delay`).
+                    // reconnect (see `parked_tick_delay`). A frame
+                    // arriving mid-park still wakes the loop (F5),
+                    // so a resumed stream is picked up at once.
                     let delay = self.parked_tick_delay(Instant::now());
-                    tokio::select! {
-                        () = tokio::time::sleep(delay) => self.on_tick().await,
-                        result = self.stop_rx.changed() => {
-                            if Self::stop_fired(&result, &self.stop_rx) {
-                                break;
-                            }
+                    match self.wait_wake(tokio::time::sleep(delay)).await {
+                        Wake::Tick | Wake::Frame | Wake::SourceDropped => {
+                            self.on_tick().await;
                         }
+                        Wake::Stop => break,
                     }
                 }
             }
         }
         self.finish()
+    }
+
+    /// Wait for the next wake event (F5 event-driven output): the
+    /// tick future, a frame arriving at the source, or stop.
+    ///
+    /// The source is taken out of `self` for the wait (the frame
+    /// future borrows it, and `on_tick` needs `&mut self` — the two
+    /// cannot coexist in one `select!`), then restored — except
+    /// when `next_frame` returned [`None`], which means the source
+    /// dropped: it stays out and a reconnect is scheduled instead.
+    /// A frame the wait delivers is stored in `pending_frame`
+    /// (never dropped: `next_frame` already consumed it from the
+    /// source) with its receipt instant, and `drain_source` yields
+    /// it first. `next_frame` must be cancellation-safe (the tick
+    /// arm drops the frame future when it wins) — the trait
+    /// already requires that for the zero-timeout drain polls.
+    async fn wait_wake(&mut self, tick: impl Future) -> Wake {
+        let Some(mut source) = self.source.take() else {
+            // No source: tick or stop only (a parked engine with a
+            // factory still needs its tick for the reconnect).
+            let stop = tokio::select! {
+                _ = tick => false,
+                result = self.stop_rx.changed() => {
+                    Self::stop_fired(&result, &self.stop_rx)
+                }
+            };
+            return if stop { Wake::Stop } else { Wake::Tick };
+        };
+        let wake = tokio::select! {
+            _ = tick => Wake::Tick,
+            frame = source.next_frame() => match frame {
+                Some(frame) => {
+                    self.pending_frame = Some((frame, Instant::now()));
+                    Wake::Frame
+                }
+                None => Wake::SourceDropped,
+            },
+            result = self.stop_rx.changed() => {
+                if Self::stop_fired(&result, &self.stop_rx) {
+                    Wake::Stop
+                } else {
+                    Wake::Tick
+                }
+            }
+        };
+        match wake {
+            Wake::SourceDropped => {
+                // The source is gone (not restored): schedule the
+                // reconnect the drain would have scheduled on a
+                // `None` poll.
+                self.next_reconnect_at = Some(Instant::now() + RECONNECT_INTERVAL);
+            }
+            _ => {
+                self.source = Some(source);
+            }
+        }
+        wake
     }
 
     /// Whether a live source is attached right now (DS-31): the
@@ -689,18 +787,38 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
         // time (`StreamFrame` is inline data — the clone is a
         // memcpy, no heap allocation) so `handle_frame` can take
         // `&mut self` while the buffer stays owned by the engine.
+        // `handle_frame` returns the frame's receipt instant when
+        // it accepted the frame — the age-at-output measurement
+        // anchors on the LAST accepted frame this tick.
+        let mut last_accepted: Option<Instant> = None;
         for i in 0..n_frames {
-            let frame = self.tick_frames[i].clone();
-            out = self.handle_frame(&frame, now);
+            let (frame, arrived) = self.tick_frames[i].clone();
+            let (next, accepted) = self.handle_frame(&frame, now, arrived);
+            if accepted.is_some() {
+                last_accepted = accepted;
+            }
+            out = next;
         }
         let out = if self.watchdog.is_stale(now) {
             OutputState::neutral()
         } else {
             out
         };
-        if self.send_output(&out) && had_frame {
-            self.metrics
-                .record_output_latency(duration_us(started.elapsed()));
+        if self.send_output(&out) {
+            // F4: the output send happened — count it. The latency
+            // and age measurements only apply when a frame was
+            // accepted this tick: a duplicate-only tick carries the
+            // previous output, not a fresh frame.
+            self.metrics.record_output_sent();
+            if had_frame {
+                self.metrics
+                    .record_output_latency(duration_us(started.elapsed()));
+                if let Some(arrived) = last_accepted {
+                    self.metrics.record_age_at_output(duration_us(
+                        Instant::now().saturating_duration_since(arrived),
+                    ));
+                }
+            }
         }
     }
 
@@ -841,9 +959,18 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
     /// `Vec` on every 5 ms tick for the common 1-frame case. The
     /// buffer lives on the engine and is cleared per tick, so the
     /// tick path allocates 0 B. Returns the number of frames
-    /// drained; frames are read from [`Self::tick_frames`].
+    /// drained; frames are read from [`Self::tick_frames`]. Each
+    /// frame is stamped with its engine-receipt instant (F4) as it
+    /// is polled — the arrival-gap series measures receipt spacing,
+    /// not tick spacing. The frame that woke the engine (F5,
+    /// `pending_frame`) is drained first. Frames past the cap stay
+    /// queued for the next tick — deferred, never dropped.
     async fn drain_source(&mut self) -> usize {
         self.tick_frames.clear();
+        // F5: the frame that woke the engine is drained first.
+        if let Some((frame, arrived)) = self.pending_frame.take() {
+            self.tick_frames.push((frame, arrived));
+        }
         let mut dropped = false;
         while self.tick_frames.len() < MAX_FRAMES_PER_TICK {
             let polled = {
@@ -853,7 +980,7 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
                 timeout(Duration::ZERO, source.next_frame()).await
             };
             match polled {
-                Ok(Some(frame)) => self.tick_frames.push(frame),
+                Ok(Some(frame)) => self.tick_frames.push((frame, Instant::now())),
                 Ok(None) => {
                     dropped = true;
                     break;
@@ -866,6 +993,19 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
             self.source = None;
             self.next_reconnect_at = Some(Instant::now() + RECONNECT_INTERVAL);
         }
+        // F4: the burst size is the pre-trim count (how many frames
+        // one tick found waiting). F8: keep only the newest
+        // `KEEP_NEWEST_FRAMES` — the older ones are stale (counted);
+        // the sequence gap the next accepted frame records is the
+        // honest PC-side loss for them.
+        self.metrics
+            .record_burst(u32::try_from(self.tick_frames.len()).unwrap_or(u32::MAX));
+        if self.tick_frames.len() > KEEP_NEWEST_FRAMES {
+            let stale = self.tick_frames.len() - KEEP_NEWEST_FRAMES;
+            self.tick_frames.drain(..stale);
+            self.metrics
+                .record_stale_dropped(u64::try_from(stale).unwrap_or(u64::MAX));
+        }
         self.tick_frames.len()
     }
 
@@ -874,6 +1014,12 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
     /// silently (the current output is repeated); gaps are counted
     /// in the metrics loss window and processing continues.
     ///
+    /// `arrived` is the frame's engine-receipt instant (F4, stamped
+    /// by `drain_source`). Returns the output state plus the receipt
+    /// instant when the frame was ACCEPTED — [`None`] for a
+    /// duplicate, so the caller can anchor the age-at-output
+    /// measurement on the last accepted frame, never on a duplicate.
+    ///
     /// L1: jitter is sampled only for accepted frames — a duplicate
     /// retransmission's timestamp is stale by definition and must not
     /// pollute the jitter p99. A gap is recorded as one batch
@@ -881,7 +1027,12 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
     /// L8: a large backward sequence jump rebaselines only with
     /// reboot evidence — a stale watchdog (no frame for ≥ 250 ms) or
     /// a status-packet uptime reset since the last frame.
-    fn handle_frame(&mut self, frame: &StreamFrame, now: Instant) -> OutputState {
+    fn handle_frame(
+        &mut self,
+        frame: &StreamFrame,
+        now: Instant,
+        arrived: Instant,
+    ) -> (OutputState, Option<Instant>) {
         // Reboot evidence is read before the watchdog tick: a frame
         // arriving after ≥ 250 ms of silence is evidence the board
         // may have restarted.
@@ -895,8 +1046,22 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
             .check_with_evidence(frame.seq, reboot_evidence);
         if decision == SeqDecision::Duplicate {
             self.counters.frames_dropped_duplicate += 1;
-            return self.last_output;
+            // F4: a duplicate is stale by definition — counted in
+            // `stale_dropped`, not in the loss window (it arrived;
+            // it just carries nothing new).
+            self.metrics.record_stale_dropped(1);
+            return (self.last_output, None);
         }
+        // F4: PC-side arrival gap (engine receipt spacing, accepted
+        // frames only) + the received count. The gap anchors on the
+        // last ACCEPTED arrival: a duplicate retransmission's
+        // arrival would corrupt the series.
+        if let Some(prev) = self.last_accepted_arrival {
+            self.metrics
+                .record_arrival_gap(duration_us(arrived.saturating_duration_since(prev)));
+        }
+        self.last_accepted_arrival = Some(arrived);
+        self.metrics.record_frame_received();
         if let Some(prev_ts) = self.last_frame_ts {
             self.metrics
                 .record_inter_arrival_jitter(inter_arrival_jitter_us(frame.timestamp_us, prev_ts));
@@ -916,7 +1081,7 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
         let out = self.pipeline.process_with_gap(frame, skipped);
         self.counters.frames_processed += 1;
         self.last_output = out;
-        out
+        (out, Some(arrived))
     }
 
     /// Send one output state. On failure the error is counted and a
@@ -1319,8 +1484,12 @@ mod tests {
     #[tokio::test]
     async fn drain_source_is_bounded_and_defers_the_rest() {
         // H-1 bound: one tick drains at most MAX_FRAMES_PER_TICK
-        // frames; the rest stay queued for the next tick — deferred,
-        // never dropped.
+        // frames from the source; the rest stay queued for the next
+        // tick — deferred, never dropped. F8 (v2.0.21): of the
+        // drained frames only the newest KEEP_NEWEST_FRAMES are
+        // kept — the older ones are stale (counted in
+        // `stale_dropped`) — so the drain returns 4 even though 32
+        // were pulled, and the 8 still queued drain next.
         let (tx, rx) = mpsc::channel(64);
         let (sink, _states) = RecordingSink::new(false);
         let mut engine = WheelEngine::new(
@@ -1335,12 +1504,33 @@ mod tests {
                 .expect("source channel open");
         }
         let first = engine.drain_source().await;
-        assert_eq!(first, MAX_FRAMES_PER_TICK);
-        assert_eq!(engine.tick_frames.first().map(|f| f.seq), Some(0));
-        assert_eq!(engine.tick_frames.last().map(|f| f.seq), Some(cap_u16 - 1));
+        assert_eq!(first, KEEP_NEWEST_FRAMES);
+        assert_eq!(
+            engine.tick_frames.first().map(|f| f.0.seq),
+            Some(cap_u16 - u16::try_from(KEEP_NEWEST_FRAMES).expect("keep fits u16"))
+        );
+        assert_eq!(
+            engine.tick_frames.last().map(|f| f.0.seq),
+            Some(cap_u16 - 1)
+        );
+        assert_eq!(
+            engine.metrics.stale_dropped,
+            u64::try_from(MAX_FRAMES_PER_TICK - KEEP_NEWEST_FRAMES).expect("fits u64")
+        );
         let rest = engine.drain_source().await;
-        assert_eq!(rest, 8);
-        assert_eq!(engine.tick_frames.first().map(|f| f.seq), Some(cap_u16));
+        assert_eq!(rest, KEEP_NEWEST_FRAMES);
+        assert_eq!(
+            engine.tick_frames.first().map(|f| f.0.seq),
+            Some(cap_u16 + 4)
+        );
+        assert_eq!(
+            engine.tick_frames.last().map(|f| f.0.seq),
+            Some(cap_u16 + 7)
+        );
+        assert_eq!(
+            engine.metrics.stale_dropped,
+            u64::try_from(MAX_FRAMES_PER_TICK - KEEP_NEWEST_FRAMES + 4).expect("fits u64")
+        );
     }
 
     #[test]
@@ -1892,6 +2082,115 @@ mod tests {
         );
         let report = stop_and_report(&mut harness).await;
         assert_eq!(report.counters.frames_processed, 1);
+    }
+
+    #[tokio::test]
+    async fn f4_arrival_gap_and_counters_are_recorded() {
+        // F4 (v2.0.21): three frames 50 ms apart — the engine
+        // records the receipt spacing (arrival gap ≈ 50 ms), the
+        // received count, the age at output (receipt → send, a
+        // fraction of a tick), and the output sends.
+        let mut harness = start(false);
+        for (seq, ts) in [(0, 0), (1, 5_000), (2, 10_000)] {
+            harness
+                .tx
+                .send(frame(seq, ts, 3300))
+                .await
+                .expect("source channel open");
+            sleep(Duration::from_millis(50)).await;
+        }
+        sleep(Duration::from_millis(100)).await;
+        let report = stop_and_report(&mut harness).await;
+        assert_eq!(report.counters.frames_processed, 3);
+        assert_eq!(report.metrics.frames_received, 3);
+        assert_eq!(report.metrics.stale_dropped, 0);
+        assert!(
+            report.metrics.outputs_sent >= 3,
+            "outputs sent: {}",
+            report.metrics.outputs_sent
+        );
+        assert!(report.metrics.frames_per_tick_max >= 1);
+        let gap = report
+            .metrics
+            .arrival_gap_p99()
+            .expect("arrival gap measured");
+        assert!(
+            (20_000..=200_000).contains(&gap),
+            "arrival-gap p99 {gap} µs for 50 ms-spaced frames"
+        );
+        let age = report
+            .metrics
+            .age_at_output_p99()
+            .expect("age at output measured");
+        assert!(
+            age < 100_000,
+            "age-at-output p99 {age} µs must stay well under one tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn f4_duplicate_is_counted_stale_not_received() {
+        // F4: a retransmitted frame is a duplicate — it counts in
+        // `stale_dropped` (and the duplicate counter), never in
+        // `frames_received` and never in the arrival-gap series.
+        let mut harness = start(false);
+        for _ in 0..2 {
+            harness
+                .tx
+                .send(frame(0, 0, 3300))
+                .await
+                .expect("source channel open");
+        }
+        sleep(Duration::from_millis(100)).await;
+        let report = stop_and_report(&mut harness).await;
+        assert_eq!(report.counters.frames_processed, 1);
+        assert_eq!(report.counters.frames_dropped_duplicate, 1);
+        assert_eq!(report.metrics.frames_received, 1);
+        assert_eq!(report.metrics.stale_dropped, 1);
+        assert_eq!(
+            report.metrics.arrival_gap_p99(),
+            None,
+            "one accepted frame defines no gap"
+        );
+    }
+
+    #[tokio::test]
+    async fn f5_wait_wake_returns_on_frame_arrival() {
+        // F5 (v2.0.21): `wait_wake` resolves on frame arrival even
+        // when the tick is far away — the run loop no longer waits
+        // out the tick (or the 100 ms parked sleep) to process a
+        // frame. The delivered frame is stored in `pending_frame`,
+        // never dropped.
+        let (tx, rx) = mpsc::channel(32);
+        let (sink, _states) = RecordingSink::new(false);
+        let mut engine = WheelEngine::new(
+            ProcessingPipeline::new(PipelinePlan::default()),
+            ChannelSource::new(rx),
+            Box::new(sink),
+        );
+        tx.send(frame(7, 0, 3300)).await.expect("channel open");
+        let wake = timeout(
+            Duration::from_secs(2),
+            engine.wait_wake(tokio::time::sleep(Duration::from_secs(10))),
+        )
+        .await
+        .expect("wait_wake resolves on frame arrival, not on the tick");
+        assert_eq!(wake, Wake::Frame);
+        assert_eq!(
+            engine.pending_frame.as_ref().map(|(frame, _)| frame.seq),
+            Some(7),
+            "the woken frame is kept for the drain"
+        );
+        // No frame queued: the tick arm wins instead.
+        let wake = timeout(Duration::from_secs(2), engine.wait_wake(async {}))
+            .await
+            .expect("wait_wake resolves on the tick");
+        assert_eq!(wake, Wake::Tick);
+        assert_eq!(
+            engine.pending_frame.as_ref().map(|(frame, _)| frame.seq),
+            Some(7),
+            "a tick wake leaves the pending frame alone"
+        );
     }
 
     #[tokio::test]
