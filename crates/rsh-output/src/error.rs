@@ -1,61 +1,23 @@
-//! Shared output error type (G4) — the selector- and diagnostics-facing
+//! Shared output error type (G4) - the selector- and diagnostics-facing
 //! error for every output backend.
 //!
 //! # Why the trait still returns [`VJoyError`](crate::vjoy::VJoyError)
 //!
 //! The [`IJoystickOutput`](crate::IJoystickOutput) trait's error type is
-//! vJoy-flavoured today, and the `HIDMaestro` backend maps its rich
-//! `HidMaestroError` (in `rsh-output-hidmaestro`) onto it
-//! lossily (`DriverNotFound` carrying the full human-readable message).
-//! That split stays for now, deliberately, and this type does **not**
-//! pretend to have fixed it:
+//! vJoy-flavoured today, and every backend maps its own failures onto
+//! it lossily (`DriverNotFound` carrying the full human-readable
+//! message). The selector therefore records failure **reasons as
+//! strings** (see `SwitchOutcome::fallback_reason` in the
+//! [`selector`](crate::selector) module) and never branches on a
+//! `VJoyError` variant to identify which backend failed.
 //!
-//! * Changing the trait's error type would require coordinated edits to
-//!   both backends' trait implementations — `vjoy.rs` (this crate) and
-//!   `rsh-output-hidmaestro`'s `backend.rs` / `error.rs` — which are
-//!   outside the G4 file ownership. A half-migration (trait changed,
-//!   one backend left behind) would not compile at all.
-//! * A `From<HidMaestroError> for OutputError` impl cannot live in this
-//!   crate: `rsh-output-hidmaestro` depends on `rsh-output`, so this
-//!   crate cannot depend on it back (circular dependency). It cannot
-//!   live in `rsh-app-core` either (orphan rule — neither type is local
-//!   there). It belongs in `rsh-output-hidmaestro`'s `error.rs`, next to
-//!   the existing `From<HidMaestroError> for VJoyError`, as the first
-//!   step of the trait migration below.
-//! * Nothing diagnostic is lost at the UI layer in the meantime: the
-//!   lossy mapping preserves the full human-readable message verbatim
-//!   (`VJoyError::DriverNotFound` displays its payload as-is), and the
-//!   authoritative rich error always lives in
-//!   `HidMaestroOutput::last_error()`
-//!   / `HidMaestroStatus`,
-//!   which the selector's diagnostics read — never the trait error's
-//!   variant. The selector therefore records failure **reasons as
-//!   strings** (see `SwitchOutcome::fallback_reason` in the
-//!   [`selector`](crate::selector) module) and never branches on a
-//!   never branches on a `VJoyError` variant to identify a
-//!   `HIDMaestro` failure.
-//!
-//! # Migration path (follow-up, not G4)
-//!
-//! 1. Add `impl From<HidMaestroError> for OutputError` in
-//!    `rsh-output-hidmaestro/src/error.rs` (variant-for-variant, using
-//!    the `HIDMaestro`-origin variants below).
-//! 2. Change the [`IJoystickOutput`](crate::IJoystickOutput) trait's
-//!    methods to return `Result<_, OutputError>` and update both
-//!    backends' implementations (`vjoy.rs` maps via the
-//!    [`From<VJoyError>`] impl below; the `HIDMaestro` backend maps via
-//!    step 1).
-//! 3. Delete the lossy `From<HidMaestroError> for VJoyError` impl and
-//!    the `VJoyError` import from the `HIDMaestro` backend.
-//!
-//! Until then, [`OutputError`] is the unified type for everything
-//! *above* the trait: the backend selector
+//! Until a trait migration happens, [`OutputError`] is the unified
+//! type for everything *above* the trait: the backend selector
 //! ([`selector`](crate::selector)), switch outcomes, and diagnostics.
 //! `From<VJoyError>` is exact (variant-for-variant), so no
 //! vJoy-origin information is lost in that conversion either.
 
 use std::fmt;
-use std::path::PathBuf;
 
 use crate::vjoy::VJoyError;
 
@@ -64,12 +26,10 @@ use crate::vjoy::VJoyError;
 ///
 /// Display strings are the human-readable reason (the C# `out string
 /// error`): the Output page shows them verbatim, so they name the fix
-/// ("install vJoy …", "approve the UAC prompt …"), never just a code.
-/// The vJoy-origin variants mirror [`VJoyError`] exactly; the
-/// `HIDMaestro`-origin variants mirror
-/// `HidMaestroError` (in `rsh-output-hidmaestro`) exactly
-/// (same wording), so a future trait migration maps variant-for-variant
-/// with no message change.
+/// ("install vJoy ...", "install the `ViGEmBus` driver ..."), never just a code.
+/// Every variant mirrors [`VJoyError`] exactly (same wording), so
+/// a future trait migration maps variant-for-variant with no
+/// message change.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutputError {
     /// The driver DLL could not be found (registry + `ProgramFiles`
@@ -124,43 +84,6 @@ pub enum OutputError {
     ButtonOutOfRange(u8),
     /// The driver DLL could not be loaded or an export is missing.
     LoadFailed(String),
-    /// The `HIDMaestro` sidecar executable could not be found at the
-    /// resolved path.
-    SidecarNotFound(PathBuf),
-    /// The sidecar process could not be spawned.
-    SidecarSpawnFailed(String),
-    /// No `hello` line arrived within the spawn timeout.
-    SidecarHelloTimeout,
-    /// The `hello` line was malformed or failed validation.
-    SidecarBadHello(String),
-    /// The sidecar died (EOF / crash / heartbeat timeout) mid-session.
-    SidecarDied(String),
-    /// A sidecar reply did not arrive within the reply timeout.
-    SidecarReplyTimeout,
-    /// A sidecar reply was not valid JSON or failed validation.
-    SidecarBadReply(String),
-    /// The operation needs administrator rights and the sidecar is not
-    /// elevated (UAC declined, or RSH was launched non-elevated).
-    NotAdmin,
-    /// The `HIDMaestro` driver is not installed and could not be
-    /// installed.
-    DriverNotInstalled(String),
-    /// `InstallDriver()` failed.
-    DriverInstallFailed(String),
-    /// The requested profile was refused (brand catalog profile, usbip
-    /// composite, own-reports, or not deployable — SEC-H-06).
-    ProfileRefused(String),
-    /// `CreateController` failed.
-    CreateFailed(String),
-    /// The sidecar already failed once and the one retry was used up
-    /// (G3). Cleared by an explicit user re-select. The message
-    /// claims NO fallback (P2-5, v2.0.12 scan): whether one happens
-    /// is decided by the selector — on the automatic path the
-    /// fallback outcome states it, on the explicit path there is
-    /// none.
-    FallbackNeeded,
-    /// This backend only runs on Windows (sidecar + driver).
-    UnsupportedPlatform,
     /// Any other I/O failure talking to a backend.
     Io(String),
     /// The requested backend has no factory (not installed / not
@@ -172,20 +95,8 @@ pub enum OutputError {
     SwitchFailed(String),
 }
 
-impl OutputError {
-    /// True when this error means "the `HIDMaestro` retry is used up —
-    /// fall back to vJoy". Only constructible from the rich
-    /// `HIDMaestro` error (see the module docs); the lossy trait error
-    /// never produces it, so the selector falls back on **any**
-    /// `HIDMaestro` connect failure, not only on this variant.
-    #[must_use]
-    pub const fn fallback_needed(&self) -> bool {
-        matches!(self, Self::FallbackNeeded)
-    }
-}
-
 impl fmt::Display for OutputError {
-    // One arm per variant (34 variants) is longer than clippy's
+    // One arm per variant (20 variants) is longer than clippy's
     // 100-line default for a function; splitting the Display impl
     // would only hide the mapping, so the lint is allowed here.
     #[allow(clippy::too_many_lines)]
@@ -193,7 +104,6 @@ impl fmt::Display for OutputError {
         match self {
             Self::DriverNotFound(msg)
             | Self::InsufficientCapabilities(msg)
-            | Self::ProfileRefused(msg)
             | Self::BackendNotAvailable(msg)
             | Self::SwitchFailed(msg) => write!(f, "{msg}"),
             Self::DriverDisabled => write!(
@@ -249,53 +159,6 @@ impl fmt::Display for OutputError {
                 "Button {button} is out of range (buttons are 1–32; higher buttons are rejected, never clamped)."
             ),
             Self::LoadFailed(msg) => write!(f, "Could not load vJoyInterface.dll: {msg}"),
-            Self::SidecarNotFound(path) => write!(
-                f,
-                "HIDMaestro sidecar not found at {}. Reinstall RSH or switch the output backend to vJoy.",
-                path.display()
-            ),
-            Self::SidecarSpawnFailed(msg) => {
-                write!(f, "Could not start the HIDMaestro sidecar: {msg}")
-            }
-            Self::SidecarHelloTimeout => write!(
-                f,
-                "The HIDMaestro sidecar did not answer in time. Try again or switch the output backend to vJoy."
-            ),
-            Self::SidecarBadHello(msg) => {
-                write!(f, "The HIDMaestro sidecar sent an invalid hello: {msg}")
-            }
-            Self::SidecarDied(msg) => write!(
-                f,
-                "The HIDMaestro sidecar stopped unexpectedly ({msg}). Falling back to vJoy."
-            ),
-            Self::SidecarReplyTimeout => write!(
-                f,
-                "The HIDMaestro sidecar stopped answering. Falling back to vJoy."
-            ),
-            Self::SidecarBadReply(msg) => {
-                write!(f, "The HIDMaestro sidecar sent an invalid reply: {msg}")
-            }
-            Self::NotAdmin => write!(
-                f,
-                "HIDMaestro needs administrator rights: approve the UAC prompt when RSH starts (the elevated helper runs for the whole session), or run RSH as administrator. vJoy needs no prompt."
-            ),
-            Self::DriverNotInstalled(msg) => {
-                write!(f, "HIDMaestro driver is not installed: {msg}")
-            }
-            Self::DriverInstallFailed(msg) => {
-                write!(f, "HIDMaestro driver install failed: {msg}")
-            }
-            Self::CreateFailed(msg) => {
-                write!(f, "HIDMaestro device could not be created: {msg}")
-            }
-            Self::FallbackNeeded => write!(
-                f,
-                "HIDMaestro already failed once and the retry was used up — re-select HIDMaestro in Output settings to try again."
-            ),
-            Self::UnsupportedPlatform => write!(
-                f,
-                "HIDMaestro only runs on Windows (sidecar + driver). Use the vJoy backend on this machine."
-            ),
             Self::Io(msg) => write!(f, "Output backend I/O error: {msg}"),
         }
     }
@@ -348,7 +211,7 @@ mod tests {
             err,
             OutputError::DriverNotFound("vJoy not found".to_string())
         );
-        // The lossy HIDMaestro mapping rides on this variant: the
+        // A backend's lossy mapping rides on this variant: the
         // payload is displayed verbatim, so the real reason survives.
         assert_eq!(err.to_string(), "vJoy not found");
 
@@ -362,35 +225,6 @@ mod tests {
                 dll: "2.2.2".to_string(),
                 driver: "2.1.9".to_string(),
             }
-        );
-    }
-
-    #[test]
-    fn hidmaestro_origin_variants_carry_the_documented_wording() {
-        assert!(OutputError::FallbackNeeded.fallback_needed());
-        assert!(!OutputError::NotConnected.fallback_needed());
-        assert!(
-            OutputError::NotAdmin
-                .to_string()
-                .contains("approve the UAC prompt")
-        );
-        assert!(
-            OutputError::FallbackNeeded
-                .to_string()
-                .contains("retry was used up")
-        );
-        // P2-5 (v2.0.12 scan): the wording claims NO fallback —
-        // the fallback is stated by the selector's outcome on the
-        // automatic path, never by this error on the explicit path.
-        assert!(
-            !OutputError::FallbackNeeded
-                .to_string()
-                .contains("falling back to vJoy")
-        );
-        assert!(
-            OutputError::UnsupportedPlatform
-                .to_string()
-                .contains("only runs on Windows")
         );
     }
 }

@@ -1,8 +1,8 @@
 //! App state (Phase G0 — the Phase G entry item, SW-R6.1).
 //!
 //! [`AppStateCore`] is the testable half of the Tauri app state: it owns
-//! the engine metrics + [`LoopRateTracker`](crate::snapshot::LoopRateTracker)
-//! + [`EncoderState`](crate::snapshot::EncoderState), the installed output
+//! the engine metrics + [`LoopRateTracker`](crate::snapshot::LoopRateTracker),
+//! the installed output
 //! backend (a boxed [`IJoystickOutput`](rsh_output::IJoystickOutput)), the
 //! game launcher, and the profile store. The Tauri shell
 //! (`src-tauri/src/app_state.rs`) wraps this in the Tauri-managed
@@ -17,17 +17,13 @@
 //! `update` / `send_neutral`, all `Result`-based;
 //! `ProcessedState = rsh_engine::pipeline::OutputState`). The G4
 //! selector swaps the backend in this slot at runtime — vJoy
-//! (default, G3), `HIDMaestro` (explicit choice, G2), or the [`NullSink`](crate::system::NullSink)
+//! (default, G3), Xbox (ViGEmBus fallback), or the [`NullSink`](crate::system::NullSink)
 //! (no device) — via `AppStateCore::set_output_backend`. At launch the
 //! shell calls [`AppStateCore::activate_startup_backend`], which
 //! activates the persisted `AppSettings.output_backend` choice through
-//! the same selector — except an elevated backend (`HIDMaestro`), which
-//! is NEVER activated at startup (hotfix v1.0.1: its `runas` launch
-//! would pop a UAC prompt on every launch). A persisted `HIDMaestro`
-//! choice is deferred instead: the [`NullSink`] stays installed, the
-//! outcome records `active: None` with the reason, and the user
-//! activates it by enabling output or picking it on the Output page
-//! (user-initiated, so the UAC prompt there is expected). The
+//! the same selector. A persisted `HIDMaestro` value (the deleted
+//! v2.0.18 backend) migrates to vJoy — see
+//! [`migrate_persisted_backend_default`]. The
 //! [`NullSink`] is only the fallback base when activation fails, and
 //! the failure reason is recorded in the backend detail and in the
 //! startup outcome — never silently. Until activation runs the installed backend is the
@@ -69,7 +65,7 @@
 //! - **Status packets are forwarded.** The forwarder drains the
 //!   transport's status channel after every stream frame and pumps
 //!   the packets into the engine's `status_sender` (H1 condition 12),
-//!   so `btnsEx` and the board loss counters reach the engine. While
+//!   so the board loss counters reach the engine. While
 //!   no stream frame arrives the pump waits with it (status only
 //!   moves while frames flow); the engine still drains its own
 //!   status channel on every tick.
@@ -173,16 +169,14 @@ use rsh_engine::engine::{
 use rsh_engine::metrics::EngineMetrics;
 use rsh_engine::pipeline::OutputState as PipelineOutputState;
 use rsh_engine::pipeline::{PipelinePlan, ProcessingPipeline};
+use rsh_output::VigemOutput;
 use rsh_output::selector::{BackendFactories, BackendKind, SwitchOutcome, switch_backend};
 #[cfg(windows)]
 use rsh_output::vjoy::{RealVJoyDll, VJoyInterface};
 use rsh_output::vjoy::{VJOY_DOWNLOAD_URL, VJoyOutput, resolve_dll_path};
 #[cfg(windows)]
-use rsh_output::vjoy_config::configure_device_1_envelope_and_mappings;
+use rsh_output::vjoy_config::configure_device_1_envelope;
 use rsh_output::{IJoystickOutput, ProcessedState, VJoyError};
-use rsh_output_hidmaestro::backend::UAC_NOTE;
-use rsh_output_hidmaestro::manager::resolve_sidecar_path;
-use rsh_output_hidmaestro::{G29PedalMap, HidMaestroConfig, HidMaestroOutput};
 use rsh_profiles::bindings::{BindingError, BindingStore, is_app_action};
 use rsh_profiles::csharp_import::{
     GameId, KNOWN_MODULES, PedalCalibration, PerModuleTuning, SteeringCalibration, WheelProfile,
@@ -201,7 +195,6 @@ use rsh_profiles::watcher::{
 use rsh_protocol::config::ConfigBlob;
 use rsh_protocol::control::LedTestPattern;
 use rsh_protocol::stream::MAX_AXES;
-use rsh_protocol::stream::MAX_ENCODERS;
 use rsh_protocol::stream::StatusPacket;
 use rsh_protocol::stream::StreamFrame;
 use rsh_protocol::{GetCapsReply, HelloReply};
@@ -231,8 +224,8 @@ use crate::firmware_image;
 use crate::launcher::{GameLauncher, SystemSpawner};
 use crate::manual_games::ManualGameStore;
 use crate::snapshot::{
-    ConnectionState, EncoderState, EngineSnapshot, EngineStats, LoopRateTracker, PedalSnapshot,
-    SnapshotInput, build_engine_stats_cached,
+    ConnectionState, EngineSnapshot, EngineStats, LoopRateTracker, PedalSnapshot, SnapshotInput,
+    build_engine_stats_cached,
 };
 use crate::system::{NullSink, ShutdownOutcome};
 use crate::telemetry_adapter::TelemetryCarSource;
@@ -332,10 +325,9 @@ pub const SNAPSHOT_EMIT_INTERVAL_MS: u64 = 33;
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ButtonPressEvent {
-    /// Button number: 1–32 physical, 33–64 extended, 65–72 encoder virtual.
+    /// Button number: 1–32 physical.
     pub button: u8,
-    /// True on press, false on release. Encoder virtual buttons are
-    /// momentary pulses: only the `pressed: true` edge is emitted.
+    /// True on press, false on release.
     pub pressed: bool,
 }
 
@@ -431,29 +423,6 @@ struct VjoyDllCache {
 /// long enough that the ~1 Hz slow poll never probes, short enough
 /// that a hand-installed driver shows up without a restart.
 const VJOY_DLL_CACHE_TTL: Duration = Duration::from_secs(60);
-
-/// Cached FH4 wheel check (v2.0.14): [`AppStateCore::vjoy_status`]
-/// is called ~1 Hz by the slow poll, but the check reads the
-/// registry + loads the vJoy DLL — it runs at most once per
-/// [`WHEEL_CHECK_CACHE_TTL`] window, or when invalidated (backend
-/// switch, vJoy install completion). Off Windows the check does
-/// not exist, so the cache stays empty and `vjoy_status()` reports
-/// `wheel_check: None` forever.
-#[derive(Default)]
-struct WheelCheckCache {
-    /// When the cached check ran ([`None`] = never checked, or
-    /// invalidated — the next read re-checks immediately).
-    checked_at: Option<Instant>,
-    /// The last check result ([`None`] off Windows, or before the
-    /// first check ran).
-    result: Option<rsh_api::WheelCheck>,
-}
-
-/// Time after which the cached wheel check is re-run (v2.0.14):
-/// the mapping / envelope only change when something installs or
-/// reconfigures vJoy, so 30 s is plenty live without re-reading
-/// the registry every slow-poll cycle.
-const WHEEL_CHECK_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Cached Wi-Fi password-set flag (R3-D-08): [`AppStateCore::wifi_status`]
 /// did one Credential Manager read per call, and the daemon's slow
@@ -571,20 +540,17 @@ pub enum SnapshotEmit {
 
 /// Inputs for one engine tick, as [`AppStateCore::ingest_frame`] consumes
 /// them. The caller is the engine task (or a test driving it): steering
-/// and pedals are the pipeline's processed values, encoder counts are
-/// the board's cumulative `i16` counts, `output` is the pipeline's
+/// and pedals are the pipeline's processed values, `output` is the pipeline's
 /// [`PipelineOutputState`] for this tick (button edges are diffed from
 /// it), and `metrics` is the engine's current metrics snapshot.
+/// (v2.0.19: encoder counts are gone — the firmware sends zeros and
+/// nothing reads them.)
 #[derive(Clone, Copy, Debug)]
 pub struct FrameInput {
     /// Steering angle in degrees, -450..450.
     pub steering_deg: f64,
     /// Pedal positions 0..1.
     pub pedals: PedalSnapshot,
-    /// Cumulative encoder counts from the latest stream frame.
-    pub encoder_counts: [i16; MAX_ENCODERS],
-    /// How many encoders the frame carries (`n_enc <= 4`).
-    pub n_enc: usize,
     /// The pipeline's processed output for this tick.
     pub output: PipelineOutputState,
     /// The engine's current metrics.
@@ -810,7 +776,7 @@ type BackendHandle = Arc<Mutex<Box<dyn IJoystickOutput>>>;
 
 /// The testable app state (Phase G0).
 ///
-/// Owns the engine metrics + loop-rate tracker + encoder state, the
+/// Owns the engine metrics + loop-rate tracker, the
 /// installed output backend, the game launcher, and the profile store.
 /// Every command the Tauri shell exposes reads/writes this state — no
 /// command invents data, and no command succeeds without its backing
@@ -825,19 +791,17 @@ pub struct AppStateCore {
     metrics: Mutex<EngineMetrics>,
     /// Measured engine loop rate (sliding 1 s window).
     loop_rate: Mutex<LoopRateTracker>,
-    /// Encoder baselines + virtual-button derivation.
-    encoders: Mutex<EncoderState>,
     /// The installed output backend ([`IJoystickOutput`]). Starts as
     /// the [`NullSink`]; the G4 selector swaps this slot at runtime
-    /// (vJoy default, `HIDMaestro` explicit choice, none) — see
+    /// (vJoy default, Xbox, none) — see
     /// [`AppStateCore::set_output_backend`].
     ///
     /// PERF F-15: the slot holds an `Arc` handle to a per-instance
     /// mutex, not the backend directly. A caller clones the handle
     /// under this slot lock (microseconds — see
     /// [`AppStateCore::backend_handle`]) and runs slow backend calls
-    /// (`update()`, up to ~200 ms on `HIDMaestro`'s sidecar
-    /// round-trip) on the handle's own lock, so the 200 Hz engine
+    /// (`update()`, up to ~200 ms on a slow backend)
+    /// on the handle's own lock, so the 200 Hz engine
     /// tick never stalls a backend switch and a switch never stalls
     /// a tick: a switch swaps the slot `Arc`, the tick keeps sending
     /// to the instance it cloned, and the next tick picks up the new
@@ -860,7 +824,7 @@ pub struct AppStateCore {
     output_enabled: Mutex<bool>,
     /// Last pipeline output (resent on re-enable; neutral on disable).
     last_output: Mutex<PipelineOutputState>,
-    /// Last button bitmask seen (`buttons | buttons_ex << 32`), for edge diffing.
+    /// Last button bitmask seen (`buttons`), for edge diffing.
     last_buttons: Mutex<u64>,
     /// Outcome of the most recent backend send (`None` = never attempted).
     last_send_ok: Mutex<Option<bool>>,
@@ -962,29 +926,9 @@ pub struct AppStateCore {
     /// Load-time warnings from the manual-games store (see
     /// [`AppStateCore::manual_game_load_warnings`]).
     manual_game_load_warnings: Vec<String>,
-    /// Last pressed set for buttons 1–64 (`buttons | buttons_ex <<
-    /// 32`), for app-action edge detection in
-    /// [`AppStateCore::apply_bindings`].
+    /// Last pressed set for buttons 1–32 (`buttons`), for app-action
+    /// edge detection in [`AppStateCore::apply_bindings`].
     last_bound_pressed: Mutex<u64>,
-    /// Last encoder-button bits seen (`encoder_buttons.0`, bits
-    /// 0–7 = virtual buttons 65–72), for app-action edge detection
-    /// in [`AppStateCore::apply_bindings`] (R2-08): the engine
-    /// repeats `last_output` on ticks with no new frame, so a
-    /// momentary encoder pulse would otherwise re-fire its app
-    /// action on every tick until the next frame recomputes it.
-    last_bound_encoder: Mutex<u8>,
-    /// Last long-press set for buttons 1–32 (the engine's
-    /// `long_press_buttons` word), for app-action edge detection
-    /// in [`AppStateCore::apply_bindings`] (BU2): a held button's
-    /// long-press app action must fire once, when the threshold is
-    /// crossed — not once per 200 Hz tick while it stays held.
-    last_long_press_pressed: Mutex<u64>,
-    /// Last double-press set for buttons 1–32 (the engine's
-    /// `double_press_buttons` word), for app-action edge detection
-    /// in [`AppStateCore::apply_bindings`] (BU3): a double-pressed
-    /// button's 2nd app action must fire once, when the second
-    /// press starts — not once per 200 Hz tick while it stays held.
-    last_double_press_pressed: Mutex<u64>,
     /// Queued app actions from bound button presses, drained by the
     /// daemon manager loop ([`AppStateCore::drain_binding_actions`]).
     binding_actions: Mutex<VecDeque<BindingAppAction>>,
@@ -1016,9 +960,6 @@ pub struct AppStateCore {
     engine_frame_tx: Mutex<Option<tokio::sync::mpsc::Sender<StreamFrame>>>,
     /// The last [`EngineReport`] a stopped engine delivered, if any.
     engine_last_report: Mutex<Option<EngineReport>>,
-    /// Cumulative encoder counts reconstructed from the engine's
-    /// per-tick deltas (see [`EngineSink`]).
-    engine_encoders: Mutex<EngineEncoderAccum>,
     /// Latest raw axis readings in mV (see [`RawAxesSample`]): the
     /// capture methods sample this slot. Reported per frame by the
     /// frame feeder ([`AppStateCore::note_raw_axes`]).
@@ -1042,10 +983,6 @@ pub struct AppStateCore {
     /// `installing` / `install_error` are NOT cached — they are
     /// cheap lock reads and must stay live.
     vjoy_dll_cache: Mutex<VjoyDllCache>,
-    /// Cached FH4 wheel check (v2.0.14, see [`WheelCheckCache`]):
-    /// the check result `vjoy_status()` reports, so the ~1 Hz slow
-    /// poll does not re-run the registry / DLL reads every cycle.
-    wheel_check_cache: Mutex<WheelCheckCache>,
     /// Last measured vJoy driver version (P3-9, v2.0.12 scan):
     /// the live vJoy backend measures it at connect (see
     /// [`IJoystickOutput::vjoy_driver_version`]), and `vjoy_status()`
@@ -1116,32 +1053,6 @@ pub struct AppStateCore {
     /// When the last failover attempt ran (C-FAIL-1 rate limit: at
     /// most one attempt per 30 s, even after a reset).
     fallback_last_attempt: Mutex<Option<Instant>>,
-    /// Whether the user declined the `HIDMaestro` UAC prompt this
-    /// session (B-2/A10, v2.0.2): while set, an automatic
-    /// (re-)activation of `HIDMaestro` fails fast with the `NotAdmin`
-    /// message instead of prompting again. Only an explicit user
-    /// re-select ([`AppStateCore::set_output_backend`]) clears it —
-    /// the in-place re-arm in [`Self::apply_backend_switch`] (P2,
-    /// v2.0.11) must NOT clear it, or the prompt would loop again.
-    /// (The re-arm clears the backend manager's own decline latch;
-    /// this app-core flag is a separate latch, cleared only by the
-    /// explicit re-select path.)
-    elevation_declined: AtomicBool,
-    /// Consecutive failed EXPLICIT switches to `HIDMaestro` this
-    /// session (P2, v2.0.11 — the retry-storm guard). At 3 failures
-    /// (`HID_SWITCH_MAX_CONSECUTIVE_FAILURES`) the explicit switch
-    /// is refused for 30 s (`HID_SWITCH_COOLDOWN`, see
-    /// `hid_switch_cooldown_until` below). A successful explicit
-    /// switch resets the count.
-    hid_switch_failures: AtomicU32,
-    /// When the explicit-`HIDMaestro`-switch cooldown ends (P2,
-    /// v2.0.11): while in the future, an explicit switch to
-    /// `HIDMaestro` fails fast with `HID_SWITCH_COOLDOWN_MESSAGE`
-    /// instead of spawning another sidecar. `None` when no cooldown
-    /// is active. Automatic paths (startup activation, deferred
-    /// enable, mid-session failover) never consult this — only the
-    /// explicit user switch does.
-    hid_switch_cooldown_until: Mutex<Option<std::time::Instant>>,
     /// Serialises backend switches (B-2): a switch already in
     /// flight (UAC prompt on screen / sidecar spawning, up to ~10 s)
     /// rejects a second overlapping switch instead of spawning a
@@ -1319,7 +1230,6 @@ impl AppStateCore {
         let state = Self {
             metrics: Mutex::new(EngineMetrics::new()),
             loop_rate: Mutex::new(LoopRateTracker::new()),
-            encoders: Mutex::new(EncoderState::new()),
             backend: Mutex::new(Arc::new(Mutex::new(backend))),
             backend_name: Mutex::new(backend_name),
             backend_detail: Mutex::new(backend_detail.into()),
@@ -1351,9 +1261,6 @@ impl AppStateCore {
             manual_games: Mutex::new(manual_games),
             manual_game_load_warnings,
             last_bound_pressed: Mutex::new(0),
-            last_bound_encoder: Mutex::new(0),
-            last_long_press_pressed: Mutex::new(0),
-            last_double_press_pressed: Mutex::new(0),
             binding_actions: Mutex::new(VecDeque::new()),
             stop_handle: Mutex::new(None),
             engine_status: Mutex::new(EngineTaskStatus::Idle),
@@ -1364,13 +1271,11 @@ impl AppStateCore {
             engine_ready_rx: Mutex::new(None),
             engine_frame_tx: Mutex::new(None),
             engine_last_report: Mutex::new(None),
-            engine_encoders: Mutex::new(EngineEncoderAccum::default()),
             raw_axes: Mutex::new(RawAxesSample::default()),
             startup_backend: Mutex::new(None),
             backend_migration_note: Mutex::new(backend_migration_note),
             vjoy_install: Mutex::new(VjoyInstallState::default()),
             vjoy_dll_cache: Mutex::new(VjoyDllCache::default()),
-            wheel_check_cache: Mutex::new(WheelCheckCache::default()),
             last_vjoy_driver_version: Mutex::new(None),
             wifi_password_cache: Mutex::new(WifiPasswordCache::default()),
             session_gate_open: Mutex::new(false),
@@ -1385,9 +1290,6 @@ impl AppStateCore {
             pre_game_profile: Mutex::new(None),
             fallback_used: AtomicBool::new(false),
             fallback_last_attempt: Mutex::new(None),
-            elevation_declined: AtomicBool::new(false),
-            hid_switch_failures: AtomicU32::new(0),
-            hid_switch_cooldown_until: Mutex::new(None),
             switch_in_flight: Mutex::new(()),
             firmware_update: Mutex::new(FirmwareUpdateStatus::default()),
             board_reachable: AtomicBool::new(false),
@@ -1427,9 +1329,8 @@ impl AppStateCore {
     /// startup default: the shell calls
     /// [`AppStateCore::activate_startup_backend`] right after opening,
     /// which activates the persisted backend choice through the
-    /// selector (vJoy when selected; a persisted `HIDMaestro` choice
-    /// is deferred at startup — no UAC prompt — until the user enables
-    /// output or picks it on the Output page), with the reason
+    /// selector (vJoy when selected; a persisted `HIDMaestro` value
+    /// migrates to vJoy), with the reason
     /// recorded on failure. A missing store file means defaults (one `Default`
     /// profile, default settings); a corrupt file is an error, never
     /// silently dropped data.
@@ -1490,7 +1391,7 @@ impl AppStateCore {
     /// Clone the live backend handle (PERF F-15): the slot lock is
     /// held only for the `Arc` clone. The caller then locks the
     /// handle's own mutex for its backend call — a slow `update()`
-    /// (up to ~200 ms on `HIDMaestro`'s sidecar round-trip) never
+    /// (up to ~200 ms on a slow backend) never
     /// holds the slot lock, so it cannot stall a backend switch,
     /// and a switch (which swaps the slot handle) cannot stall a
     /// tick: the tick keeps sending to the instance it cloned and
@@ -1943,10 +1844,9 @@ impl AppStateCore {
         self.board_reachable.store(false, Ordering::SeqCst);
     }
 
-    /// Live button bitmask (H10, v2.0.2): the raw combined mask
-    /// (`buttons | buttons_ex << 32`) from the last button edge
-    /// frame — bit `n - 1` is wheel button `n` (1–64). `0` = none
-    /// pressed / no frame yet.
+    /// Live button bitmask (H10, v2.0.2): the raw `buttons` mask
+    /// from the last button edge frame — bit `n - 1` is wheel button
+    /// `n` (1–32). `0` = none pressed / no frame yet.
     #[must_use]
     pub fn pressed_button_mask(&self) -> u64 {
         *lock(&self.last_buttons)
@@ -2666,7 +2566,7 @@ impl AppStateCore {
     /// Read the pin map (`get_pin_map`): the single-pin functions
     /// the Settings editor can round-trip (steering, accelerator,
     /// brake, clutch, handbrake, horn, led). Multi-pin records
-    /// (shifter, encoders, button matrix), the shifter up/down
+    /// (shifter, button matrix), the shifter up/down
     /// `BUTTON` slots, and battery / I²C records are omitted — the
     /// editor cannot express them, and `set_pin_map` preserves them
     /// untouched.
@@ -3090,7 +2990,7 @@ impl AppStateCore {
     }
 
     /// Feeds one engine tick into the state: ticks the loop-rate
-    /// tracker, stores the metrics, updates the encoders, diffs the
+    /// tracker, stores the metrics, diffs the
     /// button bits into `rsh://button-press` edges, and builds + stores
     /// the next snapshot. Returns the snapshot built for this tick.
     /// Short-held locks only — the engine never waits on the UI.
@@ -3099,7 +2999,6 @@ impl AppStateCore {
         lock(&self.loop_rate).tick();
         *lock(&self.metrics) = input.metrics;
 
-        let encoders = lock(&self.encoders).update(&input.encoder_counts, input.n_enc);
         let seq = {
             let mut guard = lock(&self.seq);
             *guard += 1;
@@ -3116,16 +3015,14 @@ impl AppStateCore {
             stats,
             active_profile_id,
             seq,
-            encoders,
             seq_gap: input.metrics.seq_gap,
             tx_fail: input.metrics.tx_fail,
-            // M-3: handbrake + gear come from the pipeline output, so
-            // the Overview always shows the live values, never stale
-            // or hardcoded ones.
+            // M-3: handbrake comes from the pipeline output, so
+            // the Overview always shows the live value, never a stale
+            // or hardcoded one.
             handbrake: f64::from(input.output.handbrake),
-            gear: input.output.gear,
         });
-        self.push_button_edges(&input.output, &snapshot);
+        self.push_button_edges(&input.output);
         // Bindings apply AFTER the raw edges are queued (learn mode
         // + the UI highlight see the physical button) and BEFORE the
         // output is stored: `last_output` — and the backend send,
@@ -3143,17 +3040,12 @@ impl AppStateCore {
     /// * Game action: the source button's bit is cleared and the
     ///   target is set while the button is held — `horn` sets bit 4
     ///   (button 5, plus the `horn` flag), `shifter_up` /
-    ///   `shifter_down` set bits 0/1, `gear_N` sets the decoded
-    ///   `gear` field, `handbrake` drives the handbrake axis to
-    ///   1.0. The game never sees the raw button as well.
+    ///   `shifter_down` set bits 0/1, `handbrake` drives the handbrake
+    ///   axis to 1.0. The game never sees the raw button as well.
     /// * App action: on a press *edge* only (a held button must not
     ///   repeat at 200 Hz), the action is queued for the daemon
     ///   manager loop ([`AppStateCore::drain_binding_actions`]); the
-    ///   output is untouched. Encoder pulses (65–72) are edge-detected
-    ///   against the previous tick's encoder bits (R2-08) — the
-    ///   engine repeats `last_output` on ticks with no new frame, so
-    ///   a momentary pulse repeated across ticks is one edge, not one
-    ///   action per tick.
+    ///   output is untouched.
     /// * No binding for a button: the tick passes through unchanged
     ///   (the pre-binding default behaviour).
     /// * A binding to `horn` bypasses the horn module gate on
@@ -3162,99 +3054,30 @@ impl AppStateCore {
     ///   while its button is already held fires its app action
     ///   once on the next tick — the edge baseline only tracks
     ///   ticks that pass through here.)
-    /// * Long-press action (BU2): a button with a long-press
-    ///   binding fires its *normal* action while held, and the
-    ///   long-press action takes over once the engine's
-    ///   `long_press_buttons` bit for it is set (held past the
-    ///   threshold). A button with only a long-press binding passes
-    ///   its raw bit through until the threshold, then the
-    ///   long-press action takes over. The short-press action is
-    ///   therefore NOT delayed — a hold shows the normal action
-    ///   first, then the long-press one. A long-press app action
-    ///   fires once, on the threshold edge
-    ///   (`last_long_press_pressed` baseline), not once per tick.
-    /// * Double-press action (BU3): the same 2nd action — a
-    ///   button whose press starts within the double-press window
-    ///   of its previous release switches to its long-press action
-    ///   for the whole hold (the engine's `double_press_buttons`
-    ///   bit). A double-press app action fires once, on the second
-    ///   press edge (`last_double_press_pressed` baseline).
+    ///   (v2.0.19: encoder virtual buttons 65–72, long-press and
+    ///   double-press actions, and H-pattern `gear_N` actions are
+    ///   deleted — only physical buttons 1–32 and the four surviving
+    ///   game actions remain.)
     fn apply_bindings(&self, output: &PipelineOutputState) -> PipelineOutputState {
         let bindings = lock(&self.bindings).list().clone();
-        let long_press = lock(&self.bindings).list_long_press().clone();
-        let pressed64 = u64::from(output.buttons) | (u64::from(output.buttons_ex) << 32);
-        if bindings.is_empty() && long_press.is_empty() {
+        let pressed64 = u64::from(output.buttons);
+        if bindings.is_empty() {
             *lock(&self.last_bound_pressed) = pressed64;
-            *lock(&self.last_bound_encoder) = output.encoder_buttons.0;
-            *lock(&self.last_long_press_pressed) = u64::from(output.long_press_buttons);
-            *lock(&self.last_double_press_pressed) = u64::from(output.double_press_buttons);
             return *output;
         }
         let mut out = *output;
         let mut queued: Vec<BindingAppAction> = Vec::new();
         {
             let mut last_pressed = lock(&self.last_bound_pressed);
-            let mut last_encoder = lock(&self.last_bound_encoder);
-            let mut last_long_press = lock(&self.last_long_press_pressed);
-            let mut last_double_press = lock(&self.last_double_press_pressed);
-            // Every button with a normal binding, a long-press
-            // binding, or both — one pass, one edge baseline each.
-            let mut buttons: Vec<u8> = bindings.keys().copied().collect();
-            for button in long_press.keys() {
-                if !bindings.contains_key(button) {
-                    buttons.push(*button);
-                }
-            }
-            for button in buttons {
-                let normal = bindings.get(&button).map(String::as_str);
-                let long_action = long_press.get(&button).map(String::as_str);
-                if !Self::binding_button_pressed(button, output, pressed64) {
+            for (&button, action) in &bindings {
+                if !Self::binding_button_pressed(button, pressed64) {
                     continue;
                 }
-                // BU2+BU3: past the threshold (long-press) or on a
-                // second press inside the window (double-press) the
-                // 2nd action takes over (falling back to the normal
-                // action when no 2nd action is set); before either,
-                // only the normal action applies — a 2nd-action-only
-                // button passes its raw bit through until then.
-                let long_pressed = (1..=32).contains(&button)
-                    && output.long_press_buttons & (1u32 << (u64::from(button) - 1)) != 0;
-                let double_pressed = (1..=32).contains(&button)
-                    && output.double_press_buttons & (1u32 << (u64::from(button) - 1)) != 0;
-                let second_action = long_pressed || double_pressed;
-                let from_second_action = second_action && long_action.is_some();
-                let Some(action) = (if second_action {
-                    long_action.or(normal)
-                } else {
-                    normal
-                }) else {
-                    continue;
-                };
                 if is_app_action(action) {
-                    // Edge only — see the method docs. Encoder
-                    // buttons (65–72) are edge-detected against the
-                    // previous tick's encoder bits (R2-08), exactly
-                    // like the physical-button path below; a
-                    // long-press app action is edge-detected
-                    // against the previous tick's long-press bits,
-                    // a double-press one against the previous
-                    // tick's double-press bits.
-                    let edge = if from_second_action {
-                        let bit = 1_u64 << (u64::from(button) - 1);
-                        if double_pressed {
-                            *last_double_press & bit == 0
-                        } else {
-                            *last_long_press & bit == 0
-                        }
-                    } else if button >= 65 {
-                        let bit = 1_u8 << (button - 65);
-                        *last_encoder & bit == 0
-                    } else {
-                        let bit = 1_u64 << (u64::from(button) - 1);
-                        *last_pressed & bit == 0
-                    };
-                    if edge {
-                        match action {
+                    // Edge only — see the method docs.
+                    let bit = 1_u64 << (u64::from(button) - 1);
+                    if *last_pressed & bit == 0 {
+                        match action.as_str() {
                             "profile_next" => queued.push(BindingAppAction::ProfileNext),
                             "profile_previous" => {
                                 queued.push(BindingAppAction::ProfilePrevious);
@@ -3266,7 +3089,7 @@ impl AppStateCore {
                 }
                 // Game action: clear the source bit, set the target.
                 Self::clear_bound_button(&mut out, button);
-                match action {
+                match action.as_str() {
                     "horn" => {
                         // HID P1-1: the canonical horn bit is 4
                         // (stream `buttons` bit 4), not 2 — bit 2
@@ -3276,12 +3099,6 @@ impl AppStateCore {
                     }
                     "shifter_up" => out.buttons |= 1 << 0,
                     "shifter_down" => out.buttons |= 1 << 1,
-                    "gear_1" => out.gear = 1,
-                    "gear_2" => out.gear = 2,
-                    "gear_3" => out.gear = 3,
-                    "gear_4" => out.gear = 4,
-                    "gear_5" => out.gear = 5,
-                    "gear_6" => out.gear = 6,
                     "handbrake" => out.handbrake = 1.0,
                     // An unknown action can never be stored (the
                     // store validates on set and on load) — ignore
@@ -3290,9 +3107,6 @@ impl AppStateCore {
                 }
             }
             *last_pressed = pressed64;
-            *last_encoder = output.encoder_buttons.0;
-            *last_long_press = u64::from(output.long_press_buttons);
-            *last_double_press = u64::from(output.double_press_buttons);
         }
         if !queued.is_empty() {
             lock(&self.binding_actions).extend(queued);
@@ -3301,15 +3115,11 @@ impl AppStateCore {
     }
 
     /// True when wheel button `button` is pressed in this tick's
-    /// output: bits of `buttons` are buttons 1–32, bits of
-    /// `buttons_ex` are buttons 33–64 (pre-combined in
-    /// `pressed64`), and `encoder_buttons` bit `n` is virtual
-    /// button `65 + n`.
-    fn binding_button_pressed(button: u8, output: &PipelineOutputState, pressed64: u64) -> bool {
-        if button >= 65 {
-            let bit = button - 65;
-            bit < 8 && output.encoder_buttons.0 & (1 << bit) != 0
-        } else if button >= 1 {
+    /// output: bits of `buttons` are buttons 1–32 (pre-combined in
+    /// `pressed64`). Buttons outside 1–32 never press (v2.0.19:
+    /// encoder virtual buttons 65–72 are deleted).
+    fn binding_button_pressed(button: u8, pressed64: u64) -> bool {
+        if (1..=32).contains(&button) {
             pressed64 & (1_u64 << (u64::from(button) - 1)) != 0
         } else {
             false
@@ -3318,23 +3128,18 @@ impl AppStateCore {
 
     /// Clear one wheel button's bit from a tick's output (the
     /// source bit of a bound game action — the game must not see
-    /// the raw button as well as the bound target).
+    /// the raw button as well as the bound target). Only physical
+    /// buttons 1–32 have bits.
     fn clear_bound_button(out: &mut PipelineOutputState, button: u8) {
-        match button {
-            1..=32 => out.buttons &= !(1 << (u64::from(button) - 1)),
-            33..=64 => out.buttons_ex &= !(1 << (u64::from(button) - 33)),
-            65..=72 => {
-                out.encoder_buttons.0 &= !(1 << (button - 65));
-            }
-            _ => {}
+        if (1..=32).contains(&button) {
+            out.buttons &= !(1 << (u64::from(button) - 1));
         }
     }
 
     /// Diffs `output`'s button bits against the previous tick and
-    /// queues the edges; encoder virtual-button pulses (65–72) from
-    /// the snapshot are momentary, so only the press edge is queued.
-    fn push_button_edges(&self, output: &PipelineOutputState, snapshot: &EngineSnapshot) {
-        let combined = u64::from(output.buttons) | (u64::from(output.buttons_ex) << 32);
+    /// queues the edges (physical buttons 1–32 only).
+    fn push_button_edges(&self, output: &PipelineOutputState) {
+        let combined = u64::from(output.buttons);
         let mut last = lock(&self.last_buttons);
         let changed = combined ^ *last;
         *last = combined;
@@ -3345,12 +3150,12 @@ impl AppStateCore {
             // edge batch is the pick. Collected here, applied after
             // the events lock is dropped (no nested locking).
             let mut learned: Option<u8> = None;
-            for button in 1..=64_u8 {
+            for button in 1..=32_u8 {
                 let bit = 1_u64 << (u64::from(button) - 1);
                 if changed & bit != 0 {
                     let pressed = combined & bit != 0;
                     events.push_back(ButtonPressEvent { button, pressed });
-                    if pressed && (1..=32).contains(&button) && learned.is_none() {
+                    if pressed && learned.is_none() {
                         learned = Some(button);
                     }
                 }
@@ -3362,13 +3167,6 @@ impl AppStateCore {
                 *lock(&self.learned_button) = Some(button);
                 *lock(&self.learn_armed) = false;
             }
-        }
-        let mut events = lock(&self.button_events);
-        for &button in &snapshot.encoder_buttons {
-            events.push_back(ButtonPressEvent {
-                button,
-                pressed: true,
-            });
         }
     }
 
@@ -3430,10 +3228,9 @@ impl AppStateCore {
     /// Current output state, exactly as the backend reports it: the
     /// installed backend's name, `connected` from the backend's live
     /// `is_connected()`, and a detail that names the backend plus the
-    /// last send's outcome. `enabled` is the toggle state. When the
-    /// live backend is `HIDMaestro` the detail carries the UAC note
-    /// (elevated helper for the whole session); after a fallback it
-    /// also names the requested backend and the failure reason.
+    /// last send's outcome. `enabled` is the toggle state. After a
+    /// fallback the detail also names the requested backend and the
+    /// failure reason.
     #[must_use]
     pub fn output_state(&self) -> CommandOutputState {
         let backend = self.backend_handle();
@@ -3457,46 +3254,8 @@ impl AppStateCore {
     #[must_use]
     pub fn set_output_enabled(&self, enabled: bool) -> CommandOutputState {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
-        let factories = real_backend_factories(
-            vjoy_device_id,
-            self.settings().g29_spoof_mode,
-            &self.settings().g29_pedal_layout,
-            self.settings().g29_handbrake_button,
-        );
+        let factories = real_backend_factories(vjoy_device_id);
         self.set_output_enabled_with_factories(enabled, &factories)
-    }
-
-    /// Storm-guard refusal for the enable toggle (P1-5,
-    /// update4-fix): `Some(state)` when enabling output would
-    /// spawn a `HIDMaestro` sidecar while the cooldown is armed —
-    /// the refusal is recorded honestly and no backend is touched.
-    /// `None` when the toggle may proceed (no spawn would happen,
-    /// or the guard is not armed). Split out of
-    /// [`Self::set_output_enabled_with_factories`] so that function
-    /// stays under clippy's `too_many_lines` limit.
-    fn hid_switch_cooldown_refusal(&self) -> Option<CommandOutputState> {
-        // Enabling output spawns a sidecar exactly like an explicit
-        // switch when the live backend is a disconnected
-        // `HIDMaestro` (plain reconnect) or when the deferred
-        // activation would switch a persisted `HIDMaestro` in —
-        // so a toggle loop used to bypass the cooldown entirely. A
-        // connected backend is unaffected (enabling it only resends,
-        // never spawns), and a disconnected vJoy is unaffected too
-        // (its reconnect spawns nothing).
-        let live_kind = BackendKind::from_backend_name(&self.backend_name());
-        let enable_would_spawn_hidmaestro = !lock(&self.backend_handle()).is_connected()
-            && (live_kind == Some(BackendKind::HidMaestro)
-                || (live_kind == Some(BackendKind::None)
-                    && self.selected_backend() == BackendKind::HidMaestro));
-        if enable_would_spawn_hidmaestro && self.hid_switch_cooldown_active() {
-            self.record_send(
-                false,
-                format!("output enabled: {}", Self::HID_SWITCH_COOLDOWN_MESSAGE),
-            );
-            Some(self.output_state())
-        } else {
-            None
-        }
     }
 
     /// Deferred-activation half of
@@ -3522,21 +3281,8 @@ impl AppStateCore {
             // not an explicit backend switch (Bug 4/8 bans the
             // fallback only for `set_output_backend`).
             return match self.apply_backend_switch(requested, factories, true) {
-                Ok(outcome) => {
-                    // P1-5: a `HIDMaestro` activation that fell
-                    // back to vJoy still spent a failed sidecar
-                    // spawn — it counts toward the storm guard,
-                    // exactly like a failed explicit switch; a
-                    // clean activation resets the counter.
-                    if requested == BackendKind::HidMaestro {
-                        self.note_hid_switch_attempt(!outcome.fell_back);
-                    }
-                    None
-                }
+                Ok(_outcome) => None,
                 Err(error) => {
-                    if requested == BackendKind::HidMaestro {
-                        self.note_hid_switch_attempt(false);
-                    }
                     self.record_send(
                         false,
                         format!("output enabled: backend activation failed ({error})"),
@@ -3565,14 +3311,10 @@ impl AppStateCore {
     ///
     /// When output is enabled while the [`NullSink`] is installed and
     /// a real backend is selected, this is the user-initiated moment
-    /// the deferred startup backend is activated: startup never
-    /// activates an elevated backend (hotfix v1.0.1 — no UAC prompt at
-    /// launch), so without this step the toggle would only
-    /// `try_connect` the [`NullSink`] and output would stay dead until
-    /// the user re-picked the backend on the Output page. The switch
-    /// runs here because enabling output is an explicit user action —
-    /// the UAC prompt for `HIDMaestro` at this point is expected, not
-    /// a startup surprise. A failed switch is recorded honestly in the
+    /// the deferred startup backend is activated: without this step
+    /// the toggle would only `try_connect` the [`NullSink`] and output
+    /// would stay dead until the user re-picked the backend on the
+    /// Output page. A failed switch is recorded honestly in the
     /// returned state's detail and the [`NullSink`] stays installed.
     #[must_use]
     pub fn set_output_enabled_with_factories(
@@ -3588,16 +3330,11 @@ impl AppStateCore {
             // connects. The old code set it `true` up front, so a
             // refused/failed enable reported the toggle ON.
             *lock(&self.output_enabled) = false;
-            // P1-5 (update4-fix): the storm guard covers the enable
-            // toggle too — see `hid_switch_cooldown_refusal`.
-            if let Some(refused) = self.hid_switch_cooldown_refusal() {
-                return refused;
-            }
             if let Some(failed) = self.deferred_enable_activation(factories) {
                 return failed;
             }
-            // R2-09: connect outside the backend lock (up to 310 s
-            // for HIDMaestro's sidecar stages + UAC dwell, P1-1).
+            // R2-09: connect outside the backend lock (a slow
+            // backend connect must not stall engine ticks).
             // Take the
             // backend out of the slot (a disconnected NullSink
             // stands in, so engine ticks keep flowing instead of
@@ -3637,21 +3374,6 @@ impl AppStateCore {
             // bound first — the scrutinee guard of a `match` would
             // still be held inside the arm and deadlock the resend
             // on the same handle.
-            // P1-5: the storm guard counts a `HIDMaestro` connect
-            // here too (a success resets it, a failure is a strike)
-            // — the plain reconnect below spawns a sidecar exactly
-            // like a switch, so it must not bypass the guard.
-            let backend_kind = BackendKind::from_backend_name(lock(&backend).name());
-            // G29 spoof (v2.0.16): the (re)connected backend gets the
-            // persisted G29 mode BEFORE connect, so the fresh
-            // instance creates the right profile — pushing after
-            // connect would be too late (the profile is chosen at
-            // create). The handle is extracted (no slot lock held),
-            // so a live recreate here cannot stall engine ticks.
-            // The persisted pedal layout + handbrake button go in
-            // with the mode (v2.0.17), so a (re)connected backend
-            // reports with the current settings from its first tick.
-            Self::push_g29_settings_to_backend(&mut **lock(&backend), &self.settings());
             let connected = lock(&backend).try_connect();
             // P1-1 (v2.0.12 scan): the flag is set from the connect
             // outcome, not from the request — a failed connect
@@ -3662,14 +3384,6 @@ impl AppStateCore {
             *lock(&self.output_enabled) = connected.is_ok();
             match connected {
                 Ok(()) => {
-                    if backend_kind == Some(BackendKind::HidMaestro) {
-                        self.note_hid_switch_attempt(true);
-                    }
-                    // FH4 fix (v2.0.15): the (re)connected backend
-                    // gets the persisted Steam FH4 mode before the
-                    // resend, so the first tick after connect
-                    // already dedupes.
-                    lock(&backend).set_steam_fh4_mode(self.settings().steam_fh4_mode);
                     let last = *lock(&self.last_output);
                     match lock(&backend).update(&last) {
                         Ok(()) => {
@@ -3684,9 +3398,6 @@ impl AppStateCore {
                     }
                 }
                 Err(error) => {
-                    if backend_kind == Some(BackendKind::HidMaestro) {
-                        self.note_hid_switch_attempt(false);
-                    }
                     self.record_send(false, format!("output enabled: connect failed ({error})"));
                 }
             }
@@ -3746,28 +3457,9 @@ impl AppStateCore {
     /// split out so the no-sink-factory fallback can run it under
     /// the lock without duplicating the block).
     fn connect_and_resend(&self, backend: &mut Box<dyn IJoystickOutput>) -> CommandOutputState {
-        // P1-5: same storm-guard counting as the extracted path
-        // above (test-only path — the real factories always provide
-        // a sink — but a failing `HIDMaestro` connect here is still
-        // a spent sidecar spawn).
-        let kind = BackendKind::from_backend_name(backend.name());
-        // G29 spoof (v2.0.16): the persisted mode goes in BEFORE
-        // connect, so the backend creates the right profile. On an
-        // already-connected backend this recreates it when the mode
-        // differs (the test-only path holds the handle lock here —
-        // the production path extracts the handle first, above).
-        // The persisted pedal layout + handbrake button go in with
-        // the mode (v2.0.17).
-        Self::push_g29_settings_to_backend(&mut **backend, &self.settings());
+        // Test-only path — the real factories always provide a sink.
         match backend.try_connect() {
             Ok(()) => {
-                if kind == Some(BackendKind::HidMaestro) {
-                    self.note_hid_switch_attempt(true);
-                }
-                // FH4 fix (v2.0.15): the (re)connected backend gets
-                // the persisted Steam FH4 mode before the resend, so
-                // the first tick after connect already dedupes.
-                backend.set_steam_fh4_mode(self.settings().steam_fh4_mode);
                 let last = *lock(&self.last_output);
                 match backend.update(&last) {
                     Ok(()) => {
@@ -3779,9 +3471,6 @@ impl AppStateCore {
                 }
             }
             Err(error) => {
-                if kind == Some(BackendKind::HidMaestro) {
-                    self.note_hid_switch_attempt(false);
-                }
                 self.record_send(false, format!("output enabled: connect failed ({error})"));
             }
         }
@@ -3813,11 +3502,11 @@ impl AppStateCore {
         self.output_state()
     }
 
-    /// Selects the output backend by name (`"HIDMaestro"`, `"vJoy"`,
+    /// Selects the output backend by name (`"vJoy"`, `"Xbox"`,
     /// `"none"` / `"null"` / `"NullSink"`; case-insensitive) and
     /// switches the live slot at runtime — no restart. Default is
-    /// `vJoy`. This is an EXPLICIT user switch: a failed `HIDMaestro`
-    /// connect NEVER falls back to vJoy (Bug 4/8) — it errors with
+    /// `vJoy`. This is an EXPLICIT user switch: a failed connect
+    /// NEVER falls back (Bug 4/8) — it errors with
     /// the real reason, the live backend stays exactly as it was,
     /// and the persisted choice reverts to the previous backend, so
     /// the next launch does not retry a switch the user saw fail.
@@ -3838,12 +3527,7 @@ impl AppStateCore {
     /// fails, or the requested backend could not connect.
     pub fn set_output_backend(&self, name: &str) -> Result<CommandOutputState, String> {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
-        let factories = real_backend_factories(
-            vjoy_device_id,
-            self.settings().g29_spoof_mode,
-            &self.settings().g29_pedal_layout,
-            self.settings().g29_handbrake_button,
-        );
+        let factories = real_backend_factories(vjoy_device_id);
         self.set_output_backend_with_factories(name, &factories)
     }
 
@@ -3862,21 +3546,8 @@ impl AppStateCore {
         factories: &BackendFactories,
     ) -> Result<CommandOutputState, String> {
         let requested = BackendKind::parse(name).ok_or_else(|| {
-            format!("unknown output backend '{name}' (expected HIDMaestro, vJoy, or none)")
+            format!("unknown output backend '{name}' (expected vJoy, Xbox, or none)")
         })?;
-        // P2 (v2.0.11): the explicit-switch storm guard — after 3
-        // consecutive failed explicit switches to HIDMaestro, refuse
-        // further explicit switches for 30 s instead of spawning
-        // another sidecar (the v2.0.10 retest fired 30 attempts in
-        // ~4 minutes). Checked FIRST, before any latch is cleared or
-        // any choice is persisted, so a refused attempt changes no
-        // state. P1-5 (update4-fix): automatic paths consult the
-        // same guard inside `apply_backend_switch` / the enable
-        // toggle — only this FIRST check (before the persist)
-        // belongs to the explicit path.
-        if requested == BackendKind::HidMaestro && self.hid_switch_cooldown_active() {
-            return Err(Self::HID_SWITCH_COOLDOWN_MESSAGE.to_string());
-        }
         // R2-20: a backend switch re-probes the vJoy DLL on the next
         // status read instead of trusting the cached probe.
         self.invalidate_vjoy_dll_cache();
@@ -3884,17 +3555,12 @@ impl AppStateCore {
         // mid-session failover, so the next failure can fall over
         // once more.
         self.reset_fallback();
-        // B-2/A10: an explicit re-select also clears the UAC-decline
-        // latch — the user is choosing HIDMaestro again on purpose,
-        // so one fresh prompt is allowed. Automatic (re-)activation
-        // (`set_output_enabled`, startup) never clears it.
-        self.elevation_declined.store(false, Ordering::SeqCst);
         // Persist the choice first: a save failure errors out before
         // anything switches. Remember the previous choice: on a
         // failed explicit switch the persisted choice reverts to it
-        // (Bug 4/8 — a failed HIDMaestro switch must not leave
-        // HIDMaestro persisted, or the next launch defers/retries a
-        // switch the user already saw fail).
+        // (Bug 4/8 — a failed switch must not leave the failed
+        // backend persisted, or the next launch retries a switch
+        // the user already saw fail).
         let previous_output_backend = lock(&self.store).settings().output_backend.clone();
         {
             let mut settings = lock(&self.store).settings().clone();
@@ -3932,16 +3598,6 @@ impl AppStateCore {
             }
             self.refresh_settings_cache();
         }
-        // P2 (v2.0.11): maintain the explicit-switch storm counter
-        // for HIDMaestro only — a success resets it, a failure counts
-        // toward the 3-strike cooldown. (vJoy / none switches never
-        // touch it: only the elevated sidecar spawn can storm.)
-        // P1-5: shared with the enable toggle (see
-        // `note_hid_switch_attempt`) — the counting itself is the
-        // same from either entry point.
-        if requested == BackendKind::HidMaestro {
-            self.note_hid_switch_attempt(result.is_ok());
-        }
         result
     }
 
@@ -3951,12 +3607,10 @@ impl AppStateCore {
     /// 30 s rate limit still applies to the next attempt.
     ///
     /// This clears only the app-core flag. The backend's own latch
-    /// (the `HIDMaestro` `SidecarManager::fallback_needed` latch — the
-    /// "H2 latch") is cleared in [`Self::apply_backend_switch`] via
+    /// is cleared in [`Self::apply_backend_switch`] via
     /// the [`IJoystickOutput::reset_fallback`](rsh_output::IJoystickOutput::reset_fallback)
     /// hook, which re-arms the INSTALLED backend in place (P2,
-    /// v2.0.11) — the same state `HidMaestroBackend::reset_fallback`
-    /// produces, without replacing the instance (a replacement used
+    /// v2.0.11) — without replacing the instance (a replacement used
     /// to hand every attempt a fresh manager with a full retry
     /// budget). Without that step the selector's same-kind path
     /// would reconnect the latched instance, fail fast with
@@ -3972,56 +3626,6 @@ impl AppStateCore {
     pub fn fallback_used(&self) -> bool {
         self.fallback_used.load(Ordering::SeqCst)
     }
-
-    /// Explicit-switch storm guard (P2, v2.0.11): after this many
-    /// consecutive failed explicit switches to `HIDMaestro`, further
-    /// explicit switches to it are refused for
-    /// [`HID_SWITCH_COOLDOWN`](Self::HID_SWITCH_COOLDOWN). The
-    /// cooldown value (30 s) matches the frontend's UI cooldown for
-    /// the same guard — change both together.
-    const HID_SWITCH_MAX_CONSECUTIVE_FAILURES: u32 = 3;
-    /// Explicit-switch cooldown (P2, v2.0.11): 30 s, matching the
-    /// frontend's UI cooldown.
-    const HID_SWITCH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
-    /// Message for an explicit `HIDMaestro` switch refused by the
-    /// storm guard (P2, v2.0.11).
-    pub const HID_SWITCH_COOLDOWN_MESSAGE: &str =
-        "HIDMaestro switch failed 3 times — retry in 30 s";
-
-    /// True while the storm guard refuses `HIDMaestro` switches
-    /// (P1-5, update4-fix): consulted by the explicit switch AND
-    /// every automatic path ([`Self::apply_backend_switch`],
-    /// [`Self::set_output_enabled_with_factories`]), so a toggle
-    /// or re-activation loop cannot bypass the cooldown.
-    fn hid_switch_cooldown_active(&self) -> bool {
-        lock(&self.hid_switch_cooldown_until).is_some_and(|until| std::time::Instant::now() < until)
-    }
-
-    /// Record one `HIDMaestro` switch attempt against the storm
-    /// guard (P1-5, update4-fix): shared by the explicit switch
-    /// and the enable toggle — a failed attempt counts toward the
-    /// 3-strike cooldown from EITHER entry point (a toggle loop
-    /// used to never arm the guard at all), and a success resets
-    /// the counter. Only ever called for `HIDMaestro` attempts
-    /// (vJoy / none never touch the guard).
-    fn note_hid_switch_attempt(&self, success: bool) {
-        if success {
-            self.hid_switch_failures.store(0, Ordering::SeqCst);
-        } else {
-            let failures = self.hid_switch_failures.fetch_add(1, Ordering::SeqCst) + 1;
-            if failures >= Self::HID_SWITCH_MAX_CONSECUTIVE_FAILURES {
-                self.hid_switch_failures.store(0, Ordering::SeqCst);
-                *lock(&self.hid_switch_cooldown_until) =
-                    Some(std::time::Instant::now() + Self::HID_SWITCH_COOLDOWN);
-            }
-        }
-    }
-
-    /// UAC decline message (B-2/A10, v2.0.2): shown once when the user
-    /// declines the `HIDMaestro` elevation prompt. The switch fails with
-    /// this (no silent fallback to vJoy) and the decline latch blocks
-    /// automatic re-prompts until an explicit re-select.
-    pub const HID_NOT_ADMIN: &str = "HIDMaestro needs administrator rights — approve the UAC prompt to switch to it, or run RSH as administrator. vJoy needs no prompt.";
 
     /// Applies a backend switch through the selector with the given
     /// factories, and updates the live name / detail / selected choice
@@ -4048,29 +3652,10 @@ impl AppStateCore {
     ) -> Result<SwitchOutcome, String> {
         // B-2: serialise switches — a second overlapping switch
         // (user double-clicking, a poll-driven re-activation) would
-        // spawn a second elevated sidecar and a second UAC prompt.
+        // run a second connect against the same slot.
         let _switch_guard = self.switch_in_flight.try_lock().map_err(|_| {
             "a backend switch is already in progress — wait for it to finish".to_string()
         })?;
-        // P1-5 (update4-fix): the storm guard is consulted on EVERY
-        // path into a `HIDMaestro` switch, not only the explicit
-        // selector path — an automatic re-attempt (deferred enable,
-        // mid-session re-activation) used to rebuild a fresh manager
-        // with a full retry budget while the guard was armed, so the
-        // 30-attempt storm could continue through the toggle. The
-        // explicit path still refuses first (before persisting) in
-        // `set_output_backend_with_factories`; this is the backstop
-        // for every other caller.
-        if requested == BackendKind::HidMaestro && self.hid_switch_cooldown_active() {
-            return Err(Self::HID_SWITCH_COOLDOWN_MESSAGE.to_string());
-        }
-        // B-2/A10: the user declined the UAC prompt this session.
-        // Fail fast with the NotAdmin message — no new prompt, no
-        // silent fallback. Only an explicit re-select clears this
-        // (see `set_output_backend`).
-        if requested == BackendKind::HidMaestro && self.elevation_declined.load(Ordering::SeqCst) {
-            return Err(Self::HID_NOT_ADMIN.to_string());
-        }
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
         // H2 latch, deep-scan Round 2 item 5: the selector's
         // same-kind path reconnects the INSTALLED instance, so a
@@ -4082,10 +3667,9 @@ impl AppStateCore {
         // clears the installed backend's latch on its own manager,
         // instead of replacing the instance with a fresh factory
         // build. The replacement used to defeat the manager's
-        // 2-failure latch and clear `elevation_declined` on every
-        // attempt (the retry storm's enabler: every call got a
+        // 2-failure latch (the retry storm's enabler: every call got a
         // fresh manager with a full retry budget). A connected
-        // instance is never reset (its live sidecar session
+        // instance is never reset (its live session
         // survives). `set_output_backend` calls `reset_fallback`
         // first, so by the time this runs the app-core flag is clear
         // too — both latches re-arm on one explicit re-select.
@@ -4105,11 +3689,10 @@ impl AppStateCore {
         {
             lock(&live).reset_fallback();
         }
-        // R2-09: the selector's connect (up to 310 s of sidecar
-        // stages + UAC dwell for HIDMaestro, P1-1) must NOT run under the
+        // R2-09: the selector's connect must NOT run under the
         // backend lock — while it did, every engine tick blocked on
         // the mutex and output stopped entirely for as long as the
-        // user took to answer UAC. Take the installed backend OUT of
+        // connect took. Take the installed backend OUT of
         // the slot (leaving a disconnected NullSink behind, so
         // engine ticks keep flowing instead of blocking), run the
         // switch on the local box with no lock held, then swap the
@@ -4124,8 +3707,7 @@ impl AppStateCore {
                 std::mem::replace(&mut *slot, Arc::new(Mutex::new(placeholder)))
             };
             // The extracted handle is owned by this scope: the
-            // switch (up to 310 s of sidecar stages + UAC dwell,
-            // P1-1) runs on its own lock, never on the slot lock.
+            // switch runs on its own lock, never on the slot lock.
             let mut current = lock(&handle);
             let outcome = switch_backend(&mut current, requested, factories, None, allow_fallback)
                 .map_err(|error| error.to_string());
@@ -4144,8 +3726,8 @@ impl AppStateCore {
         self.finish_backend_switch(outcome, requested, vjoy_device_id, allow_fallback)
     }
 
-    /// Interprets a completed backend switch (R2-09): the UAC-decline
-    /// handling + live-name/detail bookkeeping that used to sit
+    /// Interprets a completed backend switch (R2-09): the
+    /// live-name/detail bookkeeping that used to sit
     /// inline in [`Self::apply_backend_switch`], split out so the
     /// switch itself can run outside the backend lock. The backend
     /// slot already holds the switch result when this runs, so the
@@ -4157,22 +3739,8 @@ impl AppStateCore {
         vjoy_device_id: u32,
         allow_fallback: bool,
     ) -> Result<SwitchOutcome, String> {
-        // B-2/A10: a UAC decline surfaces as a NotAdmin failure
-        // (or a fallback whose reason names it). Record the decline
-        // and FAIL the switch with the plain message — never silently
-        // fall back to vJoy (the user asked for HIDMaestro and must
-        // know it is not active) and never re-prompt automatically.
         let outcome = match outcome {
             Ok(outcome) => {
-                if outcome.fell_back
-                    && outcome
-                        .fallback_reason
-                        .as_deref()
-                        .is_some_and(|reason| reason.contains("administrator rights"))
-                {
-                    self.elevation_declined.store(true, Ordering::SeqCst);
-                    return Err(Self::HID_NOT_ADMIN.to_string());
-                }
                 // Bug 4/8 defence: an explicit switch must never
                 // report a fallback as success — the selector does
                 // not produce one when `allow_fallback` is false,
@@ -4190,10 +3758,6 @@ impl AppStateCore {
                 outcome
             }
             Err(error) => {
-                if requested == BackendKind::HidMaestro && error.contains("administrator rights") {
-                    self.elevation_declined.store(true, Ordering::SeqCst);
-                    return Err(Self::HID_NOT_ADMIN.to_string());
-                }
                 return Err(error);
             }
         };
@@ -4211,59 +3775,25 @@ impl AppStateCore {
         }
         *lock(&self.backend_name) = live_name;
         *lock(&self.backend_detail) = detail;
-        // FH4 wheel check (v2.0.14): the switch changed what the
-        // check measures (which backend feeds), so invalidate and
-        // re-check immediately, and log the one-line summary —
-        // the daemon log then shows the wheel state at every
-        // switch, not just at startup.
-        self.invalidate_wheel_check_cache();
-        if let Some(check) = self.cached_wheel_check() {
-            self.push_connection_log("INFO", &format!("wheel check: {}", check.summary_line()));
-        }
-        // FH4 fix (v2.0.15): a switch (re)connects the live backend
-        // (or reuses an already-connected one) — either way it gets
-        // the persisted Steam FH4 mode now, so a switch to vJoy
-        // never leaves the feed undeduped.
-        self.push_steam_fh4_mode_to_backend();
         Ok(outcome)
     }
 
-    /// Activates the persisted output backend choice at launch
-    /// (coordinator decision under delegation): reads
-    /// `AppSettings.output_backend` (default `vJoy`) and switches
-    /// the live slot through the selector — EXCEPT an elevated backend,
-    /// which is NEVER activated at startup (hotfix v1.0.1, coordinator
-    /// Option A — defer): activating `HIDMaestro` would launch its
-    /// sidecar elevated via `runas` and pop a UAC consent prompt on
-    /// every launch. A persisted `HIDMaestro` choice is therefore
-    /// deferred: the outcome records `active: None` with a reason
-    /// naming the deferral, the [`NullSink`](crate::system::NullSink)
-    /// stays installed, and the backend detail shows the reason on the
-    /// Output page. The user activates it by enabling output
-    /// ([`AppStateCore::set_output_enabled`], which switches the
-    /// deferred backend in on the explicit toggle) or by picking it on
-    /// the Output page ([`AppStateCore::set_output_backend`]) — both
-    /// user-initiated, so the UAC prompt there is expected. A
-    /// non-elevated choice (vJoy, driver present) IS activated at
-    /// startup through the selector, with the usual fallback to the
-    /// [`NullSink`](crate::system::NullSink) and the reason recorded.
+    /// Activates the persisted output backend choice at launch:
+    /// reads `AppSettings.output_backend` (default `vJoy`) and switches
+    /// the live slot through the selector, with the usual fallback to
+    /// the [`NullSink`](crate::system::NullSink) and the reason recorded.
     /// This never fails the launch: when activation fails, the outcome
     /// records `active: None` and the reason, the
     /// [`NullSink`](crate::system::NullSink) stays installed, and the
     /// backend detail names the failure — the app keeps running with
     /// output disabled instead of crashing or silently pretending a
     /// backend is live. The choice is NOT re-persisted here (it is
-    /// already the persisted choice); the next launch defers / retries
+    /// already the persisted choice); the next launch retries
     /// it the same way.
     #[must_use]
     pub fn activate_startup_backend(&self) -> StartupBackendOutcome {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
-        let factories = real_backend_factories(
-            vjoy_device_id,
-            self.settings().g29_spoof_mode,
-            &self.settings().g29_pedal_layout,
-            self.settings().g29_handbrake_button,
-        );
+        let factories = real_backend_factories(vjoy_device_id);
         self.activate_startup_backend_with_factories(&factories)
     }
 
@@ -4277,28 +3807,6 @@ impl AppStateCore {
         factories: &BackendFactories,
     ) -> StartupBackendOutcome {
         let requested = self.selected_backend();
-        // UAC deferral (hotfix v1.0.1): only HIDMaestro needs
-        // elevation — its sidecar is launched elevated via `runas`
-        // (`rsh-output-hidmaestro` manager `spawn_elevated_runas`)
-        // and its status reports `elevation_required: true`; vJoy
-        // needs none. Never touch a factory for an elevated backend
-        // here: even building it must not start the elevated launch,
-        // and no UAC prompt may appear at startup.
-        if requested == BackendKind::HidMaestro {
-            let reason = "HIDMaestro deferred at startup — it needs elevation (UAC). Enable output to activate it."
-                .to_string();
-            *lock(&self.backend_detail) = format!(
-                "{reason} Selected backend stays HIDMaestro; no UAC prompt was shown at startup."
-            );
-            let result = StartupBackendOutcome {
-                requested,
-                active: None,
-                fell_back: false,
-                reason: Some(reason),
-            };
-            *lock(&self.startup_backend) = Some(result.clone());
-            return result;
-        }
         match self.apply_backend_switch(requested, factories, true) {
             Ok(outcome) => {
                 let result = StartupBackendOutcome {
@@ -4340,12 +3848,12 @@ impl AppStateCore {
 
     /// Every selectable backend with honest per-backend status for the
     /// Output page picker: which is selected, which is live, whether
-    /// each is connected, whether its driver/sidecar file was found,
-    /// whether it needs elevation (with the UAC note), and the vJoy
-    /// install link when vJoy is missing. Nothing here is invented:
-    /// `installed` is a file probe, `connected` is the live backend's
-    /// `is_connected()`, and non-live backends report `connected:
-    /// false`.
+    /// each is connected, whether its driver file was found,
+    /// and the vJoy install link when vJoy is missing. Nothing here
+    /// is invented: `installed` is a file probe, `connected` is the
+    /// live backend's `is_connected()`, and non-live backends report
+    /// `connected: false`. The Xbox (`ViGEmBus`) driver is only probed
+    /// at connect, so its `installed` is [`None`] (unknown).
     #[must_use]
     pub fn list_output_backends(&self) -> Vec<BackendStatus> {
         let live_kind =
@@ -4356,24 +3864,21 @@ impl AppStateCore {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
         let live_detail = lock(&self.backend_detail).clone();
         let vjoy_installed = self.vjoy_dll_path().is_some();
-        let hidmaestro_installed = resolve_sidecar_path().is_file();
         vec![
             BackendStatus {
-                id: BackendKind::HidMaestro.as_str().to_string(),
-                name: BackendKind::HidMaestro.display_name().to_string(),
+                id: BackendKind::Xbox.as_str().to_string(),
+                name: BackendKind::Xbox.display_name().to_string(),
                 is_default: false,
-                selected: selected == BackendKind::HidMaestro,
-                active: live_kind == BackendKind::HidMaestro,
-                connected: live_kind == BackendKind::HidMaestro && connected,
-                installed: Some(hidmaestro_installed),
-                elevation_required: true,
-                uac_note: Some(UAC_NOTE.to_string()),
-                detail: if live_kind == BackendKind::HidMaestro {
+                selected: selected == BackendKind::Xbox,
+                active: live_kind == BackendKind::Xbox,
+                connected: live_kind == BackendKind::Xbox && connected,
+                installed: None,
+                elevation_required: false,
+                uac_note: None,
+                detail: if live_kind == BackendKind::Xbox {
                     live_detail.clone()
-                } else if hidmaestro_installed {
-                    "HIDMaestro sidecar found. Explicit-choice backend — activation is deferred at startup (no UAC prompt on launch); enable output to activate it, and Windows will ask (UAC) then.".to_string()
                 } else {
-                    "HIDMaestro sidecar not found — reinstall RSH to use this backend.".to_string()
+                    "Xbox (ViGEmBus) fallback — for games that do not accept the vJoy wheel. Needs the ViGEmBus driver; connect to probe it.".to_string()
                 },
                 download_url: None,
             },
@@ -4454,83 +3959,6 @@ impl AppStateCore {
         cache.dll = None;
     }
 
-    /// Cached wheel check (v2.0.14): at most one
-    /// [`rsh_output::wheel_check::run_wheel_check`] per
-    /// [`WHEEL_CHECK_CACHE_TTL`] window, so the ~1 Hz slow poll
-    /// never re-reads the registry every cycle. Never blocks the
-    /// caller beyond the check itself (registry + DLL reads,
-    /// milliseconds — no elevation, no network).
-    fn cached_wheel_check(&self) -> Option<rsh_api::WheelCheck> {
-        {
-            let cache = lock(&self.wheel_check_cache);
-            if let Some(checked_at) = cache.checked_at
-                && checked_at.elapsed() < WHEEL_CHECK_CACHE_TTL
-            {
-                return cache.result.clone();
-            }
-        }
-        let result = self.refresh_wheel_check();
-        let mut cache = lock(&self.wheel_check_cache);
-        cache.checked_at = Some(Instant::now());
-        cache.result.clone_from(&result);
-        result
-    }
-
-    /// Run the wheel check once and map it to the API shape,
-    /// computing `feeding` from the live backend. Windows-only:
-    /// off Windows there is no registry / vJoy to check, so this
-    /// returns [`None`] without touching anything. Each lock is
-    /// taken in its own scope and dropped before the next — the
-    /// three locks (`output_enabled`, backend, `engine_status`)
-    /// are never held nested, matching the `vjoy_status()` pattern.
-    // `self` is used on Windows (backend / output / engine reads);
-    // off Windows the whole Windows block is cfg'd out, so the
-    // pedantic unused-self lint is allowed here.
-    // `unnecessary_wraps` is Windows-only too: off Windows this
-    // returns `None` (no registry / vJoy to check), so the `Option`
-    // is load-bearing for the shared signature — on Windows the
-    // check always produces a value.
-    #[allow(clippy::unused_self)]
-    #[allow(clippy::unnecessary_wraps)]
-    fn refresh_wheel_check(&self) -> Option<rsh_api::WheelCheck> {
-        #[cfg(windows)]
-        {
-            let result = rsh_output::wheel_check::run_wheel_check();
-            let enabled = *lock(&self.output_enabled);
-            let (is_vjoy, connected) = {
-                let backend = self.backend_handle();
-                let live = lock(&backend);
-                (live.name() == "vJoy", live.is_connected())
-            };
-            let engine_running = matches!(self.engine_status(), EngineTaskStatus::Running { .. });
-            Some(rsh_api::WheelCheck {
-                vjoy_mapping_ok: result.vjoy_mapping_ok,
-                hid_mapping_ok: result.hid_mapping_ok,
-                envelope_ok: result.envelope_ok,
-                button_count: result.button_count,
-                ffb_present: result.ffb_present,
-                feeding: enabled && is_vjoy && connected && engine_running,
-                next_step: result.next_step,
-            })
-        }
-        #[cfg(not(windows))]
-        {
-            None
-        }
-    }
-
-    /// Drop the cached wheel check (v2.0.14): the next
-    /// [`Self::cached_wheel_check`] re-checks immediately. Callers
-    /// that change what the check measures — backend switch
-    /// ([`Self::finish_backend_switch`]), vJoy install completion
-    /// ([`run_vjoy_install`]) — invalidate instead of waiting out
-    /// the TTL.
-    fn invalidate_wheel_check_cache(&self) {
-        let mut cache = lock(&self.wheel_check_cache);
-        cache.checked_at = None;
-        cache.result = None;
-    }
-
     /// vJoy driver status (v2.0.1 hotfix BACKEND-2): whether the DLL
     /// was found (cached file probe — see
     /// [`Self::vjoy_dll_path`]), whether a background install is
@@ -4556,11 +3984,8 @@ impl AppStateCore {
         let version = live_version.or_else(|| lock(&self.last_vjoy_driver_version).clone());
         // Probe before taking the install lock: the probe takes the
         // cache lock, and no other path takes both locks in the
-        // opposite order. The wheel check goes first for the same
-        // reason (it takes the wheel-check cache lock, then
-        // `output_enabled` / backend / `engine_status`).
+        // opposite order.
         let dll = self.vjoy_dll_path();
-        let wheel_check = self.cached_wheel_check();
         let install = lock(&self.vjoy_install);
         rsh_api::VjoyStatus {
             installed: dll.is_some(),
@@ -4568,11 +3993,6 @@ impl AppStateCore {
             install_error: install.error.clone(),
             dll_path: dll.map(|path| path.to_string_lossy().into_owned()),
             version,
-            // FH4 wheel check (v2.0.14): the cached daemon-side
-            // check — None off Windows, or before the first check
-            // ran. The UI renders None as "not checked yet", never
-            // as OK.
-            wheel_check,
         }
     }
 
@@ -4610,8 +4030,7 @@ impl AppStateCore {
     /// progress / failure surface through
     /// [`AppStateCore::vjoy_status`] polling — never by blocking the
     /// caller. The installer needs admin once (its own manifest
-    /// triggers the UAC prompt); that is expected and unlike
-    /// `HIDMaestro`, which prompts on every launch.
+    /// triggers the UAC prompt); that is expected.
     ///
     /// # Errors
     ///
@@ -4764,35 +4183,15 @@ impl AppStateCore {
     /// The frame channel into the running engine, when the engine task
     /// is running. Transports feed frames here through the supervisor's
     /// forwarder; tests drive it directly with a fake frame stream.
-    /// Whoever feeds frames must also call
-    /// [`AppStateCore::note_frame_encoders`] per frame, or the
-    /// snapshot's encoder counts stay at their defaults.
     /// [`None`] until [`AppStateCore::start_engine`] runs.
     #[must_use]
     pub fn engine_frame_sender(&self) -> Option<tokio::sync::mpsc::Sender<StreamFrame>> {
         lock(&self.engine_frame_tx).clone()
     }
 
-    /// Records one frame's encoder counts, as reported by whoever
-    /// feeds frames into the engine (the transport forwarder calls
-    /// this per frame; a test feeder driving
-    /// [`AppStateCore::engine_frame_sender`] directly calls it too).
-    /// The engine's sink only ever sees pipeline *deltas*, and the
-    /// engine repeats the last output — deltas included — on ticks
-    /// with no new frame, so deltas must never be accumulated in the
-    /// sink (that over-counts). The board's cumulative counts are the
-    /// truth: the snapshot tracker diffs them into deltas itself, and
-    /// repeats diff to zero. `n_enc` is clamped to `MAX_ENCODERS`.
-    pub fn note_frame_encoders(&self, counts: [i16; MAX_ENCODERS], n_enc: usize) {
-        let mut accum = lock(&self.engine_encoders);
-        accum.counts = counts;
-        accum.n_enc = n_enc.min(MAX_ENCODERS);
-    }
-
     /// Records one frame's raw axis readings in mV, as reported by
     /// whoever feeds frames into the engine (the transport forwarder
-    /// calls this per authenticated frame, next to
-    /// [`AppStateCore::note_frame_encoders`]; a test feeder driving
+    /// calls this per authenticated frame; a test feeder driving
     /// [`AppStateCore::engine_frame_sender`] directly calls it too).
     /// This is the v2.0.2 capture plumbing: the pipeline only ever
     /// sees the frame inside the engine, so without this slot the raw
@@ -5642,8 +5041,7 @@ impl AppStateCore {
 
     /// Feeds one engine tick into the state: the sink's view of the
     /// pipeline output becomes a snapshot tick (steering in degrees,
-    /// pedals, encoder counts reconstructed from the per-tick
-    /// deltas) plus the installed backend's send (below). The
+    /// pedals) plus the installed backend's send (below). The
     /// engine's live metrics are not observable per tick (see the
     /// module docs), so the snapshot's p99s stay unmeasured and
     /// `seqGap` / `txFail` stay 0 — the loop rate is measured from
@@ -5667,14 +5065,6 @@ impl AppStateCore {
         output: &PipelineOutputState,
         metrics: &EngineMetrics,
     ) -> PipelineOutputState {
-        // Encoder counts come from the latest frame (reported by the
-        // feeder via `note_frame_encoders`), not from the output's
-        // deltas: the engine repeats the last output on ticks with no
-        // new frame, so accumulating deltas here would over-count.
-        let (encoder_counts, n_enc) = {
-            let accum = lock(&self.engine_encoders);
-            (accum.counts, accum.n_enc)
-        };
         // L8: clutch presence comes from the active profile's clutch
         // module, not from the reading: a present-but-released clutch
         // reads exactly 0.0 and must still report `Some(0.0)`. With
@@ -5703,8 +5093,6 @@ impl AppStateCore {
                 brake: f64::from(output.brake),
                 clutch,
             },
-            encoder_counts,
-            n_enc,
             output: *output,
             metrics: *metrics,
         });
@@ -5738,8 +5126,8 @@ impl AppStateCore {
         // PERF F-15: clone the backend handle under the slot lock,
         // then run the update on the handle's own lock — never on
         // the slot lock. A switch swaps the slot handle without
-        // waiting out this update (up to ~200 ms on HIDMaestro's
-        // sidecar round-trip), and this tick is not stalled by a
+        // waiting out this update (up to ~200 ms on a slow backend's
+        // round-trip), and this tick is not stalled by a
         // switch either: it keeps sending to the instance it cloned
         // and the next tick picks up the new backend.
         let handle = self.backend_handle();
@@ -5759,7 +5147,7 @@ impl AppStateCore {
 
     /// Mid-session failover (C-FAIL-1): on a refused backend update,
     /// switch the live slot to the fallback backend
-    /// (`HIDMaestro` → vJoy) and retry the update once there. Fires
+    /// (Xbox → vJoy) and retry the update once there. Fires
     /// at most once until an explicit user re-select calls
     /// [`reset_fallback`](Self::reset_fallback), and at most once
     /// per 30 s even after a reset. The switch is logged in the
@@ -5771,12 +5159,7 @@ impl AppStateCore {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
         self.try_mid_session_fallback_with_factories(
             output,
-            &real_backend_factories(
-                vjoy_device_id,
-                self.settings().g29_spoof_mode,
-                &self.settings().g29_pedal_layout,
-                self.settings().g29_handbrake_button,
-            ),
+            &real_backend_factories(vjoy_device_id),
         )
     }
 
@@ -6262,277 +5645,6 @@ impl AppStateCore {
             ..Default::default()
         })?;
         Ok(merged.close_to_tray)
-    }
-
-    /// Whether Steam FH4 wheel mode is on (FH4 fix, v2.0.15): the
-    /// stored `steam_fh4_mode` flag (default off).
-    #[must_use]
-    pub fn steam_fh4_mode(&self) -> bool {
-        self.settings().steam_fh4_mode
-    }
-
-    /// Persist the Steam FH4 wheel mode choice (FH4 fix, v2.0.15)
-    /// and push it into the live backend at once, so a connected
-    /// vJoy backend starts deduping / hysteresis-filtering on the
-    /// next tick without a reconnect. The registry flag itself is
-    /// NOT written here — the daemon's `set_steam_fh4_mode` owns
-    /// the registry write (vJoy-only guard + installer marker),
-    /// and calls this to persist. Returns the stored value.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message when the settings save fails.
-    pub fn set_steam_fh4_mode(self: &Arc<Self>, enabled: bool) -> Result<bool, String> {
-        let merged = self.set_settings_patch(AppSettingsPatch {
-            steam_fh4_mode: Some(enabled),
-            ..Default::default()
-        })?;
-        self.push_steam_fh4_mode_to_backend();
-        Ok(merged.steam_fh4_mode)
-    }
-
-    /// Push the persisted Steam FH4 wheel mode into the live backend
-    /// (FH4 fix, v2.0.15). Safe to call whenever the live backend
-    /// may have (re)connected — the push is idempotent, and
-    /// non-vJoy backends ignore it (trait default no-op). Never
-    /// call while the backend handle's own lock is already held
-    /// (connect paths push through their locked `&mut` backend
-    /// directly instead — see [`Self::connect_and_resend`]).
-    fn push_steam_fh4_mode_to_backend(&self) {
-        let enabled = self.settings().steam_fh4_mode;
-        let handle = self.backend_handle();
-        lock(&handle).set_steam_fh4_mode(enabled);
-    }
-
-    /// Whether G29 spoof mode is on (v2.0.16): the stored
-    /// `g29_spoof_mode` flag (default off).
-    #[must_use]
-    pub fn g29_spoof_mode(&self) -> bool {
-        self.settings().g29_spoof_mode
-    }
-
-    /// Persist the G29 spoof mode choice (v2.0.16) and recreate the
-    /// live `HIDMaestro` backend with the right profile at once, so a
-    /// connected HID backend switches identity without a manual
-    /// backend re-select. The recreate runs OUTSIDE the backend slot
-    /// lock (R2-09 pattern — the extracted handle is swapped back
-    /// afterwards): it spawns a sidecar and may dwell on a UAC
-    /// prompt, and holding the slot lock for that would stall every
-    /// engine tick. A disconnected HID backend just records the flag
-    /// (its next connect creates the right profile); non-HID
-    /// backends ignore the push (trait default no-op — the daemon
-    /// refuses enabling there before this is ever called).
-    /// Returns the stored value.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message when the settings save fails.
-    pub fn set_g29_spoof_mode(self: &Arc<Self>, enabled: bool) -> Result<bool, String> {
-        let merged = self.set_settings_patch(AppSettingsPatch {
-            g29_spoof_mode: Some(enabled),
-            ..Default::default()
-        })?;
-        // Only a HIDMaestro live backend has a profile to recreate.
-        if self.backend_name() == "HIDMaestro" {
-            self.recreate_live_backend_for_g29(enabled);
-        }
-        Ok(merged.g29_spoof_mode)
-    }
-
-    /// Recreate the installed `HIDMaestro` backend with the given `G29`
-    /// mode, outside the backend slot lock (see
-    /// [`Self::set_g29_spoof_mode`]). The backend handle is taken
-    /// out of the slot (a disconnected `NullSink` stands in, so engine
-    /// ticks keep flowing), the mode is applied on the extracted
-    /// handle — which disconnects + reconnects when connected, and
-    /// just records the flag when not — and the handle is swapped
-    /// back. A failed recreate leaves the backend disconnected with
-    /// the failure in its status; the daemon sees that and rolls the
-    /// persisted flag back. Bug 3 (v2.0.17): the swap-back is
-    /// conditional — the mode apply can dwell minutes on a UAC
-    /// prompt, and if a concurrent switch/fallback installed a newer
-    /// backend meanwhile, the stale handle must be dropped, not
-    /// written back over the newer backend. The token is the
-    /// placeholder's INNER box address, not the slot Arc:
-    /// `apply_backend_switch` extracts the slot Arc and writes the
-    /// SAME Arc back with a different backend inside it, so an
-    /// `Arc::ptr_eq` on the slot would pass even after the slot's
-    /// backend changed (the first version of this guard had exactly
-    /// that hole — the race test caught it). The new backend is
-    /// built before the old box is dropped, so the placeholder's
-    /// address cannot be recycled into the new backend. The two
-    /// checks (inner box, then Arc under the slot lock) are not
-    /// atomic — a switch landing between them is a microseconds
-    /// window, vs the minutes-long UAC dwell this guards; the slot
-    /// lock is never held across a handle lock in this codebase
-    /// (R2-09), so the check cannot be made atomic here.
-    fn recreate_live_backend_for_g29(&self, enabled: bool) {
-        let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
-        // Only the `None` placeholder is built from these factories
-        // here — the extracted live backend is reused, so its pedal
-        // map / handbrake button come from the live push (see
-        // `push_g29_pedal_layout_to_backend` /
-        // `push_g29_handbrake_button_to_backend`), not from a fresh
-        // build. Fresh builds (connect, backend switch) read the
-        // current settings through `real_backend_factories`.
-        let factories = real_backend_factories(
-            vjoy_device_id,
-            enabled,
-            &self.settings().g29_pedal_layout,
-            self.settings().g29_handbrake_button,
-        );
-        if let Some(placeholder) = factories.build(BackendKind::None) {
-            // Capture the placeholder's identity BEFORE installing
-            // it: the `Box` itself does not move when it is placed
-            // in the `Arc<Mutex<…>>`, so this address names the
-            // placeholder instance for the rest of the call. The
-            // address is only ever COMPARED (`ptr::eq` — never
-            // dereferenced), so it stays a valid token even after
-            // a concurrent switch drops the box.
-            let placeholder_ptr = {
-                let raw: &dyn IJoystickOutput = &*placeholder;
-                std::ptr::from_ref(raw)
-            };
-            let placeholder_handle = Arc::new(Mutex::new(placeholder));
-            let handle = {
-                let mut slot = lock(&self.backend);
-                std::mem::replace(&mut *slot, Arc::clone(&placeholder_handle))
-            };
-            lock(&handle).set_g29_spoof_mode(enabled);
-            // Only swap back while the slot still holds OUR
-            // placeholder instance (same inner box): a concurrent
-            // switch installed a newer backend, and a blind
-            // write-back would overwrite + drop it. Dropping the
-            // stale handle here keeps the newer backend live.
-            let slot_handle = lock(&self.backend).clone();
-            let still_placeholder = {
-                let current = lock(&slot_handle);
-                std::ptr::eq(std::ptr::from_ref(&**current), placeholder_ptr)
-            };
-            if still_placeholder {
-                let mut slot = lock(&self.backend);
-                if Arc::ptr_eq(&*slot, &placeholder_handle) {
-                    *slot = handle;
-                }
-            }
-        } else {
-            // No sink factory (test-only path): push on the live
-            // handle directly — test backends are no-ops here.
-            self.push_g29_spoof_mode_to_backend();
-        }
-    }
-
-    /// Push the persisted G29 mode + pedal layout + handbrake
-    /// button into a backend (v2.0.17) — the connect paths call
-    /// this BEFORE connect, so a fresh instance creates the right
-    /// profile and reports with the current settings from its first
-    /// tick. The mode push can recreate an already-connected
-    /// backend (see `set_g29_spoof_mode`); the layout/button pushes
-    /// are live field updates (next tick, no restart).
-    fn push_g29_settings_to_backend(backend: &mut dyn IJoystickOutput, settings: &AppSettings) {
-        backend.set_g29_spoof_mode(settings.g29_spoof_mode);
-        backend.set_g29_pedal_layout(&settings.g29_pedal_layout);
-        backend.set_g29_handbrake_button(u8::try_from(settings.g29_handbrake_button).unwrap_or(8));
-    }
-
-    /// Push the persisted G29 spoof mode into the live backend
-    /// (v2.0.16). Idempotent when the flag already matches (the
-    /// trait method no-ops), and non-HID backends ignore it (trait
-    /// default no-op). Never call while the backend handle's own
-    /// lock is already held (connect paths push through their
-    /// locked `&mut` backend directly instead — see
-    /// [`Self::connect_and_resend`]).
-    fn push_g29_spoof_mode_to_backend(&self) {
-        let enabled = self.settings().g29_spoof_mode;
-        let handle = self.backend_handle();
-        lock(&handle).set_g29_spoof_mode(enabled);
-    }
-
-    /// G29 pedal layout (v2.0.17): the persisted
-    /// `g29_pedal_layout` setting (`"hidmaestro"` default |
-    /// `"pcgamingwiki"`).
-    #[must_use]
-    pub fn g29_pedal_layout(&self) -> String {
-        self.settings().g29_pedal_layout
-    }
-
-    /// Persist the G29 pedal layout (v2.0.17) and push it live to
-    /// a `HIDMaestro` backend, so the next tick already reports
-    /// with the new map — no restart, no recreate. A disconnected
-    /// backend just records the setting (its next connect builds /
-    /// pushes with it). Returns the stored value.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message when the layout is unknown or the
-    /// settings save fails.
-    pub fn set_g29_pedal_layout(self: &Arc<Self>, layout: &str) -> Result<String, String> {
-        let layout =
-            rsh_profiles::csharp_import::canonical_g29_pedal_layout(layout).ok_or_else(|| {
-                format!("unknown G29 pedal layout '{layout}' (expected hidmaestro or pcgamingwiki)")
-            })?;
-        let merged = self.set_settings_patch(AppSettingsPatch {
-            g29_pedal_layout: Some(layout.to_string()),
-            ..Default::default()
-        })?;
-        // Only a HIDMaestro live backend has a G29 map to push to
-        // (other backends ignore the trait default no-op, but the
-        // name check keeps the intent explicit — same guard as the
-        // spoof-mode recreate).
-        if self.backend_name() == "HIDMaestro" {
-            self.push_g29_pedal_layout_to_backend();
-        }
-        Ok(merged.g29_pedal_layout)
-    }
-
-    /// Push the persisted G29 pedal layout into the live backend
-    /// (v2.0.17). Non-HID backends ignore it (trait default
-    /// no-op). Never call while the backend handle's own lock is
-    /// already held.
-    fn push_g29_pedal_layout_to_backend(&self) {
-        let layout = self.settings().g29_pedal_layout;
-        let handle = self.backend_handle();
-        lock(&handle).set_g29_pedal_layout(&layout);
-    }
-
-    /// G29 handbrake button (v2.0.17): the persisted
-    /// `g29_handbrake_button` setting (1–25, default 8).
-    #[must_use]
-    pub fn g29_handbrake_button(&self) -> u32 {
-        self.settings().g29_handbrake_button
-    }
-
-    /// Persist the G29 handbrake button (v2.0.17) and push it live
-    /// to a `HIDMaestro` backend, so the next tick already drives
-    /// the new button — no restart, no recreate. A disconnected
-    /// backend just records the setting. Returns the stored value.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message when the button is outside 1–25 or the
-    /// settings save fails.
-    pub fn set_g29_handbrake_button(self: &Arc<Self>, button: u32) -> Result<u32, String> {
-        if !(1..=25).contains(&button) {
-            return Err(format!("G29 handbrake button must be 1..=25, got {button}"));
-        }
-        let merged = self.set_settings_patch(AppSettingsPatch {
-            g29_handbrake_button: Some(button),
-            ..Default::default()
-        })?;
-        if self.backend_name() == "HIDMaestro" {
-            self.push_g29_handbrake_button_to_backend();
-        }
-        Ok(merged.g29_handbrake_button)
-    }
-
-    /// Push the persisted G29 handbrake button into the live
-    /// backend (v2.0.17). Non-HID backends ignore it (trait
-    /// default no-op). Never call while the backend handle's own
-    /// lock is already held.
-    fn push_g29_handbrake_button_to_backend(&self) {
-        let button = u8::try_from(self.settings().g29_handbrake_button).unwrap_or(8);
-        let handle = self.backend_handle();
-        lock(&handle).set_g29_handbrake_button(button);
     }
 
     /// Restore the newest present profiles backup (M7): `bak1` first,
@@ -7491,11 +6603,9 @@ impl AppStateCore {
             bite_point: stored.bite_point,
             saturation: stored.saturation,
             shifter_gate: if module == "shifter" {
-                Some(if stored.gate_mode.eq_ignore_ascii_case("h-pattern") {
-                    ShifterGate::HPattern
-                } else {
-                    ShifterGate::Sequential
-                })
+                // v2.0.19: H-pattern is deleted — a stored
+                // "h-pattern" gate reads as Sequential.
+                Some(ShifterGate::Sequential)
             } else {
                 None
             },
@@ -7522,22 +6632,6 @@ impl AppStateCore {
             } else {
                 None
             },
-            // --- Encoder per-module tuning ---
-            // Old profiles carry none of these fields: the
-            // defaults (50 ms pulse, 4 counts per click, accel
-            // off, sensitivity 1.0, no invert) apply.
-            encoder_pulse_ms: Some(stored.encoder_pulse_ms.unwrap_or(50.0)),
-            encoder_counts_per_click: Some(stored.encoder_counts_per_click.unwrap_or(4)),
-            encoder_accel: Some(stored.encoder_accel.unwrap_or(false)),
-            encoder_accel_sensitivity: Some(stored.encoder_accel_sensitivity.unwrap_or(1.0)),
-            encoder_invert_mask: Some(stored.encoder_invert_mask.unwrap_or(0)),
-            // --- Buttons per-module tuning ---
-            // Old profiles carry none of these fields: the
-            // defaults (10 ms debounce, 800 ms long-press
-            // threshold, 300 ms double-press window) apply.
-            button_debounce_ms: Some(stored.button_debounce_ms.unwrap_or(10.0)),
-            button_long_press_ms: Some(stored.button_long_press_ms.unwrap_or(800.0)),
-            button_double_press_ms: Some(stored.button_double_press_ms.unwrap_or(300.0)),
             // --- Shifter per-module tuning ---
             // Old profiles carry no lockout: the 50 ms default
             // applies (`Some(0.0)` = off, once set).
@@ -7648,16 +6742,6 @@ impl AppStateCore {
             press_ms,
             release_ms,
             combine_pedals,
-            // --- Encoder per-module tuning ---
-            encoder_pulse_ms: Some(50.0),
-            encoder_counts_per_click: Some(4),
-            encoder_accel: Some(false),
-            encoder_accel_sensitivity: Some(1.0),
-            encoder_invert_mask: Some(0),
-            // --- Buttons per-module tuning ---
-            button_debounce_ms: Some(10.0),
-            button_long_press_ms: Some(800.0),
-            button_double_press_ms: Some(300.0),
             // --- Shifter per-module tuning ---
             shift_lockout_ms: Some(50.0),
             // --- Handbrake/clutch per-module tuning ---
@@ -7779,16 +6863,6 @@ impl AppStateCore {
                 // --- Pedal ramps/curves per-module tuning ---
                 press_ms: None,
                 release_ms: None,
-                // --- Encoder per-module tuning ---
-                encoder_pulse_ms: None,
-                encoder_counts_per_click: None,
-                encoder_accel: None,
-                encoder_accel_sensitivity: None,
-                encoder_invert_mask: None,
-                // --- Buttons per-module tuning ---
-                button_debounce_ms: None,
-                button_long_press_ms: None,
-                button_double_press_ms: None,
                 // --- Shifter per-module tuning ---
                 shift_lockout_ms: None,
                 // --- Handbrake/clutch per-module tuning ---
@@ -7847,16 +6921,6 @@ impl AppStateCore {
         if let Some(combine) = tuning.combine_pedals {
             profile.combine_pedals = combine;
         }
-        // --- Encoder per-module tuning ---
-        entry.encoder_pulse_ms = tuning.encoder_pulse_ms;
-        entry.encoder_counts_per_click = tuning.encoder_counts_per_click;
-        entry.encoder_accel = tuning.encoder_accel;
-        entry.encoder_accel_sensitivity = tuning.encoder_accel_sensitivity;
-        entry.encoder_invert_mask = tuning.encoder_invert_mask;
-        // --- Buttons per-module tuning ---
-        entry.button_debounce_ms = tuning.button_debounce_ms;
-        entry.button_long_press_ms = tuning.button_long_press_ms;
-        entry.button_double_press_ms = tuning.button_double_press_ms;
         // --- Shifter per-module tuning ---
         entry.shift_lockout_ms = tuning.shift_lockout_ms;
         // --- Handbrake/clutch per-module tuning ---
@@ -7867,11 +6931,9 @@ impl AppStateCore {
         entry.led_period_ms = tuning.led_period_ms;
         entry.horn_min_ms = tuning.horn_min_ms;
         entry.horn_latch = tuning.horn_latch;
-        if let Some(gate) = tuning.shifter_gate {
-            entry.gate_mode = match gate {
-                ShifterGate::Sequential => "Sequential".to_string(),
-                ShifterGate::HPattern => "H-pattern".to_string(),
-            };
+        if tuning.shifter_gate.is_some() {
+            // v2.0.19: H-pattern is deleted — every gate is Sequential.
+            entry.gate_mode = "Sequential".to_string();
         }
     }
 
@@ -8128,8 +7190,6 @@ impl AppStateCore {
             ("handbrake", &mut plan.handbrake),
             ("shifter", &mut plan.shifter),
             ("horn", &mut plan.horn),
-            ("buttons", &mut plan.buttons),
-            ("encoders", &mut plan.encoders),
         ] {
             *slot = Self::module_plan_tuning(profile.as_ref(), module, &self.get_tuning(module));
         }
@@ -8255,20 +7315,8 @@ impl AppStateCore {
             bite_point: tuning.bite_point.unwrap_or(0.0) as f32,
             // --- Brake per-module tuning ---
             saturation: tuning.saturation.unwrap_or(1.0) as f32,
-            gate_mode: match tuning.shifter_gate {
-                Some(ShifterGate::HPattern) => ShifterGateMode::HPattern,
-                _ => ShifterGateMode::Sequential,
-            },
-            // --- Encoder per-module tuning ---
-            pulse_ms: tuning.encoder_pulse_ms.unwrap_or(50.0) as f32,
-            counts_per_click: tuning.encoder_counts_per_click.unwrap_or(4),
-            accel_enabled: tuning.encoder_accel.unwrap_or(false),
-            accel_sensitivity: tuning.encoder_accel_sensitivity.unwrap_or(1.0) as f32,
-            encoder_invert_mask: tuning.encoder_invert_mask.unwrap_or(0),
-            // --- Buttons per-module tuning ---
-            debounce_ms: tuning.button_debounce_ms.unwrap_or(10.0) as f32,
-            long_press_ms: tuning.button_long_press_ms.unwrap_or(800.0) as f32,
-            double_press_ms: tuning.button_double_press_ms.unwrap_or(300.0) as f32,
+            // v2.0.19: H-pattern is deleted — every gate is Sequential.
+            gate_mode: ShifterGateMode::Sequential,
             // --- Shifter per-module tuning ---
             shift_lockout_ms: tuning.shift_lockout_ms.unwrap_or(50.0) as f32,
             // --- Handbrake/clutch per-module tuning ---
@@ -8514,28 +7562,15 @@ enum EngineCommand {
     Disconnect,
 }
 
-/// Cumulative encoder counts from the latest frame, as reported by
-/// the frame feeder (see
-/// [`AppStateCore::note_frame_encoders`]). The sink reads these when
-/// it feeds [`AppStateCore::ingest_frame`]; the snapshot tracker
-/// diffs them into deltas itself.
-#[derive(Clone, Copy, Debug, Default)]
-struct EngineEncoderAccum {
-    /// Cumulative counts from the latest frame, one per encoder.
-    counts: [i16; MAX_ENCODERS],
-    /// How many encoders the latest frame carries (`0..=4`).
-    n_enc: usize,
-}
-
 /// Latest raw axis readings in mV, as reported by the frame feeder
 /// (see [`AppStateCore::note_raw_axes`]). v2.0.2 capture plumbing:
 /// the engine consumes the frame's `axes_mv` inside the pipeline and
 /// the state used to only ever see the processed output — so a
 /// centre / pedal endpoint could never be captured from live data.
-/// The feeder now also reports the raw axes per frame (same pattern
-/// as [`EngineEncoderAccum`]), and the capture methods sample this
-/// slot. A sample older than [`RAW_MV_FRESH_FOR`] is refused by
-/// capture — a stale reading must never be saved as a calibration.
+/// The feeder now also reports the raw axes per frame, and the capture
+/// methods sample this slot. A sample older than [`RAW_MV_FRESH_FOR`]
+/// is refused by capture — a stale reading must never be saved as a
+/// calibration.
 #[derive(Clone, Copy, Debug, Default)]
 struct RawAxesSample {
     /// Raw axis values in mV by slot 0–7 (`None` = slot not present).
@@ -8615,8 +7650,9 @@ impl OutputSink for EngineSink {
 /// There is no way to tell a v2.0.0 default apart from an explicit
 /// user `HIDMaestro` choice — the store records only the value — so
 /// this migration knowingly also moves an explicit `HIDMaestro`
-/// choice when vJoy is installed; the user can re-pick `HIDMaestro` on
-/// the Output page, and the migration note names the change.
+/// choice when vJoy is installed; the `HIDMaestro` backend was
+/// removed in v2.0.19, so there is nothing to re-pick — the
+/// migration note names the change.
 #[must_use]
 pub fn should_migrate_persisted_backend(persisted_backend: &str, vjoy_installed: bool) -> bool {
     persisted_backend == "HIDMaestro" && vjoy_installed
@@ -8642,7 +7678,7 @@ pub fn migrate_persisted_backend_default(store: &mut ProfileStore) -> Option<Str
     store.set_settings(settings);
     if let Ok(()) = store.save() {
         Some(
-            "migrated persisted HIDMaestro default to VJoy (vJoy driver found; re-pick HIDMaestro on the Output page to go back)"
+            "migrated persisted HIDMaestro default to VJoy (vJoy driver found; the HIDMaestro backend was removed in v2.0.19)"
                 .to_string(),
         )
     } else {
@@ -8681,10 +7717,6 @@ fn run_vjoy_install(state: &Arc<AppStateCore>) {
     // R2-20: the install may have placed (or failed to place) the
     // DLL — the cached probe must not keep answering the old result.
     state.invalidate_vjoy_dll_cache();
-    // FH4 fix (v2.0.14): the install reconfigures device 1 and
-    // re-writes the mapping tree — the cached wheel check must not
-    // keep answering the pre-install state either.
-    state.invalidate_wheel_check_cache();
     let mut install = lock(&state.vjoy_install);
     install.installing = false;
     install.error = result.err();
@@ -8806,22 +7838,19 @@ fn run_vjoy_install_inner() -> Result<(), String> {
         ));
     }
     if resolve_dll_path().is_some() {
-        // FH4 fix #1 (v2.0.13) + complete tree (v2.0.14): vJoy
-        // installs with its own default device-1 shape, not the
-        // EmuWheel envelope wheel games need (8 axes, 128 buttons,
+        // vJoy installs with its own default device-1 shape, not the
+        // envelope wheel games need (8 axes, 128 buttons,
         // 1 discrete POV, all FFB — see `rsh_output::vjoy_config`).
-        // Configure device 1 AND re-write the complete GameInput
-        // RacingWheel mapping tree now, while the user is here —
-        // one UAC prompt (the installer already prompted once).
-        // The RSH installer does the same steps directly (it is
+        // Configure device 1's envelope now, while the user is here.
+        // The RSH installer does the same step directly (it is
         // already elevated), so a failed config here is reported
         // as a failure with that repair path instead of a silent
-        // wrong-shaped device: without the envelope + mapping no
+        // wrong-shaped device: without the envelope no
         // wheel game can classify the device.
         #[cfg(windows)]
-        if let Err(error) = configure_device_1_envelope_and_mappings() {
+        if let Err(error) = configure_device_1_envelope() {
             return Err(format!(
-                "vJoy installed, but its device 1 could not be configured as a wheel for Windows.Gaming.Input games (for example Forza Horizon 4): {error}"
+                "vJoy installed, but its device 1 could not be configured as a wheel: {error}"
             ));
         }
         Ok(())
@@ -8834,31 +7863,12 @@ fn run_vjoy_install_inner() -> Result<(), String> {
 }
 
 /// Builds the real backend factories for the selector: vJoy
-/// (default), `HIDMaestro` (explicit choice, this settings' device
-/// id), and the no-device sink. `g29_spoof` is the persisted G29
-/// mode: a freshly built `HIDMaestro` backend creates the `logitech-g29`
-/// profile when it is on (see `HidMaestroConfig::g29_spoof`) — the
-/// live toggle path recreates the installed instance instead, so the
-/// two paths never disagree about which profile is live.
-fn real_backend_factories(
-    vjoy_device_id: u32,
-    g29_spoof: bool,
-    g29_pedal_layout: &str,
-    g29_handbrake_button: u32,
-) -> BackendFactories {
-    let g29_pedal_map = G29PedalMap::from_layout(g29_pedal_layout).unwrap_or(G29PedalMap::PROFILE);
-    // Settings sanitize clamps to 1–25; the clamp here is the
-    // backstop for a hand-built value, and the `u8` cast cannot
-    // fail after it.
-    let g29_handbrake_button = u8::try_from(g29_handbrake_button.clamp(1, 25)).unwrap_or(8);
+/// (default, this settings' device id), Xbox (`ViGEmBus` fallback),
+/// and the no-device sink.
+fn real_backend_factories(vjoy_device_id: u32) -> BackendFactories {
     BackendFactories {
-        hidmaestro: Some(Box::new(move || {
-            Box::new(HidMaestroOutput::with_config(
-                HidMaestroConfig::default()
-                    .with_g29_spoof(g29_spoof)
-                    .with_g29_pedal_map(g29_pedal_map)
-                    .with_g29_handbrake_button(g29_handbrake_button),
-            )) as Box<dyn IJoystickOutput>
+        xbox: Some(Box::new(|| {
+            Box::new(VigemOutput::new()) as Box<dyn IJoystickOutput>
         })),
         vjoy: Some(Box::new(move || {
             Box::new(VJoyOutput::new(vjoy_device_id)) as Box<dyn IJoystickOutput>
@@ -10757,20 +9767,16 @@ async fn forward_with_retry_with_policy<T, F>(
             // R3-D-02: the gate opened — the wait is over, the
             // forwarder no longer owns a retry.
             _retry_wait_guard = None;
-            // Status pump (H1 condition 12): board loss counters and
-            // `btnsEx` reach the engine. A full/closed engine status
+            // Status pump (H1 condition 12): board loss counters
+            // reach the engine. A full/closed engine status
             // channel drops the packet (the engine drains its own
             // channel every tick; a stale counter is never fatal).
             while let Some(status) = transport.try_next_status() {
                 let _ = status_tx.try_send(status);
             }
-            // The frame's cumulative encoder counts are the snapshot's
-            // truth (see `note_frame_encoders`); report them before
-            // handing the frame to the engine.
-            state.note_frame_encoders(frame.encoders, frame.n_enc);
             // v2.0.2 capture plumbing: the frame's raw mV is the
             // capture source (see `note_raw_axes`) — reported for
-            // authenticated frames only, next to the encoders.
+            // authenticated frames only.
             state.note_raw_axes(frame.axes_mv);
             if frame_tx.try_send(frame).is_err() {
                 // Channel full (engine behind) or closed (engine
@@ -10815,15 +9821,16 @@ async fn forward_with_retry_with_policy<T, F>(
 }
 
 /// Human-readable detail for a live backend kind, as
-/// [`AppStateCore::output_state`] reports it. The `HIDMaestro` line
-/// always carries the UAC note: the elevated helper runs for the whole
-/// session, so Windows asks on every launch while it is active.
+/// [`AppStateCore::output_state`] reports it.
 #[must_use]
 fn live_backend_detail(kind: BackendKind, vjoy_device_id: u32) -> String {
     match kind {
-        BackendKind::HidMaestro => format!("HIDMaestro — explicit-choice backend. {UAC_NOTE}"),
+        BackendKind::Xbox => {
+            "Xbox (ViGEmBus) — fallback backend for games that do not accept the vJoy wheel."
+                .to_string()
+        }
         BackendKind::VJoy => {
-            format!("vJoy device {vjoy_device_id} — default backend, no UAC prompt needed.")
+            format!("vJoy device {vjoy_device_id} — default backend.")
         }
         BackendKind::None => "No output backend — output is disabled.".to_string(),
     }
@@ -10845,7 +9852,6 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize};
     use std::time::Duration;
 
-    use rsh_engine::encoder::EncoderButtons;
     use rsh_protocol::PinTableEntry;
     use rsh_security::keystore::KeystoreError;
 
@@ -10860,34 +9866,19 @@ mod tests {
         fail: Arc<Mutex<bool>>,
         fail_connect: Arc<Mutex<bool>>,
         /// Message a failing `try_connect` reports (default "mock
-        /// connect failed"; tests set it to e.g. an "administrator
-        /// rights" wording to model a UAC decline).
+        /// connect failed").
         fail_connect_message: Arc<Mutex<String>>,
-        /// The manager latch (P2, v2.0.11): models the `HIDMaestro`
-        /// `SidecarManager::fallback_needed` latch. While set,
+        /// The manager latch (P2, v2.0.11): models the backend's
+        /// `fallback_needed` latch. While set,
         /// `try_connect` fails fast — exactly like the real latched
         /// manager — and only the trait's `reset_fallback` hook
         /// clears it. Distinct from `fail_connect`, which models an
-        /// external failure (the sidecar will not start) that no
+        /// external failure (the backend will not start) that no
         /// re-arm can clear.
         latched: Arc<Mutex<bool>>,
         /// Reported by `name()`; the failover test needs a backend
-        /// that reports `"HIDMaestro"` / `"vJoy"`.
+        /// that reports `"Xbox"` / `"vJoy"`.
         name: &'static str,
-        /// Recorded `G29` mode (Bug 3, v2.0.17): the mock now models
-        /// the real `HidMaestroOutput::set_g29_spoof_mode` restart
-        /// (disconnect + reconnect on a mode change while
-        /// connected), so G29 toggle tests see a real recreate.
-        g29_spoof: Arc<Mutex<bool>>,
-        /// Optional block hook for the G29 recreate race test (Bug
-        /// 3, v2.0.17): when armed, `set_g29_spoof_mode` signals
-        /// `entered` and waits on `release` (bounded), so the test
-        /// can run a concurrent backend switch mid-recreate.
-        g29_block: Arc<Mutex<Option<(FlagPair, FlagPair)>>>,
-        /// Last G29 pedal layout pushed to this mock (v2.0.17).
-        g29_pedal_layout: Arc<Mutex<String>>,
-        /// Last G29 handbrake button pushed to this mock (v2.0.17).
-        g29_handbrake_button: Arc<Mutex<u8>>,
     }
 
     impl RecordingBackend {
@@ -10916,10 +9907,6 @@ mod tests {
                     fail_connect_message: Arc::new(Mutex::new("mock connect failed".to_string())),
                     latched: Arc::new(Mutex::new(false)),
                     name,
-                    g29_spoof: Arc::new(Mutex::new(false)),
-                    g29_block: Arc::new(Mutex::new(None)),
-                    g29_pedal_layout: Arc::new(Mutex::new("hidmaestro".to_string())),
-                    g29_handbrake_button: Arc::new(Mutex::new(8)),
                 },
                 sent,
                 fail,
@@ -10956,29 +9943,6 @@ mod tests {
         fn is_latched(&self) -> bool {
             *self.latched.lock().expect("latched lock poisoned")
         }
-
-        /// Arms the G29 block hook (Bug 3, v2.0.17): the next
-        /// `set_g29_spoof_mode` signals `entered` and waits on
-        /// `release`, so the test can switch backends mid-recreate.
-        fn arm_g29_block(&self, entered: FlagPair, release: FlagPair) {
-            *self.g29_block.lock().expect("g29_block lock poisoned") = Some((entered, release));
-        }
-
-        /// Last G29 pedal layout pushed to this mock (v2.0.17).
-        fn g29_pedal_layout(&self) -> String {
-            self.g29_pedal_layout
-                .lock()
-                .expect("g29_pedal_layout lock poisoned")
-                .clone()
-        }
-
-        /// Last G29 handbrake button pushed to this mock (v2.0.17).
-        fn g29_handbrake_button(&self) -> u8 {
-            *self
-                .g29_handbrake_button
-                .lock()
-                .expect("g29_handbrake_button lock poisoned")
-        }
     }
 
     impl IJoystickOutput for RecordingBackend {
@@ -10996,7 +9960,7 @@ mod tests {
             // consulted, and with the fallback wording.
             if *self.latched.lock().expect("latched lock poisoned") {
                 return Err(VJoyError::DriverNotFound(
-                    "HIDMaestro already failed once and the retry was used up — re-select HIDMaestro in Output settings to try again."
+                    "backend already failed once and the retry was used up — re-select it in Output settings to try again."
                         .to_string(),
                 ));
             }
@@ -11049,59 +10013,6 @@ mod tests {
                 .push(PipelineOutputState::neutral());
             Ok(())
         }
-
-        /// G29 restart semantics (Bug 3, v2.0.17): models the real
-        /// `HidMaestroOutput::set_g29_spoof_mode` — a mode change
-        /// while connected disconnects, records the flag, and
-        /// reconnects (a failing reconnect leaves it disconnected,
-        /// which is how the daemon detects a failed recreate); a
-        /// disconnected backend just records the flag. When the
-        /// block hook is armed, the mode apply first signals
-        /// `entered` and waits on `release` (bounded, so a test
-        /// that never releases fails instead of hanging).
-        fn set_g29_spoof_mode(&mut self, enabled: bool) {
-            if let Some((entered, release)) = self
-                .g29_block
-                .lock()
-                .expect("g29_block lock poisoned")
-                .clone()
-            {
-                BlockingBackend::set_flag(&entered);
-                assert!(
-                    BlockingBackend::wait_flag(&release, Duration::from_secs(10)),
-                    "g29 block release timed out — the race test never released the recreate"
-                );
-            }
-            if enabled == *self.g29_spoof.lock().expect("g29_spoof lock poisoned") {
-                return;
-            }
-            let was_connected = self.is_connected();
-            if was_connected {
-                self.disconnect();
-            }
-            *self.g29_spoof.lock().expect("g29_spoof lock poisoned") = enabled;
-            if was_connected {
-                let _ = self.try_connect();
-            }
-        }
-
-        /// Records the pushed layout (v2.0.17): the mock has no map
-        /// to apply, so the recorded value IS the assertion surface
-        /// for the core setter push.
-        fn set_g29_pedal_layout(&mut self, layout: &str) {
-            *self
-                .g29_pedal_layout
-                .lock()
-                .expect("g29_pedal_layout lock poisoned") = layout.to_string();
-        }
-
-        /// Records the pushed handbrake button (v2.0.17).
-        fn set_g29_handbrake_button(&mut self, button: u8) {
-            *self
-                .g29_handbrake_button
-                .lock()
-                .expect("g29_handbrake_button lock poisoned") = button;
-        }
     }
 
     /// One side of the `BlockingBackend` handshake: a bool flag
@@ -11110,7 +10021,7 @@ mod tests {
     type FlagPair = Arc<(Mutex<bool>, Condvar)>;
 
     /// Test-only backend whose `update()` blocks until the test
-    /// releases it (PERF F-15): models a `HIDMaestro` sidecar
+    /// releases it (PERF F-15): models a slow backend
     /// round-trip that takes ~200 ms, so the test can prove a
     /// backend switch does not wait it out. `update()` signals
     /// `entered` on entry and waits on `release` (bounded, so a
@@ -11250,8 +10161,6 @@ mod tests {
                 brake: 0.0,
                 clutch: None,
             },
-            encoder_counts: [0; MAX_ENCODERS],
-            n_enc: 0,
             output: PipelineOutputState::neutral(),
             metrics: EngineMetrics::new(),
         }
@@ -11304,172 +10213,6 @@ mod tests {
             enabled.detail.contains("backend activation failed"),
             "detail: {}",
             enabled.detail
-        );
-    }
-
-    #[test]
-    fn steam_fh4_mode_defaults_off_and_persists() {
-        // FH4 fix (v2.0.15): default OFF, and the toggle round-trips
-        // through settings.json.
-        let (state, _dir) = test_state();
-        assert!(!state.steam_fh4_mode(), "default must be off");
-        assert!(!state.settings().steam_fh4_mode);
-        assert!(state.set_steam_fh4_mode(true).expect("persist on"));
-        assert!(state.steam_fh4_mode());
-        assert!(state.settings().steam_fh4_mode);
-        assert!(!state.set_steam_fh4_mode(false).expect("persist off"));
-        assert!(!state.steam_fh4_mode());
-    }
-
-    #[test]
-    fn g29_spoof_mode_defaults_off_and_persists() {
-        // G29 spoof (v2.0.16): default OFF, and the toggle
-        // round-trips through settings.json. The test backend is the
-        // NullSink (not HIDMaestro), so the push is a no-op — the
-        // persist itself is what this asserts.
-        let (state, _dir) = test_state();
-        assert!(!state.g29_spoof_mode(), "default must be off");
-        assert!(!state.settings().g29_spoof_mode);
-        assert!(state.set_g29_spoof_mode(true).expect("persist on"));
-        assert!(state.g29_spoof_mode());
-        assert!(state.settings().g29_spoof_mode);
-        assert!(!state.set_g29_spoof_mode(false).expect("persist off"));
-        assert!(!state.g29_spoof_mode());
-    }
-
-    /// G29 settings (v2.0.17): defaults are the `HIDMaestro`
-    /// layout and button 8, and both round-trip through
-    /// settings.json. The test backend is the `NullSink` (not
-    /// `HIDMaestro`), so no live push happens — the persist itself
-    /// is what this asserts. Validation errors change nothing.
-    #[test]
-    fn g29_settings_default_and_persist() {
-        let (state, _dir) = test_state();
-        assert_eq!(state.g29_pedal_layout(), "hidmaestro");
-        assert_eq!(state.g29_handbrake_button(), 8);
-        assert_eq!(state.settings().g29_pedal_layout, "hidmaestro");
-        assert_eq!(state.settings().g29_handbrake_button, 8);
-        assert_eq!(
-            state
-                .set_g29_pedal_layout("pcgamingwiki")
-                .expect("persist layout"),
-            "pcgamingwiki"
-        );
-        assert_eq!(state.g29_pedal_layout(), "pcgamingwiki");
-        assert_eq!(
-            state.set_g29_handbrake_button(12).expect("persist button"),
-            12
-        );
-        assert_eq!(state.g29_handbrake_button(), 12);
-        assert!(state.set_g29_pedal_layout("banana").is_err());
-        assert_eq!(state.g29_pedal_layout(), "pcgamingwiki");
-        assert!(state.set_g29_handbrake_button(0).is_err());
-        assert!(state.set_g29_handbrake_button(26).is_err());
-        assert_eq!(state.g29_handbrake_button(), 12);
-    }
-
-    /// G29 settings (v2.0.17): on a live `HIDMaestro` backend the
-    /// setters push the new values at once (next tick), so no
-    /// restart is needed for a layout/button change.
-    #[test]
-    fn g29_settings_push_live_to_hidmaestro_backend() {
-        let (factories, hm) = hidmaestro_mock_factories();
-        let (state, _dir) = test_state();
-        state
-            .set_output_backend_with_factories("HIDMaestro", &factories)
-            .expect("HIDMaestro switch succeeds");
-        assert!(state.output_state().connected);
-        assert_eq!(hm.g29_pedal_layout(), "hidmaestro");
-        assert_eq!(hm.g29_handbrake_button(), 8);
-        assert_eq!(
-            state
-                .set_g29_pedal_layout("pcgamingwiki")
-                .expect("set layout"),
-            "pcgamingwiki"
-        );
-        assert_eq!(hm.g29_pedal_layout(), "pcgamingwiki");
-        assert_eq!(state.set_g29_handbrake_button(12).expect("set button"), 12);
-        assert_eq!(hm.g29_handbrake_button(), 12);
-    }
-
-    /// Bug 3 (v2.0.17): a backend switch that lands WHILE a G29
-    /// recreate is mid-flight (blocked here in the mock's
-    /// `set_g29_spoof_mode`, modelling the minutes-long UAC dwell)
-    /// must survive the recreate — the stale handle is dropped,
-    /// not written back over the newer backend. The mock's block
-    /// hook is the closest faithful equivalent of the real race:
-    /// the mock cannot itself swap the slot (it holds no state
-    /// reference), so the test thread drives the recreate while
-    /// the main thread performs the concurrent switch, exactly as
-    /// a second user switch / fallback would. What it proves: the
-    /// inner-box guard keeps the newer backend — and it caught the
-    /// first guard version, which compared only the slot `Arc`
-    /// (`Arc::ptr_eq`): the switch path recycles the extracted Arc
-    /// and writes it back with the new backend inside, so the Arc
-    /// check passed while the backend had changed. What it does
-    /// NOT prove: a real UAC dwell (no sidecar here), a fallback
-    /// racing from the engine thread, or a switch landing in the
-    /// microseconds between the guard's two checks (see the
-    /// `recreate_live_backend_for_g29` docs).
-    #[test]
-    fn g29_recreate_keeps_newer_backend_after_concurrent_switch() {
-        let (hm, _hm_sent, _hm_fail) = RecordingBackend::new_named("HIDMaestro");
-        let (vj, _vj_sent, _vj_fail) = RecordingBackend::new_named("vJoy");
-        let hm_factory = hm.clone();
-        let vj_factory = vj.clone();
-        let factories = BackendFactories {
-            hidmaestro: Some(Box::new(move || {
-                Box::new(hm_factory.clone()) as Box<dyn IJoystickOutput>
-            })),
-            vjoy: Some(Box::new(move || {
-                Box::new(vj_factory.clone()) as Box<dyn IJoystickOutput>
-            })),
-            none: Box::new(|| Box::new(NullSink) as Box<dyn IJoystickOutput>),
-        };
-        let (state, _dir) = test_state();
-        state
-            .set_output_backend_with_factories("HIDMaestro", &factories)
-            .expect("HIDMaestro switch succeeds");
-        assert!(state.output_state().connected);
-        let entered = Arc::new((Mutex::new(false), Condvar::new()));
-        let release = Arc::new((Mutex::new(false), Condvar::new()));
-        hm.arm_g29_block(Arc::clone(&entered), Arc::clone(&release));
-        let state_for_thread = Arc::clone(&state);
-        let toggled = std::thread::spawn(move || state_for_thread.set_g29_spoof_mode(true));
-        assert!(
-            BlockingBackend::wait_flag(&entered, Duration::from_secs(10)),
-            "recreate entered the mock G29 apply"
-        );
-        // Concurrent switch mid-recreate (a second user switch /
-        // fallback during the UAC dwell).
-        state
-            .set_output_backend_with_factories("vJoy", &factories)
-            .expect("concurrent vJoy switch succeeds");
-        assert_eq!(state.backend_name(), "vJoy");
-        assert!(state.output_state().connected, "vJoy is connected");
-        let vjoy_handle = state.backend_handle();
-        BlockingBackend::set_flag(&release);
-        let stored = toggled
-            .join()
-            .expect("toggle thread joins")
-            .expect("toggle persists");
-        assert!(stored, "the toggle itself still persists on");
-        assert_eq!(
-            state.backend_name(),
-            "vJoy",
-            "stale HIDMaestro handle must not overwrite the newer vJoy backend"
-        );
-        // `backend_name()` is a separate string — the slot itself
-        // must hold the vJoy backend, not just report its name.
-        let live = state.backend_handle();
-        assert_eq!(
-            lock(&live).name(),
-            "vJoy",
-            "the slot's live backend is vJoy, not the stale HIDMaestro handle"
-        );
-        assert!(
-            Arc::ptr_eq(&state.backend_handle(), &vjoy_handle),
-            "the slot still holds the newer vJoy handle"
         );
     }
 
@@ -11568,15 +10311,15 @@ mod tests {
     #[test]
     fn set_output_backend_without_drivers_fails_honestly_and_keeps_the_old_backend() {
         let (state, _dir) = test_state();
-        // Linux sandbox: no HIDMaestro sidecar, no vJoy DLL. An
-        // explicit HIDMaestro switch must ERROR with the real
+        // Linux sandbox: no ViGEmBus driver, no vJoy DLL. An
+        // explicit Xbox switch must ERROR with the real
         // reason — never silently fall back to vJoy (Bug 4/8) — and
         // the persisted choice reverts to the previous backend.
         let error = state
-            .set_output_backend("HIDMaestro")
-            .expect_err("HIDMaestro must fail without a sidecar");
+            .set_output_backend("Xbox")
+            .expect_err("Xbox must fail without a driver");
         assert!(
-            error.contains("could not switch output backend to HIDMaestro"),
+            error.contains("could not switch output backend to Xbox"),
             "{error}"
         );
         assert!(
@@ -11585,7 +10328,7 @@ mod tests {
         );
         // The failed switch reverts the persisted choice to the
         // previous backend (vJoy here), instead of leaving
-        // HIDMaestro persisted for the next launch to retry.
+        // Xbox persisted for the next launch to retry.
         assert_eq!(state.settings().output_backend, "VJoy");
         // …and the failed switch never moved the in-memory selection
         // off the previous choice (the vJoy default here).
@@ -11606,13 +10349,9 @@ mod tests {
         assert_eq!(state.settings().output_backend, "VJoy");
     }
 
-    /// Bug 4/8: an explicit `HIDMaestro` switch whose connect fails
-    /// (non-UAC reason) errors with the real reason, leaves vJoy
-    /// live and connected, and reverts the persisted choice to vJoy
-    /// — no silent fallback, no "now vJoy" success.
     #[test]
-    fn explicit_hidmaestro_switch_failure_reverts_choice_and_keeps_vjoy() {
-        let factories = named_mock_factories(Some("HIDMaestro sidecar failed to start."), None);
+    fn explicit_xbox_switch_failure_reverts_choice_and_keeps_vjoy() {
+        let factories = named_mock_factories(Some("Xbox driver not found."), None);
         let (state, _dir) = test_state();
         state
             .apply_backend_switch(BackendKind::VJoy, &factories, true)
@@ -11621,10 +10360,10 @@ mod tests {
         assert!(state.output_state().connected);
 
         let error = state
-            .set_output_backend_with_factories("HIDMaestro", &factories)
-            .expect_err("explicit HIDMaestro failure must error");
+            .set_output_backend_with_factories("Xbox", &factories)
+            .expect_err("explicit Xbox failure must error");
         assert!(
-            error.contains("sidecar failed to start"),
+            error.contains("Xbox driver not found"),
             "the real reason is reported: {error}"
         );
         assert!(!error.contains("fell back"), "no silent fallback: {error}");
@@ -11639,170 +10378,28 @@ mod tests {
     }
 
     /// Mock factories for the P2 tests where the test keeps a handle
-    /// to the `HIDMaestro` mock, so it can flip `fail_connect` on the
+    /// to the `Xbox` mock, so it can flip `fail_connect` on the
     /// INSTALLED instance: a same-kind re-select reconnects the
     /// installed backend (a fresh factory build is never consulted
     /// on that path), so a separate failing factory cannot make a
     /// re-select fail — only the installed instance's own flag can.
-    fn hidmaestro_mock_factories() -> (BackendFactories, RecordingBackend) {
-        let (hm, _hm_sent, _hm_fail) = RecordingBackend::new_named("HIDMaestro");
+    fn xbox_mock_factories() -> (BackendFactories, RecordingBackend) {
+        let (xb, _xb_sent, _xb_fail) = RecordingBackend::new_named("Xbox");
         let (vj, _vj_sent, _vj_fail) = RecordingBackend::new_named("vJoy");
-        let hm_factory = hm.clone();
+        let xb_factory = xb.clone();
         let vj_factory = vj.clone();
         (
             BackendFactories {
-                hidmaestro: Some(Box::new(move || {
-                    Box::new(hm_factory.clone()) as Box<dyn IJoystickOutput>
+                xbox: Some(Box::new(move || {
+                    Box::new(xb_factory.clone()) as Box<dyn IJoystickOutput>
                 })),
                 vjoy: Some(Box::new(move || {
                     Box::new(vj_factory.clone()) as Box<dyn IJoystickOutput>
                 })),
                 none: Box::new(|| Box::new(NullSink) as Box<dyn IJoystickOutput>),
             },
-            hm,
+            xb,
         )
-    }
-
-    /// P2 (v2.0.11): the explicit-switch storm guard — 3 consecutive
-    /// failed explicit switches to `HIDMaestro` refuse the 4th for
-    /// 30 s with the cooldown message (the v2.0.10 retest fired 30
-    /// attempts in ~4 minutes). A refused attempt changes no state,
-    /// vJoy switches are unaffected, and a successful `HIDMaestro`
-    /// switch resets the counter.
-    #[test]
-    fn explicit_hidmaestro_switch_cooldown_after_three_failures() {
-        let (factories, hm) = hidmaestro_mock_factories();
-        hm.set_fail_connect(true);
-        hm.set_fail_connect_message("HIDMaestro sidecar failed to start.");
-        let (state, _dir) = test_state();
-        // One failure, then a success: the success resets the
-        // counter, so the three failures below are strikes #1–#3,
-        // not #2–#4.
-        let error = state
-            .set_output_backend_with_factories("HIDMaestro", &factories)
-            .expect_err("failing HIDMaestro switch must error");
-        assert!(
-            error.contains("sidecar failed to start"),
-            "the real reason is reported: {error}"
-        );
-        hm.set_fail_connect(false);
-        state
-            .set_output_backend_with_factories("HIDMaestro", &factories)
-            .expect("HIDMaestro switch succeeds with a working sidecar");
-        // A connected same-kind re-select is a no-op success, so
-        // disconnect first — the re-select must actually attempt a
-        // connect to count as a failure.
-        {
-            let handle = state.backend_handle();
-            lock(&handle).disconnect();
-        }
-        hm.set_fail_connect(true);
-        for attempt in 1..=3 {
-            let error = state
-                .set_output_backend_with_factories("HIDMaestro", &factories)
-                .expect_err("failing HIDMaestro switch must error");
-            assert!(
-                error.contains("sidecar failed to start"),
-                "attempt {attempt} reports the real reason: {error}"
-            );
-            assert!(
-                !error.contains("retry in 30 s"),
-                "attempt {attempt} is not yet refused: {error}"
-            );
-        }
-        // The 4th attempt inside the 30 s window is refused — and a
-        // refused attempt changes no state (the persisted choice and
-        // the selection are exactly as the 3rd failure left them).
-        let settings_before = state.settings().output_backend.clone();
-        let selected_before = state.selected_backend();
-        let error = state
-            .set_output_backend_with_factories("HIDMaestro", &factories)
-            .expect_err("4th switch must be refused by the cooldown");
-        assert_eq!(error, AppStateCore::HID_SWITCH_COOLDOWN_MESSAGE);
-        assert_eq!(state.settings().output_backend, settings_before);
-        assert_eq!(state.selected_backend(), selected_before);
-        // The guard is HIDMaestro-only: vJoy still switches.
-        let switched = state
-            .set_output_backend_with_factories("vJoy", &factories)
-            .expect("vJoy switch is unaffected by the HIDMaestro cooldown");
-        assert_eq!(switched.backend, "vJoy");
-    }
-
-    /// P1-5 (update4-fix): the enable toggle consults the storm
-    /// guard — after 3 failed explicit switches arm the cooldown,
-    /// enabling output with a persisted `HIDMaestro` choice is
-    /// refused with the cooldown message even though the sidecar
-    /// would now succeed, and no backend is activated.
-    #[test]
-    fn enable_toggle_consults_hidmaestro_switch_cooldown() {
-        let (factories, hm) = hidmaestro_mock_factories();
-        hm.set_fail_connect(true);
-        hm.set_fail_connect_message("HIDMaestro sidecar failed to start.");
-        let (state, _dir) = test_state_with_backend_setting("HIDMaestro");
-        assert_eq!(state.selected_backend(), BackendKind::HidMaestro);
-        for _ in 1..=3 {
-            let _ = state
-                .set_output_backend_with_factories("HIDMaestro", &factories)
-                .expect_err("failing HIDMaestro switch must error");
-        }
-        // The sidecar is fixed now — but the cooldown still holds.
-        hm.set_fail_connect(false);
-        let backend_before = state.backend_name();
-        let enabled = state.set_output_enabled_with_factories(true, &factories);
-        assert!(
-            !enabled.connected,
-            "no backend is activated during the cooldown"
-        );
-        // P1-1 (v2.0.12 scan): a refused enable reports the
-        // toggle OFF — the flag is set only once an enable
-        // actually happens.
-        assert_eq!(
-            enabled.enabled,
-            Some(false),
-            "a cooldown-refused enable must not report ON"
-        );
-        assert!(
-            enabled.detail.contains("retry in 30 s"),
-            "the toggle is refused by the cooldown: {}",
-            enabled.detail
-        );
-        assert_eq!(
-            state.backend_name(),
-            backend_before,
-            "no backend is activated during the cooldown"
-        );
-    }
-
-    /// P1-5 (update4-fix): failed enable-toggle activations count
-    /// toward the storm guard too — 3 failing enables arm the
-    /// cooldown, and the 4th enable is refused without spawning
-    /// another sidecar. (Before this fix the toggle never counted,
-    /// so the guard could never arm from the toggle alone.)
-    #[test]
-    fn enable_toggle_failures_arm_the_cooldown() {
-        let (state, _dir) = test_state_with_backend_setting("HIDMaestro");
-        let factories = mock_factories(true, true);
-        for attempt in 1..=3 {
-            let enabled = state.set_output_enabled_with_factories(true, &factories);
-            assert!(!enabled.connected, "attempt {attempt} must not connect");
-            assert!(
-                enabled.detail.contains("backend activation failed"),
-                "attempt {attempt} reports the activation failure: {}",
-                enabled.detail
-            );
-            assert!(
-                !enabled.detail.contains("retry in 30 s"),
-                "attempt {attempt} is not yet refused: {}",
-                enabled.detail
-            );
-        }
-        let enabled = state.set_output_enabled_with_factories(true, &factories);
-        assert!(!enabled.connected, "4th enable must not connect");
-        assert!(
-            enabled.detail.contains("retry in 30 s"),
-            "4th enable is refused by the cooldown: {}",
-            enabled.detail
-        );
     }
 
     /// P1-5 (update4-fix): an AUTOMATIC re-attempt must NOT clear
@@ -11810,10 +10407,10 @@ mod tests {
     /// fast with `FallbackNeeded`, the automatic path falls back to
     /// vJoy, and the latch survives (only an explicit re-select
     /// re-arms it in place; see
-    /// `reselect_disconnected_hidmaestro_rearms_latched_instance`).
+    /// `reselect_disconnected_xbox_rearms_latched_instance`).
     #[test]
     fn automatic_switch_does_not_clear_manager_latch() {
-        let (latched, _latched_sent, _latched_fail) = RecordingBackend::new_named("HIDMaestro");
+        let (latched, _latched_sent, _latched_fail) = RecordingBackend::new_named("Xbox");
         latched.set_latched(true);
         let live = latched.clone();
         let dir = test_dir("latched-automatic");
@@ -11824,8 +10421,8 @@ mod tests {
             "test latched backend",
         ));
         let factories = BackendFactories {
-            hidmaestro: Some(Box::new(|| {
-                let (backend, _, _) = RecordingBackend::new_named("HIDMaestro");
+            xbox: Some(Box::new(|| {
+                let (backend, _, _) = RecordingBackend::new_named("Xbox");
                 Box::new(backend) as Box<dyn IJoystickOutput>
             })),
             vjoy: Some(Box::new(|| {
@@ -11838,7 +10435,7 @@ mod tests {
         // instance must NOT be re-armed — it fails fast, the switch
         // falls back to vJoy, and the latch is still set afterwards.
         let outcome = state
-            .apply_backend_switch(BackendKind::HidMaestro, &factories, true)
+            .apply_backend_switch(BackendKind::Xbox, &factories, true)
             .expect("automatic switch falls back to vJoy");
         assert!(outcome.fell_back, "the latched backend falls back");
         assert_eq!(outcome.active, BackendKind::VJoy);
@@ -11855,11 +10452,11 @@ mod tests {
     /// retry budget).
     #[test]
     fn same_kind_reselect_reuses_installed_backend() {
-        let (factories, hm) = hidmaestro_mock_factories();
+        let (factories, xb) = xbox_mock_factories();
         let (state, _dir) = test_state();
         state
-            .set_output_backend_with_factories("HIDMaestro", &factories)
-            .expect("HIDMaestro switch succeeds");
+            .set_output_backend_with_factories("Xbox", &factories)
+            .expect("Xbox switch succeeds");
         assert!(state.output_state().connected);
         {
             let handle = state.backend_handle();
@@ -11867,13 +10464,13 @@ mod tests {
         }
         assert!(!state.output_state().connected);
         let handle_before = state.backend_handle();
-        hm.set_fail_connect(true);
-        hm.set_fail_connect_message("HIDMaestro sidecar failed to start.");
+        xb.set_fail_connect(true);
+        xb.set_fail_connect_message("Xbox driver not found.");
         let error = state
-            .set_output_backend_with_factories("HIDMaestro", &factories)
+            .set_output_backend_with_factories("Xbox", &factories)
             .expect_err("failing re-select must error");
         assert!(
-            error.contains("sidecar failed to start"),
+            error.contains("Xbox driver not found"),
             "the real reason is reported: {error}"
         );
         assert!(
@@ -11882,50 +10479,15 @@ mod tests {
         );
     }
 
-    /// Bug 4/8 (UAC decline, regression guard): a `HIDMaestro`
-    /// connect failure naming "administrator rights" fails with
-    /// [`AppStateCore::HID_NOT_ADMIN`], latches the decline, and
-    /// reverts the persisted choice — no silent fallback to vJoy.
-    #[test]
-    fn explicit_hidmaestro_switch_uac_decline_returns_hid_not_admin() {
-        let factories = named_mock_factories(
-            Some("administrator rights are required to install the driver"),
-            None,
-        );
-        let (state, _dir) = test_state();
-        state
-            .apply_backend_switch(BackendKind::VJoy, &factories, true)
-            .expect("install vJoy mock");
-
-        let error = state
-            .set_output_backend_with_factories("HIDMaestro", &factories)
-            .expect_err("a UAC decline must error");
-        assert!(
-            error.contains(AppStateCore::HID_NOT_ADMIN),
-            "the decline is typed, not generic: {error}"
-        );
-        assert!(
-            state.elevation_declined.load(Ordering::SeqCst),
-            "the decline latch is set"
-        );
-        assert_eq!(state.backend_name(), "vJoy", "vJoy stays live");
-        assert_eq!(state.selected_backend(), BackendKind::VJoy);
-        assert_eq!(
-            state.settings().output_backend,
-            "VJoy",
-            "persisted choice reverts to the previous backend"
-        );
-    }
-
     /// The fallback survives ONLY on automatic paths: enabling
-    /// output with a persisted `HIDMaestro` choice whose sidecar fails
-    /// still falls back to vJoy (the deferred startup activation),
-    /// and the persisted choice stays `HIDMaestro` for the next launch.
+    /// output with a persisted `Xbox` choice whose driver fails
+    /// still falls back to vJoy, and the persisted choice stays
+    /// `Xbox` for the next launch.
     #[test]
-    fn automatic_deferred_enable_still_falls_back_to_vjoy() {
-        let factories = named_mock_factories(Some("HIDMaestro sidecar failed to start."), None);
-        let (state, _dir) = test_state_with_backend_setting("HIDMaestro");
-        assert_eq!(state.selected_backend(), BackendKind::HidMaestro);
+    fn automatic_enable_still_falls_back_to_vjoy() {
+        let factories = named_mock_factories(Some("Xbox driver not found."), None);
+        let (state, _dir) = test_state_with_backend_setting("Xbox");
+        assert_eq!(state.selected_backend(), BackendKind::Xbox);
 
         let switched = state.set_output_enabled_with_factories(true, &factories);
         assert_eq!(switched.backend, "vJoy", "automatic path falls back");
@@ -11933,7 +10495,7 @@ mod tests {
         assert_eq!(state.backend_name(), "vJoy");
         assert_eq!(
             state.settings().output_backend,
-            "HIDMaestro",
+            "Xbox",
             "the automatic path does not rewrite the persisted choice"
         );
     }
@@ -11943,27 +10505,20 @@ mod tests {
         let (state, _dir) = test_state();
         let backends = state.list_output_backends();
         assert_eq!(backends.len(), 3);
-        let hidmaestro = &backends[0];
-        assert_eq!(hidmaestro.id, "hidmaestro");
-        assert_eq!(hidmaestro.name, "HIDMaestro");
-        assert!(!hidmaestro.is_default, "vJoy is the default since v2.0.1");
-        assert!(!hidmaestro.selected, "settings default is vJoy");
-        assert!(hidmaestro.elevation_required);
-        assert!(
-            hidmaestro
-                .uac_note
-                .as_deref()
-                .is_some_and(|note| note.contains("UAC")),
-            "UAC note is present for HIDMaestro"
-        );
+        let xbox = &backends[0];
+        assert_eq!(xbox.id, "xbox");
+        assert_eq!(xbox.name, "Xbox (ViGEmBus)");
+        assert!(!xbox.is_default, "vJoy is the default since v2.0.1");
+        assert!(!xbox.selected, "settings default is vJoy");
+        assert!(!xbox.elevation_required);
+        assert_eq!(xbox.uac_note, None);
         assert_eq!(
-            hidmaestro.installed,
-            Some(false),
-            "no sidecar in the sandbox"
+            xbox.installed, None,
+            "the ViGEmBus driver is only probed at connect"
         );
-        assert!(!hidmaestro.active);
-        assert!(!hidmaestro.connected);
-        assert_eq!(hidmaestro.download_url, None);
+        assert!(!xbox.active);
+        assert!(!xbox.connected);
+        assert_eq!(xbox.download_url, None);
         let vjoy = &backends[1];
         assert_eq!(vjoy.id, "vjoy");
         assert!(vjoy.is_default, "vJoy is the default since v2.0.1");
@@ -11981,21 +10536,6 @@ mod tests {
         assert_eq!(none.installed, Some(true));
         assert!(!none.connected);
         assert!(!none.elevation_required);
-    }
-
-    #[test]
-    fn output_state_reports_the_uac_note_for_hidmaestro() {
-        // The detail string is built from the live kind, so even the
-        // sink state documents the rule; the live HIDMaestro detail
-        // (after a real switch on Windows) carries the same note.
-        assert!(live_backend_detail(BackendKind::HidMaestro, 1).contains("UAC"));
-        assert!(live_backend_detail(BackendKind::HidMaestro, 1).contains("every launch"));
-        // vJoy names the absence of a prompt, not the presence of one.
-        assert!(live_backend_detail(BackendKind::VJoy, 1).contains("no UAC prompt"));
-        // …and vJoy is the default since v2.0.1, HIDMaestro the
-        // explicit choice.
-        assert!(live_backend_detail(BackendKind::VJoy, 1).contains("default backend"));
-        assert!(!live_backend_detail(BackendKind::HidMaestro, 1).contains("default backend"));
     }
 
     // -- v2.0.1 hotfix BACKEND-2: default backend vJoy ----------------
@@ -12029,24 +10569,6 @@ mod tests {
         assert_eq!(status.install_error, None);
         assert_eq!(status.dll_path, None);
         assert_eq!(status.version, None, "version is never invented");
-        assert_eq!(
-            status.wheel_check, None,
-            "the wheel check does not exist off Windows"
-        );
-    }
-
-    /// FH4 wheel check (v2.0.14): off Windows the check never
-    /// runs — the cache stays empty and invalidation is a no-op
-    /// (no registry / vJoy to read, no panic).
-    #[test]
-    #[cfg(not(windows))]
-    fn wheel_check_cache_stays_empty_off_windows() {
-        let (state, _dir) = test_state();
-        assert_eq!(state.cached_wheel_check(), None);
-        assert!(lock(&state.wheel_check_cache).checked_at.is_some());
-        state.invalidate_wheel_check_cache();
-        assert!(lock(&state.wheel_check_cache).checked_at.is_none());
-        assert_eq!(state.cached_wheel_check(), None);
     }
 
     /// P3-9 (v2.0.12 scan): the last measured driver version is
@@ -12165,7 +10687,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_builds_snapshots_with_measured_loop_rate_and_encoders() {
+    fn ingest_builds_snapshots_with_measured_loop_rate() {
         let (state, _dir) = test_state();
         // No ticks yet: stats unmeasured, snapshot is the default.
         let measured = state.engine_stats();
@@ -12177,27 +10699,14 @@ mod tests {
         let first = state.ingest_frame(test_frame(0.0));
         assert_eq!(first.seq, 1);
         assert_eq!(first.stats.loop_hz, None); // one tick cannot define a rate
-        let second = state.ingest_frame(FrameInput {
-            encoder_counts: [10, 0, 0, 0],
-            n_enc: 1,
-            ..test_frame(12.5)
-        });
+        let second = state.ingest_frame(test_frame(12.5));
         assert_eq!(second.seq, 2);
         assert_eq!(second.stats.loop_hz, Some(2.0));
         assert_eq!(second.steering_deg, 12.5);
-        assert_eq!(second.encoders.len(), 1);
-        assert_eq!(second.encoders[0].count, 10);
-        assert_eq!(second.encoders[0].delta, 0); // first sample: baseline
-        // Third tick: encoder +3 → CW press, virtual button 65.
-        let third = state.ingest_frame(FrameInput {
-            encoder_counts: [13, 0, 0, 0],
-            n_enc: 1,
-            ..test_frame(15.0)
-        });
+        // Third tick: the snapshot follows the latest frame.
+        let third = state.ingest_frame(test_frame(15.0));
         assert_eq!(third.seq, 3);
-        assert_eq!(third.encoders[0].delta, 3);
-        assert!(third.encoders[0].cw_pressed);
-        assert_eq!(third.encoder_buttons, vec![65]);
+        assert_eq!(third.steering_deg, 15.0);
         assert_eq!(state.snapshot(), third);
     }
 
@@ -12243,28 +10752,6 @@ mod tests {
             ..test_frame(0.0)
         });
         assert_eq!(state.drain_button_presses(), Vec::<ButtonPressEvent>::new());
-        // Encoder pulse: momentary press edge only (65, true). The
-        // output stays `released` so no physical-button edge sneaks in.
-        let _ = state.ingest_frame(FrameInput {
-            encoder_counts: [0, 0, 0, 0],
-            n_enc: 1,
-            output: released,
-            ..test_frame(0.0)
-        });
-        assert_eq!(state.drain_button_presses(), Vec::<ButtonPressEvent>::new());
-        let _ = state.ingest_frame(FrameInput {
-            encoder_counts: [2, 0, 0, 0],
-            n_enc: 1,
-            output: released,
-            ..test_frame(0.0)
-        });
-        assert_eq!(
-            state.drain_button_presses(),
-            vec![ButtonPressEvent {
-                button: 65,
-                pressed: true
-            }]
-        );
     }
 
     #[test]
@@ -12557,72 +11044,6 @@ mod tests {
             stored_deadzone, None,
             "draft only: disk is untouched before Save"
         );
-    }
-
-    #[test]
-    fn encoder_tuning_round_trips_and_old_profiles_get_defaults() {
-        let (state, _dir) = test_state();
-        let _ = activate_first_profile(&state);
-        // No stored encoder entry yet: the defaults apply (50 ms
-        // pulse, 4 counts per click, accel off, sensitivity 1.0,
-        // no invert) — an old profile without the fields loads the
-        // same way.
-        let neutral = state.get_tuning("encoders");
-        assert_eq!(neutral.encoder_pulse_ms, Some(50.0));
-        assert_eq!(neutral.encoder_counts_per_click, Some(4));
-        assert_eq!(neutral.encoder_accel, Some(false));
-        assert_eq!(neutral.encoder_accel_sensitivity, Some(1.0));
-        assert_eq!(neutral.encoder_invert_mask, Some(0));
-        // Invalid values are rejected, never stored.
-        let mut bad = neutral.clone();
-        bad.encoder_pulse_ms = Some(10.0);
-        assert!(state.set_tuning(&bad).is_err());
-        let mut bad = neutral.clone();
-        bad.encoder_counts_per_click = Some(3);
-        assert!(state.set_tuning(&bad).is_err());
-        let mut bad = neutral.clone();
-        bad.encoder_accel_sensitivity = Some(3.0);
-        assert!(state.set_tuning(&bad).is_err());
-        let mut bad = neutral.clone();
-        bad.encoder_invert_mask = Some(0x10);
-        assert!(state.set_tuning(&bad).is_err());
-        assert_eq!(state.get_tuning("encoders").encoder_pulse_ms, Some(50.0));
-        // Valid values store, survive a get, and reach the live
-        // pipeline plan.
-        let mut tuning = neutral.clone();
-        tuning.encoder_pulse_ms = Some(120.0);
-        tuning.encoder_counts_per_click = Some(2);
-        tuning.encoder_accel = Some(true);
-        tuning.encoder_accel_sensitivity = Some(1.5);
-        tuning.encoder_invert_mask = Some(0b0010);
-        let saved = state.set_tuning(&tuning).expect("valid encoder tuning");
-        assert_eq!(saved.encoder_pulse_ms, Some(120.0));
-        assert_eq!(saved.encoder_counts_per_click, Some(2));
-        assert_eq!(saved.encoder_accel, Some(true));
-        assert_eq!(saved.encoder_accel_sensitivity, Some(1.5));
-        assert_eq!(saved.encoder_invert_mask, Some(0b0010));
-        assert_eq!(state.get_tuning("encoders").encoder_pulse_ms, Some(120.0));
-        assert_eq!(
-            state.get_tuning("encoders").encoder_counts_per_click,
-            Some(2)
-        );
-        let plan = state.build_pipeline_plan();
-        assert_eq!(plan.encoders.pulse_ms, 120.0);
-        assert_eq!(plan.encoders.counts_per_click, 2);
-        assert!(plan.encoders.accel_enabled);
-        assert_eq!(plan.encoders.accel_sensitivity, 1.5);
-        assert_eq!(plan.encoders.encoder_invert_mask, 0b0010);
-        // Save persists them into the profile on disk.
-        assert!(state.save_draft().expect("save draft"));
-        let stored = lock(&state.store)
-            .active()
-            .and_then(|active| active.profile.module_tunings.get("encoders").cloned());
-        let stored = stored.expect("stored encoder entry");
-        assert_eq!(stored.encoder_pulse_ms, Some(120.0));
-        assert_eq!(stored.encoder_counts_per_click, Some(2));
-        assert_eq!(stored.encoder_accel, Some(true));
-        assert_eq!(stored.encoder_accel_sensitivity, Some(1.5));
-        assert_eq!(stored.encoder_invert_mask, Some(0b0010));
     }
 
     #[test]
@@ -13218,54 +11639,6 @@ mod tests {
         assert_eq!(state.take_learned_button(), None);
     }
 
-    #[test]
-    fn button_tuning_round_trips_and_old_profiles_get_defaults() {
-        // BU1+BU2+BU3: no stored buttons entry yet — the defaults
-        // apply (10 ms debounce, 800 ms long-press threshold, 300 ms
-        // double-press window), exactly like an old profile without
-        // the fields.
-        let (state, _dir) = test_state();
-        let _ = activate_first_profile(&state);
-        let neutral = state.get_tuning("buttons");
-        assert_eq!(neutral.button_debounce_ms, Some(10.0));
-        assert_eq!(neutral.button_long_press_ms, Some(800.0));
-        assert_eq!(neutral.button_double_press_ms, Some(300.0));
-        // Invalid values are rejected, never stored.
-        let mut bad = neutral.clone();
-        bad.button_debounce_ms = Some(60.0);
-        assert!(state.set_tuning(&bad).is_err());
-        let mut bad = neutral.clone();
-        bad.button_long_press_ms = Some(200.0);
-        assert!(state.set_tuning(&bad).is_err());
-        let mut bad = neutral.clone();
-        bad.button_double_press_ms = Some(100.0);
-        assert!(state.set_tuning(&bad).is_err());
-        assert_eq!(state.get_tuning("buttons").button_debounce_ms, Some(10.0));
-        // Valid values store, survive a get, and reach the live
-        // pipeline plan.
-        let mut tuning = neutral.clone();
-        tuning.button_debounce_ms = Some(25.0);
-        tuning.button_long_press_ms = Some(1200.0);
-        tuning.button_double_press_ms = Some(200.0);
-        let saved = state.set_tuning(&tuning).expect("valid button tuning");
-        assert_eq!(saved.button_debounce_ms, Some(25.0));
-        assert_eq!(saved.button_long_press_ms, Some(1200.0));
-        assert_eq!(saved.button_double_press_ms, Some(200.0));
-        assert_eq!(state.get_tuning("buttons").button_debounce_ms, Some(25.0));
-        assert_eq!(
-            state.get_tuning("buttons").button_long_press_ms,
-            Some(1200.0)
-        );
-        assert_eq!(
-            state.get_tuning("buttons").button_double_press_ms,
-            Some(200.0)
-        );
-        let plan = state.build_pipeline_plan();
-        assert_eq!(plan.buttons.debounce_ms, 25.0);
-        assert_eq!(plan.buttons.long_press_ms, 1200.0);
-        assert_eq!(plan.buttons.double_press_ms, 200.0);
-    }
-
     // -- Button→action bindings (v2.0.2, Round 2B) --------------------
 
     /// Drive one engine tick through the sink path (ingest +
@@ -13300,174 +11673,33 @@ mod tests {
         let received = drive_tick(&state, &sent, &output);
         assert_eq!(received.buttons, 1 << 4);
         assert!(!received.horn);
-        // Bind button 5 → horn, 6 → gear_2, 7 → handbrake.
+        // Bind button 5 → horn, 6 → shifter_up, 7 → handbrake.
         state.set_binding(5, "horn").expect("bind 5");
-        state.set_binding(6, "gear_2").expect("bind 6");
+        state.set_binding(6, "shifter_up").expect("bind 6");
         state.set_binding(7, "handbrake").expect("bind 7");
         let mut output = PipelineOutputState::neutral();
         output.buttons = (1 << 4) | (1 << 5) | (1 << 6);
         let received = drive_tick(&state, &sent, &output);
         assert_eq!(
             received.buttons,
-            1 << 4,
-            "only the horn bit (button 5) survives — source bits 4/5/6 are cleared"
+            (1 << 4) | (1 << 0),
+            "horn bit (button 5) and shifter-up bit (button 1) survive — source bits 5/6 are cleared"
         );
         assert!(received.horn, "horn flag follows the bound horn bit");
-        assert_eq!(received.gear, 2, "gear_2 sets the decoded gear field");
         assert_eq!(received.handbrake, 1.0, "handbrake is full while held");
         // Release: the next tick is clean again (per-tick override).
         let received = drive_tick(&state, &sent, &PipelineOutputState::neutral());
         assert_eq!(received.buttons, 0);
-        assert_eq!(received.gear, 0);
         assert_eq!(received.handbrake, 0.0);
     }
 
-    /// Long-press bindings (BU2): a held button fires its normal
-    /// action first, and the long-press action takes over once the
-    /// engine's `long_press_buttons` bit is set. A button with only
-    /// a long-press binding passes its raw bit through until the
-    /// threshold. A long-press app action queues exactly once, on
-    /// the threshold edge — not once per tick while held.
-    #[test]
-    fn bindings_long_press_takes_over_after_threshold() {
-        let (state, sent, _fail) = test_state_with_recording();
-        assert!(state.set_output_enabled(true).connected);
-        state.set_binding(5, "gear_1").expect("bind 5");
-        state
-            .set_long_press_binding(5, "gear_2")
-            .expect("bind 5 long-press");
-        // Held, before the threshold: the normal action fires.
-        let mut output = PipelineOutputState::neutral();
-        output.buttons = 1 << 4;
-        let received = drive_tick(&state, &sent, &output);
-        assert_eq!(received.gear, 1);
-        assert_eq!(received.buttons, 0, "source bit cleared by the binding");
-        // Held, past the threshold (engine's long-press bit set):
-        // the long-press action takes over.
-        output.long_press_buttons = 1 << 4;
-        let received = drive_tick(&state, &sent, &output);
-        assert_eq!(received.gear, 2);
-        // Released: everything clears.
-        let received = drive_tick(&state, &sent, &PipelineOutputState::neutral());
-        assert_eq!(received.gear, 0);
-        // Long-press-only button: raw bit passes through until the
-        // threshold, then the long-press action takes over.
-        state
-            .set_long_press_binding(6, "horn")
-            .expect("bind 6 long-press");
-        let mut output = PipelineOutputState::neutral();
-        output.buttons = 1 << 5;
-        let received = drive_tick(&state, &sent, &output);
-        assert_eq!(received.buttons, 1 << 5, "raw bit passes through");
-        assert!(!received.horn);
-        output.long_press_buttons = 1 << 5;
-        let received = drive_tick(&state, &sent, &output);
-        assert_eq!(received.buttons, 1 << 4, "horn bit only");
-        assert!(received.horn);
-        // Long-press app action: queues once on the threshold edge,
-        // not once per tick while held.
-        let (state, _dir) = test_state();
-        state.set_binding(8, "gear_1").expect("bind 8");
-        state
-            .set_long_press_binding(8, "profile_next")
-            .expect("bind 8 long-press");
-        let mut output = PipelineOutputState::neutral();
-        output.buttons = 1 << 7;
-        state.ingest_engine_output(&output, &EngineMetrics::new());
-        assert_eq!(state.drain_binding_actions().len(), 0);
-        output.long_press_buttons = 1 << 7;
-        state.ingest_engine_output(&output, &EngineMetrics::new());
-        assert_eq!(state.drain_binding_actions().len(), 1);
-        state.ingest_engine_output(&output, &EngineMetrics::new());
-        assert_eq!(
-            state.drain_binding_actions().len(),
-            0,
-            "held past the threshold must not re-queue"
-        );
-        state.ingest_engine_output(&PipelineOutputState::neutral(), &EngineMetrics::new());
-        assert_eq!(state.drain_binding_actions().len(), 0);
-    }
-
-    /// Double-press bindings (BU3): a second press inside the
-    /// window switches the button to its 2nd (long-press) action
-    /// for the whole hold — the same action BU2 uses. A double-press
-    /// app action queues exactly once, on the second press edge.
-    #[test]
-    fn bindings_double_press_takes_over_while_held() {
-        let (state, sent, _fail) = test_state_with_recording();
-        assert!(state.set_output_enabled(true).connected);
-        state.set_binding(5, "gear_1").expect("bind 5");
-        state
-            .set_long_press_binding(5, "gear_2")
-            .expect("bind 5 long-press");
-        // First press: the normal action fires.
-        let mut output = PipelineOutputState::neutral();
-        output.buttons = 1 << 4;
-        let received = drive_tick(&state, &sent, &output);
-        assert_eq!(received.gear, 1);
-        // Second press inside the window (engine's double-press
-        // bit set): the 2nd action takes over while held.
-        output.double_press_buttons = 1 << 4;
-        let received = drive_tick(&state, &sent, &output);
-        assert_eq!(received.gear, 2);
-        // Released: everything clears.
-        let received = drive_tick(&state, &sent, &PipelineOutputState::neutral());
-        assert_eq!(received.gear, 0);
-        // Double-press app action: queues once on the second-press
-        // edge, not once per tick while held.
-        let (state, _dir) = test_state();
-        state.set_binding(8, "gear_1").expect("bind 8");
-        state
-            .set_long_press_binding(8, "profile_next")
-            .expect("bind 8 long-press");
-        let mut output = PipelineOutputState::neutral();
-        output.buttons = 1 << 7;
-        state.ingest_engine_output(&output, &EngineMetrics::new());
-        assert_eq!(state.drain_binding_actions().len(), 0);
-        output.double_press_buttons = 1 << 7;
-        state.ingest_engine_output(&output, &EngineMetrics::new());
-        assert_eq!(state.drain_binding_actions().len(), 1);
-        state.ingest_engine_output(&output, &EngineMetrics::new());
-        assert_eq!(
-            state.drain_binding_actions().len(),
-            0,
-            "held as a double-press must not re-queue"
-        );
-        state.ingest_engine_output(&PipelineOutputState::neutral(), &EngineMetrics::new());
-        assert_eq!(state.drain_binding_actions().len(), 0);
-    }
-
-    /// An encoder virtual button (65–72) bound to a game action
-    /// fires momentarily: the pulse is cleared and the target is
-    /// set for exactly that tick.
-    #[test]
-    fn bindings_remap_encoder_virtual_button() {
-        let (state, sent, _fail) = test_state_with_recording();
-        assert!(state.set_output_enabled(true).connected);
-        state.set_binding(65, "shifter_up").expect("bind 65");
-        let mut output = PipelineOutputState::neutral();
-        output.encoder_buttons = EncoderButtons(0b01); // button 65
-        let received = drive_tick(&state, &sent, &output);
-        assert_eq!(received.buttons, 1 << 0, "shifter_up = bit 0");
-        assert_eq!(
-            received.encoder_buttons.0, 0,
-            "the source pulse is consumed, not forwarded"
-        );
-    }
-
-    /// App-action bindings queue exactly one action per press edge:
-    /// holding the button does not repeat, and a fresh press after
-    /// release queues again. The raw button edge still reaches the
-    /// UI highlight (learn mode / `drain_button_presses` see the
-    /// physical button).
     #[test]
     fn bindings_app_action_queues_once_per_press_edge() {
         let (state, _dir) = test_state();
         state.set_binding(8, "profile_next").expect("bind 8");
-        state.set_binding(65, "profile_previous").expect("bind 65");
+        state.set_binding(9, "profile_previous").expect("bind 9");
         let mut output = PipelineOutputState::neutral();
-        output.buttons = 1 << 7; // button 8 pressed
-        output.encoder_buttons = EncoderButtons(0b01); // button 65 pulse
+        output.buttons = (1 << 7) | (1 << 8); // buttons 8 and 9 pressed
         state.ingest_engine_output(&output, &EngineMetrics::new());
         assert_eq!(
             state.drain_binding_actions(),
@@ -13476,10 +11708,9 @@ mod tests {
                 BindingAppAction::ProfilePrevious
             ]
         );
-        // Held physical button: no repeat. The encoder pulse is
-        // absent this tick, so it does not fire again either.
+        // Held physical button: no repeat.
         let mut held = PipelineOutputState::neutral();
-        held.buttons = 1 << 7; // button 8 still held, no pulse
+        held.buttons = 1 << 7; // button 8 still held, button 9 released
         state.ingest_engine_output(&held, &EngineMetrics::new());
         assert_eq!(state.drain_binding_actions().len(), 0);
         // Release, then press again: one more action.
@@ -13500,41 +11731,6 @@ mod tests {
                 .iter()
                 .any(|event| event.button == 8 && event.pressed),
             "raw edge survives for the UI highlight: {events:?}"
-        );
-    }
-
-    /// R2-08: an encoder pulse held across two ticks fires the bound
-    /// app action exactly once — the encoder buttons are now
-    /// edge-detected against the previous tick's encoder bits, like
-    /// the physical-button path. (Before the fix the pulse fired on
-    /// every tick it was present, so one detent could cycle several
-    /// profiles.)
-    #[test]
-    fn bindings_encoder_app_action_fires_once_per_detent() {
-        let (state, _dir) = test_state();
-        state.set_binding(65, "profile_previous").expect("bind 65");
-        let mut output = PipelineOutputState::neutral();
-        output.encoder_buttons = EncoderButtons(0b01); // button 65 pulse
-        state.ingest_engine_output(&output, &EngineMetrics::new());
-        assert_eq!(
-            state.drain_binding_actions(),
-            vec![BindingAppAction::ProfilePrevious],
-            "first tick fires"
-        );
-        // Same pulse still present on the next tick: no repeat.
-        state.ingest_engine_output(&output, &EngineMetrics::new());
-        assert_eq!(
-            state.drain_binding_actions().len(),
-            0,
-            "held encoder pulse must not repeat"
-        );
-        // Release, then a fresh pulse: fires again.
-        state.ingest_engine_output(&PipelineOutputState::neutral(), &EngineMetrics::new());
-        state.ingest_engine_output(&output, &EngineMetrics::new());
-        assert_eq!(
-            state.drain_binding_actions(),
-            vec![BindingAppAction::ProfilePrevious],
-            "fresh detent after release fires again"
         );
     }
 
@@ -14251,11 +12447,11 @@ mod tests {
     /// holds the next attempt).
     #[test]
     fn mid_session_failover_switches_once_and_rearms() {
-        let (hm, _hm_sent, hm_fail) = RecordingBackend::new_named("HIDMaestro");
+        let (xb, _xb_sent, xb_fail) = RecordingBackend::new_named("Xbox");
         let (vj, vj_sent, vj_fail) = RecordingBackend::new_named("vJoy");
         let factories = BackendFactories {
-            hidmaestro: Some(Box::new(move || {
-                Box::new(hm.clone()) as Box<dyn IJoystickOutput>
+            xbox: Some(Box::new(move || {
+                Box::new(xb.clone()) as Box<dyn IJoystickOutput>
             })),
             vjoy: Some(Box::new(move || {
                 Box::new(vj.clone()) as Box<dyn IJoystickOutput>
@@ -14264,13 +12460,13 @@ mod tests {
         };
         let (state, _dir) = test_state();
         state
-            .apply_backend_switch(BackendKind::HidMaestro, &factories, true)
-            .expect("install HIDMaestro mock");
-        assert_eq!(state.backend_name(), "HIDMaestro");
+            .apply_backend_switch(BackendKind::Xbox, &factories, true)
+            .expect("install Xbox mock");
+        assert_eq!(state.backend_name(), "Xbox");
         let output = PipelineOutputState::neutral();
         // The live backend refuses the update: fail over to vJoy and
         // retry there — the send succeeds on the fallback.
-        *hm_fail.lock().expect("hm fail lock") = true;
+        *xb_fail.lock().expect("xb fail lock") = true;
         assert!(
             state
                 .try_mid_session_fallback_with_factories(&output, &factories)
@@ -14296,7 +12492,7 @@ mod tests {
     /// PERF F-15: a slow `update()` must not hold the backend slot
     /// lock. The old `send_engine_output` held `Mutex<Box<...>>`
     /// across `update()`, so a switch (and every slot read) stalled
-    /// for the whole `HIDMaestro` sidecar round-trip (~200 ms). Here
+    /// for the whole slow backend round-trip (~200 ms). Here
     /// a tick is parked inside `update()` while the main thread
     /// clones the backend handle — the slot lock must be free, so
     /// the clone returns at once instead of waiting out the update.
@@ -14342,7 +12538,7 @@ mod tests {
     }
 
     /// Deep-scan Round 2 item 5 (H2 latch): re-selecting a
-    /// disconnected `HIDMaestro` whose manager latch is set must
+    /// disconnected `Xbox` whose manager latch is set must
     /// succeed — the re-select re-arms the INSTALLED instance in
     /// place (P2, v2.0.11: the trait's `reset_fallback` hook clears
     /// the latch) instead of reconnecting the latched instance,
@@ -14352,8 +12548,8 @@ mod tests {
     /// builds fresh mocks per call whose connect succeeds (the
     /// kind-change path still uses them).
     #[test]
-    fn reselect_disconnected_hidmaestro_rearms_latched_instance() {
-        let (latched, _latched_sent, _latched_fail) = RecordingBackend::new_named("HIDMaestro");
+    fn reselect_disconnected_xbox_rearms_latched_instance() {
+        let (latched, _latched_sent, _latched_fail) = RecordingBackend::new_named("Xbox");
         latched.set_latched(true);
         let dir = test_dir("latched-reselect");
         let store = ProfileStore::open(&dir).expect("open test store");
@@ -14363,8 +12559,8 @@ mod tests {
             "test latched backend",
         ));
         let factories = BackendFactories {
-            hidmaestro: Some(Box::new(|| {
-                let (backend, _, _) = RecordingBackend::new_named("HIDMaestro");
+            xbox: Some(Box::new(|| {
+                let (backend, _, _) = RecordingBackend::new_named("Xbox");
                 Box::new(backend) as Box<dyn IJoystickOutput>
             })),
             vjoy: Some(Box::new(|| {
@@ -14378,11 +12574,11 @@ mod tests {
         // vJoy.
         state.reset_fallback();
         let outcome = state
-            .apply_backend_switch(BackendKind::HidMaestro, &factories, false)
+            .apply_backend_switch(BackendKind::Xbox, &factories, false)
             .expect("re-select of a latched backend must succeed on the re-armed instance");
-        assert_eq!(outcome.active, BackendKind::HidMaestro);
+        assert_eq!(outcome.active, BackendKind::Xbox);
         assert!(!outcome.fell_back);
-        assert_eq!(state.backend_name(), "HIDMaestro");
+        assert_eq!(state.backend_name(), "Xbox");
         assert!(
             state.output_state().connected,
             "re-armed instance connected"
@@ -14750,18 +12946,18 @@ mod tests {
     /* ------------------------------------------------------------------ */
 
     /// Mock backend factories that report the real backend names
-    /// (`"HIDMaestro"` / `"vJoy"`), each failing to connect with the
+    /// (`"Xbox"` / `"vJoy"`), each failing to connect with the
     /// given message when `Some` (connecting fine when `None`).
     /// Clones share the recording state, so the live backend's name
     /// and connection state stay observable after a switch.
     fn named_mock_factories(
-        hm_fail_message: Option<&str>,
+        xbox_fail_message: Option<&str>,
         vjoy_fail_message: Option<&str>,
     ) -> BackendFactories {
-        let (hm, _hm_sent, _hm_fail) = RecordingBackend::new_named("HIDMaestro");
-        if let Some(message) = hm_fail_message {
-            hm.set_fail_connect(true);
-            hm.set_fail_connect_message(message);
+        let (xb, _xb_sent, _xb_fail) = RecordingBackend::new_named("Xbox");
+        if let Some(message) = xbox_fail_message {
+            xb.set_fail_connect(true);
+            xb.set_fail_connect_message(message);
         }
         let (vj, _vj_sent, _vj_fail) = RecordingBackend::new_named("vJoy");
         if let Some(message) = vjoy_fail_message {
@@ -14769,8 +12965,8 @@ mod tests {
             vj.set_fail_connect_message(message);
         }
         BackendFactories {
-            hidmaestro: Some(Box::new(move || {
-                Box::new(hm.clone()) as Box<dyn IJoystickOutput>
+            xbox: Some(Box::new(move || {
+                Box::new(xb.clone()) as Box<dyn IJoystickOutput>
             })),
             vjoy: Some(Box::new(move || {
                 Box::new(vj.clone()) as Box<dyn IJoystickOutput>
@@ -14780,17 +12976,17 @@ mod tests {
     }
 
     /// Mock backend factories for the startup-activation tests: the
-    /// `HIDMaestro` and vJoy factories build clones of two recording
+    /// `Xbox` and vJoy factories build clones of two recording
     /// backends (shared record), each failing to connect when its flag
     /// is set.
-    fn mock_factories(hm_fail_connect: bool, vjoy_fail_connect: bool) -> BackendFactories {
-        let (hm, _hm_sent, _hm_fail) = RecordingBackend::new();
-        hm.set_fail_connect(hm_fail_connect);
+    fn mock_factories(xbox_fail_connect: bool, vjoy_fail_connect: bool) -> BackendFactories {
+        let (xb, _xb_sent, _xb_fail) = RecordingBackend::new();
+        xb.set_fail_connect(xbox_fail_connect);
         let (vj, _vj_sent, _vj_fail) = RecordingBackend::new();
         vj.set_fail_connect(vjoy_fail_connect);
         BackendFactories {
-            hidmaestro: Some(Box::new(move || {
-                Box::new(hm.clone()) as Box<dyn IJoystickOutput>
+            xbox: Some(Box::new(move || {
+                Box::new(xb.clone()) as Box<dyn IJoystickOutput>
             })),
             vjoy: Some(Box::new(move || {
                 Box::new(vj.clone()) as Box<dyn IJoystickOutput>
@@ -14843,40 +13039,31 @@ mod tests {
     }
 
     #[test]
-    fn startup_activation_defers_hidmaestro_at_startup() {
-        // Hotfix v1.0.1 (UAC deferral): a persisted HIDMaestro choice
-        // is NEVER activated at startup — even when the mock backend
-        // would connect fine, no factory is touched, no UAC prompt
-        // could appear. The outcome records the deferral, the NullSink
-        // stays installed, and the persisted choice is untouched.
+    fn startup_activation_activates_xbox_when_selected() {
+        // v2.0.19: no backend is deferred at startup any more — the
+        // persisted Xbox choice is activated directly (no UAC
+        // prompt: the ViGEmBus driver is probed at connect, and a
+        // failure is reported honestly instead of deferred).
         // (The fresh-store default is vJoy since v2.0.1, so the
-        // persisted HIDMaestro choice is set explicitly here.)
-        let (state, _dir) = test_state_with_backend_setting("HIDMaestro");
+        // persisted Xbox choice is set explicitly here.)
+        let (state, _dir) = test_state_with_backend_setting("Xbox");
         assert_eq!(
             state.selected_backend(),
-            BackendKind::HidMaestro,
-            "persisted HIDMaestro choice is selected"
+            BackendKind::Xbox,
+            "persisted Xbox choice is selected"
         );
         let factories = mock_factories(false, false);
         let outcome = state.activate_startup_backend_with_factories(&factories);
-        assert_eq!(outcome.requested, BackendKind::HidMaestro);
-        assert_eq!(outcome.active, None);
+        assert_eq!(outcome.requested, BackendKind::Xbox);
+        assert_eq!(outcome.active, Some(BackendKind::Xbox));
         assert!(!outcome.fell_back);
-        let reason = outcome.reason.clone().expect("deferral reason recorded");
-        assert!(reason.contains("deferred"), "{reason}");
-        assert!(reason.contains("elevation"), "{reason}");
+        assert_eq!(outcome.reason, None);
         assert_eq!(state.startup_backend_outcome(), Some(outcome));
-        assert_eq!(state.backend_name(), "NullSink");
-        assert!(!state.output_state().connected);
-        assert!(
-            state.output_state().detail.contains("deferred"),
-            "{}",
-            state.output_state().detail
-        );
-        // The persisted choice is still HIDMaestro: the next launch
-        // defers it the same way, and enabling output retries it.
-        assert_eq!(state.selected_backend(), BackendKind::HidMaestro);
-        assert_eq!(state.settings().output_backend, "HIDMaestro");
+        assert_eq!(state.backend_name(), "RecordingBackend");
+        assert!(state.output_state().connected, "mock backend connected");
+        // The persisted choice is still Xbox for the next launch.
+        assert_eq!(state.selected_backend(), BackendKind::Xbox);
+        assert_eq!(state.settings().output_backend, "Xbox");
     }
 
     #[test]
@@ -14929,34 +13116,37 @@ mod tests {
     }
 
     #[test]
-    fn enabling_output_after_deferred_startup_activates_hidmaestro() {
-        // The deferred backend is activated on the first user-initiated
-        // enable: startup defers, then `set_output_enabled(true)`
-        // switches the selected HIDMaestro backend in and connects it.
+    fn enabling_output_after_startup_activation_keeps_xbox_connected() {
+        // Startup activates the persisted Xbox choice directly; the
+        // first user-initiated enable keeps it live and connected.
         // (Fresh-store default is vJoy since v2.0.1 — the persisted
-        // HIDMaestro choice is set explicitly here.)
-        let (state, _dir) = test_state_with_backend_setting("HIDMaestro");
+        // Xbox choice is set explicitly here.)
+        let (state, _dir) = test_state_with_backend_setting("Xbox");
         let factories = mock_factories(false, false);
-        let deferred = state.activate_startup_backend_with_factories(&factories);
-        assert_eq!(deferred.active, None, "startup defers HIDMaestro");
+        let started = state.activate_startup_backend_with_factories(&factories);
+        assert_eq!(
+            started.active,
+            Some(BackendKind::Xbox),
+            "startup activates Xbox"
+        );
         let enabled = state.set_output_enabled_with_factories(true, &factories);
         assert!(enabled.connected, "backend connected after enable");
         assert_eq!(state.backend_name(), "RecordingBackend");
-        assert_eq!(state.selected_backend(), BackendKind::HidMaestro);
-        assert_eq!(state.settings().output_backend, "HIDMaestro");
+        assert_eq!(state.selected_backend(), BackendKind::Xbox);
+        assert_eq!(state.settings().output_backend, "Xbox");
     }
 
     #[test]
     fn enabling_output_with_failing_backends_reports_failure_honestly() {
-        // Enable after a deferred startup, with both mock backends
+        // Enable after a failed startup, with both mock backends
         // failing to connect: no backend goes live, the NullSink stays
         // installed, and the returned state says why.
         // (Fresh-store default is vJoy since v2.0.1 — the persisted
-        // HIDMaestro choice is set explicitly here.)
-        let (state, _dir) = test_state_with_backend_setting("HIDMaestro");
+        // Xbox choice is set explicitly here.)
+        let (state, _dir) = test_state_with_backend_setting("Xbox");
         let factories = mock_factories(true, true);
-        let deferred = state.activate_startup_backend_with_factories(&factories);
-        assert_eq!(deferred.active, None, "startup defers HIDMaestro");
+        let started = state.activate_startup_backend_with_factories(&factories);
+        assert_eq!(started.active, None, "startup activation failed");
         let enabled = state.set_output_enabled_with_factories(true, &factories);
         assert!(!enabled.connected);
         assert_eq!(state.backend_name(), "NullSink");
@@ -14974,23 +13164,22 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn startup_activation_without_drivers_defers_hidmaestro_honestly() {
-        // Linux sandbox: no HIDMaestro sidecar, no vJoy DLL — the
-        // persisted HIDMaestro choice is deferred at startup (not a
-        // connect failure: no factory is touched, nothing is probed),
-        // and the outcome must say so instead of silently staying on
-        // the NullSink.
+    fn startup_activation_without_drivers_fails_honestly() {
+        // Linux sandbox: no ViGEmBus driver, no vJoy DLL — the
+        // persisted Xbox choice fails at startup (not a silent
+        // stay on the NullSink: the outcome records the reason),
+        // and the persisted choice is untouched.
         // (Fresh-store default is vJoy since v2.0.1 — the persisted
-        // HIDMaestro choice is set explicitly here.)
-        let (state, _dir) = test_state_with_backend_setting("HIDMaestro");
+        // Xbox choice is set explicitly here.)
+        let (state, _dir) = test_state_with_backend_setting("Xbox");
         let outcome = state.activate_startup_backend();
-        assert_eq!(outcome.requested, BackendKind::HidMaestro);
+        assert_eq!(outcome.requested, BackendKind::Xbox);
         assert_eq!(outcome.active, None);
         let reason = outcome
             .reason
             .clone()
             .expect("reason recorded: {outcome:?}");
-        assert!(reason.contains("deferred"), "{reason}");
+        assert!(reason.contains("not found"), "{reason}");
         assert_eq!(state.backend_name(), "NullSink");
         assert!(!state.output_state().connected);
     }
@@ -15055,9 +13244,6 @@ mod tests {
             .expect("frame sender after start");
         for (seq, encoders) in [(0, [0, 0]), (1, [10, -5]), (2, [10, -5])] {
             let frame = test_stream_frame(seq, 3300, &encoders);
-            // The forwarder reports each frame's encoder counts; a
-            // direct feeder does the same per frame.
-            state.note_frame_encoders(frame.encoders, frame.n_enc);
             frame_tx.try_send(frame).expect("frame channel open");
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -15073,10 +13259,6 @@ mod tests {
             "snapshot shows full-right steering: {:?}",
             state.snapshot()
         );
-        let encoders = state.snapshot().encoders;
-        assert_eq!(encoders.len(), 2, "both encoders reported: {encoders:?}");
-        assert_eq!(encoders[0].count, 10, "encoder 0 count: {encoders:?}");
-        assert_eq!(encoders[1].count, -5, "encoder 1 count: {encoders:?}");
         // Stop feeding: after the 250 ms watchdog the engine sends
         // neutral on every tick.
         assert!(

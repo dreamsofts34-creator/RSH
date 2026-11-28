@@ -7,8 +7,8 @@
 // otherwise — never fake live data: see src/sim_api.rs).
 //
 // v2.0.1 hotfix: the window owns every live value as a Rust-driven
-// prop — pedals (mV/feel/deadzone from get_tuning), buttons (12 actions
-// + selected action), Extras (screens/extras.slint, wired to
+// prop — pedals (mV/feel/deadzone from get_tuning), Extras
+// (screens/extras.slint, wired to
 // set_tuning), the profile popover (real list_profiles), the wizard
 // Drivers step (vJoy status/install/fallback) and the diagnostics
 // drawer (live charts from Rust ring buffers, measured stats from
@@ -22,7 +22,6 @@ import { Sidebar, AboutPage } from "shell.slint";
 import { OverviewPage, GameItem } from "screens/overview.slint";
 import { SteeringPage } from "screens/steering.slint";
 import { PedalsPage } from "screens/pedals.slint";
-import { ButtonsPage } from "screens/buttons.slint";
 import { ExtrasScreen } from "screens/extras.slint";
 import { ProfilePopover, ProfileItem } from "screens/profile_popover.slint";
 import { GameDialog } from "screens/game_dialog.slint";
@@ -66,7 +65,7 @@ export component MainWindow inherits Window {
     default-font-family: Theme.font-text;
     default-font-size: Theme.fs-label;
 
-    in-out property <int> page: 0; // 0 Overview, 1 Steering, 2 Pedals, 3 Buttons, 4 Extras, 5 Settings, 6 About
+    in-out property <int> page: 0; // 0 Overview, 1 Steering, 2 Pedals, 3 Extras, 4 Settings, 5 About
     // D4: page-switch fade — dips to 0.7 on every `page` change and
     // the timer below restores it to 1; the content column animates
     // its opacity over 150ms both ways. (P3-9: the old 0.3 dip was
@@ -78,7 +77,7 @@ export component MainWindow inherits Window {
     in-out property <bool> unsaved: false;
     in-out property <bool> auto-paused: false;
     in-out property <int> transport: 0;   // 0 Wi-Fi, 1 USB
-    in-out property <int> controller: 1;  // 0 HIDMaestro, 1 vJoy (vJoy is the default, user order 2026-11-16)
+    in-out property <int> controller: 0;  // 0 vJoy (default), 1 Xbox (ViGEmBus)
     in-out property <int> theme: 0;       // Resolved window theme: 0 Dark, 1 Light (never 2 — R2-31). Drives Theme.mode.
     // R2-31: the STORED theme choice (0 Dark, 1 Light, 2 Auto) —
     // this is what the Settings segment shows and what theme-persist
@@ -86,29 +85,9 @@ export component MainWindow inherits Window {
     // writes after resolving Auto against the OS; it alone drives
     // Theme.mode. Rust sets both in wire_theme.
     in-out property <int> theme-choice: 0;
-    in-out property <int> pressed-index: -1;
-    in-out property <int> selected-index: 5; // A4: index 5 = "Gear 3" (preview), not 0
-    in property <[string]> button-actions: ["Shift up", "Shift down", "Horn", "Gear 1", "Gear 2", "Gear 3", "Gear 4", "Gear 5", "Gear 6", "Handbrake", "Not set", "Not set"];
-    in property <string> selected-action: "Gear 3";
-    // BU2: the selected tile's long-press action ("Not set" = none).
-    in property <string> selected-long-action: "Not set";
-    // UI-1 (v2.0.12): the rotary-knob card labels — driven from
-    // Rust (`load_knobs`, which reads the real `knob_actions()`),
-    // never literals. The old "Gear 1"/"Gear 2" literals here
-    // claimed bindings that did not exist on a fresh install, and
-    // a rebind never updated the card. "Not set" is the honest
-    // default until the daemon's stored bindings arrive.
-    in property <string> knob1-left: "Not set";
-    in property <string> knob1-right: "Not set";
-    in property <string> knob1-press: "Not set";
-    in property <string> knob2-left: "Not set";
-    in property <string> knob2-right: "Not set";
-    in property <string> knob2-press: "Not set";
-    in property <string> knob-row-action: "Not set";
-    in property <bool> buttons-listening: false;
     in property <string> profile-name: "GT3 Sprint";
     in property <string> auto-profile-text: "No profile yet";
-    in property <string> app-version: "2.0.18";
+    in property <string> app-version: "2.0.19";
     in property <bool> daemon-live: false;
     // B5 (v2.0.2): the global busy strip reads these — Rust drives
     // them from busy_jobs (each start_*_job records its label, the
@@ -180,7 +159,6 @@ export component MainWindow inherits Window {
     in property <float> brake;
     in property <float> clutch;
     in property <float> handbrake: 0;
-    in property <string> gear: "—";
     in property <float> input-pct;
     in property <float> output-pct;
     in property <float> marker-vx;
@@ -206,26 +184,6 @@ export component MainWindow inherits Window {
     in property <string> steer-balance-text: "0%";
     in property <float> steer-trim: 0.5;
     in property <string> steer-trim-text: "0%";
-    // Encoder tuning (E1/E2): pulse length + steps per click, on the
-    // Buttons page (rotary knobs live there, not in a module of
-    // their own) — from get_tuning("encoders"), never literals.
-    in property <float> enc-pulse-ms: 50.0;
-    in property <string> enc-pulse-text: "50 ms";
-    in property <int> enc-counts: 4;
-    // Encoder tuning (E3/E4): acceleration + per-knob invert.
-    in property <bool> enc-accel: false;
-    in property <float> enc-accel-sens: 1.0;
-    in property <string> enc-accel-sens-text: "100%";
-    in property <bool> enc-invert1: false;
-    in property <bool> enc-invert2: false;
-    // Button tuning (BU1/BU2): debounce + long-press threshold, on
-    // the Buttons page — from get_tuning("buttons"), never literals.
-    in property <float> btn-debounce-ms: 10.0;
-    in property <string> btn-debounce-text: "10 ms";
-    in property <float> btn-longpress-ms: 800.0;
-    in property <string> btn-longpress-text: "800 ms";
-    in property <float> btn-doublepress-ms: 300.0;
-    in property <string> btn-doublepress-text: "300 ms";
     in property <string> throttle-raw-mv-text: "—";
     in property <string> brake-raw-mv-text: "—";
     in property <string> clutch-raw-mv-text: "—";
@@ -315,7 +273,6 @@ export component MainWindow inherits Window {
     in property <string> handbrake-grab-ms-text: "0 ms";
     in property <bool> handbrake-auto-release: false;
     in property <bool> extras-calibration-disabled: true;
-    in property <int> shifter-mode: 0;
     // Shifter tuning (SH1/SH2): sensitivity is a board-config
     // value (0..1 = 0..100%), read once from the board — disabled
     // with a reason until the read lands or no shifter is
@@ -358,23 +315,6 @@ export component MainWindow inherits Window {
     in property <[GameItem]> games;
     // Settings live values (A9/A10/C3/C6): seeded from the API.
     in-out property <bool> autostart-enabled: false;
-    // A2 (Steam FH4 wheel mode): the daemon's `steam_fh4_mode`
-    // (default OFF) — two-way with the Settings screen, Rust
-    // reverts it on a failed toggle, like keep-in-tray.
-    in-out property <bool> steam-fh4-mode: false;
-    // G29 spoof mode: the daemon's `g29_spoof_mode` (default OFF)
-    // — two-way with the Settings screen, Rust reverts it on a
-    // failed toggle, like steam-fh4-mode.
-    in-out property <bool> g29-spoof-mode: false;
-    // G29 pedal layout: the daemon's `g29_pedal_layout`
-    // ("hidmaestro" default, "pcgamingwiki" alternate) — two-way
-    // with the Settings screen, Rust reverts it on a failed
-    // change, like g29-spoof-mode.
-    in-out property <string> g29-pedal-layout: "hidmaestro";
-    // G29 handbrake button: the daemon's `g29_handbrake_button`
-    // (1–25, default 8) — two-way with the Settings screen, Rust
-    // reverts it on a failed change, like g29-spoof-mode.
-    in-out property <int> g29-handbrake-button: 8;
     // M-7 (v2.0.2): two-way — Rust reads keep-in-tray for the close
     // handler and writes it back when set_close_to_tray fails, so the
     // switch never lies about the real state. Same for the Extras
@@ -466,13 +406,7 @@ export component MainWindow inherits Window {
     in-out property <bool> setup-vjoy-installing: false;
     in-out property <string> setup-vjoy-version: "";
     in-out property <string> setup-vjoy-error: "";
-    in-out property <bool> setup-vjoy-fallback: false;
-    // FH4 wheel check (v2.0.14): synced with the vJoy status
-    // above — see the SetupScreen props for the meanings.
-    in-out property <bool> setup-vjoy-wheel-checked: false;
-    in-out property <bool> setup-vjoy-wheel-ok: false;
-    in-out property <string> setup-vjoy-wheel-line: "";
-    in-out property <string> setup-vjoy-wheel-next: "";
+    in-out property <bool> setup-xbox-fallback: false;
     in-out property <bool> setup-calibration-available: false;
     in-out property <string> setup-calibration-reason: "RSH isn't running — reconnect to capture.";
     // Diagnostics drawer (v2.0.1 hotfix): right-edge overlay like the
@@ -502,10 +436,6 @@ export component MainWindow inherits Window {
     in-out property <string> diag-ipc-p50-text: "—";
     in-out property <string> diag-ipc-p99-text: "—";
     in-out property <[bool]> diag-buttons-pressed;
-    // FH4 wheel check (v2.0.14): the Diagnostics drawer's
-    // "Wheel setup: …" line — "—" until a check exists.
-    in-out property <string> diag-wheel-text: "—";
-    in-out property <bool> diag-wheel-ok: false;
 
     callback toggled-send();
     callback reconnect();
@@ -524,6 +454,8 @@ export component MainWindow inherits Window {
     callback trim-edited(string);
     callback preset-selected(int);
     callback reset-defaults();
+    callback pedals-reset-defaults();
+    callback extras-reset-defaults();
     callback set-centre();
     callback capture-full-left();
     callback capture-full-right();
@@ -555,26 +487,6 @@ export component MainWindow inherits Window {
     callback throttle-saturation-changed(float);
     callback throttle-saturation-edited(string);
     callback combine-pedals-changed(bool);
-    callback knob-selected(int);
-    callback knob-row-selected(int);
-    callback enc-pulse-changed(float);
-    callback enc-pulse-edited(string);
-    callback enc-counts-changed(int);
-    callback enc-accel-changed(bool);
-    callback enc-accel-sens-changed(float);
-    callback enc-accel-sens-edited(string);
-    callback enc-invert-changed(int, bool);
-    // Button tuning (BU1/BU2): debounce + long-press threshold
-    // sliders on the Buttons page.
-    callback btn-debounce-changed(float);
-    callback btn-debounce-edited(string);
-    callback btn-longpress-changed(float);
-    callback btn-longpress-edited(string);
-    callback btn-doublepress-changed(float);
-    callback btn-doublepress-edited(string);
-    callback learn-clicked();
-    callback edit-cancel();
-    callback edit-save();
     callback extras-action(string);
     callback extras-handbrake-mode(int);
     callback extras-handbrake-feel(int);
@@ -614,20 +526,6 @@ export component MainWindow inherits Window {
     // with the NEW state — settings-action("tray") drops the payload.
     // Rust wiring pending (FC: on_keep_tray_selected).
     callback keep-tray-selected(bool);
-    // A2 (Steam FH4 wheel mode): the Settings switch fires this
-    // with the NEW state. Rust wiring: on_steam_fh4_mode_selected.
-    callback steam-fh4-mode-selected(bool);
-    // G29 spoof mode: the Settings switch fires this with the NEW
-    // state. Rust wiring: on_g29_spoof_mode_selected.
-    callback g29-spoof-mode-selected(bool);
-    // G29 pedal layout: the Settings radios fire this with the
-    // NEW layout ("hidmaestro" / "pcgamingwiki"). Rust wiring:
-    // on_g29_pedal_layout_chosen.
-    callback g29-pedal-layout-chosen(string);
-    // G29 handbrake button: the Settings stepper fires this with
-    // the NEW button (1–25). Rust wiring:
-    // on_g29_handbrake_button_chosen.
-    callback g29-handbrake-button-chosen(int);
     callback settings-use-profile(int);
     callback settings-duplicate-profile(int);
     callback transport-selected(int);
@@ -638,10 +536,6 @@ export component MainWindow inherits Window {
     // the fix while the daemon's last activation error is
     // Unreachable (set from sync_overview).
     in property <bool> overview-unreachable: false;
-    callback tile-selected(int);
-    callback action-chip(string);
-    // BU2: a long-press action chip in the button edit panel.
-    callback long-action-chip(string);
     callback open-diagnostics();
     callback auto-pause-toggled();
     // Profile popover (A8).
@@ -682,7 +576,7 @@ export component MainWindow inherits Window {
     callback setup-connect(string);
     callback setup-calibrate(string);
     callback setup-install-vjoy();
-    callback setup-use-hidmaestro();
+    callback setup-use-xbox();
     // D17: small confirm dialog for destructive actions (delete
     // profile, remove game) — 360 px card, same pattern as the
     // GameDialog. Rust owns the pending action; Yes runs it.
@@ -761,7 +655,7 @@ export component MainWindow inherits Window {
             send-busy: busy-kind == 14;
             nav(p) => { page = p; }
             toggled-send => { toggled-send(); }
-            open-about => { page = 6; }
+            open-about => { page = 5; }
         }
         VerticalLayout {
             // The column must fill the window (920px) minus the 184px
@@ -769,7 +663,7 @@ export component MainWindow inherits Window {
             // current page's preferred width (Slint 1.18.1: the root
             // layout sizes to content, horizontal-stretch: 1 only shares
             // space the layout already has) — measured before this fix:
-            // Pedals 712px, Buttons 684px, Extras 550px, Settings 522px,
+            // Pedals 712px, Extras 550px, Settings 522px,
             // so the top-bar divider and Save ended short of the right
             // edge on every narrow page. A "width: parent.width - 184px"
             // binding was tried by Phase 3 and reverted (binding loop);
@@ -818,32 +712,27 @@ export component MainWindow inherits Window {
                     if page == 3 : HorizontalLayout {
                         spacing: 0px;
                         Text { vertical-alignment: center; text: "RSH Wheel  "; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
-                        Text { vertical-alignment: center; text: "/ Buttons"; font-size: Theme.fs-title; font-weight: 500; color: Theme.faint; }
-                    }
-                    if page == 4 : HorizontalLayout {
-                        spacing: 0px;
-                        Text { vertical-alignment: center; text: "RSH Wheel  "; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
                         Text { vertical-alignment: center; text: "/ Extras"; font-size: Theme.fs-title; font-weight: 500; color: Theme.faint; }
                     }
                     // B17: the version badge left the header — it lives
                     // at the bottom of Settings + on the About page now.
-                    if page == 5 : Text { vertical-alignment: center; text: "Settings"; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
-                    if page == 6 : Text { vertical-alignment: center; text: "About"; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
+                    if page == 4 : Text { vertical-alignment: center; text: "Settings"; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
+                    if page == 5 : Text { vertical-alignment: center; text: "About"; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
                     Rectangle { horizontal-stretch: 1; }
                     if page == 0 : AutoProfileChip {
                         game-profile: auto-profile-text;
                         paused: auto-paused;
                         pause-toggled => { auto-pause-toggled(); }
                     }
-                    if page >= 1 && page <= 4 : HorizontalLayout { cross-axis-alignment: center;
+                    if page >= 1 && page <= 3 : HorizontalLayout { cross-axis-alignment: center;
                         horizontal-stretch: 0;
                         spacing: 8px;
-                        // R2-16: the preview shows the Basic/Advanced
-                        // segment only on Steering (Wheel.html) and
-                        // Pedals (Pedals.html) — it never did anything
-                        // on Buttons/Extras, so it is not shown there.
-                        // (Profile + Save stay on all four pages.)
-                        if page == 1 || page == 2 : SegmentedControl {
+                        // R2-16 (v2.0.19): the Basic/Advanced
+                        // segment shows on Steering, Pedals and
+                        // Extras — Extras hides its Advanced rows
+                        // behind it too. (Profile + Save stay on all
+                        // three pages.)
+                        if page == 1 || page == 2 || page == 3 : SegmentedControl {
                             option-0: "Basic";
                             option-1: "Advanced";
                             selected: advanced ? 1 : 0;
@@ -871,9 +760,9 @@ export component MainWindow inherits Window {
             // body - pages are sized to their preferred width (explicit
             // width / min-width on the page, and on the row, are ignored:
             // cross-axis sizes are capped at the container). The shortfall
-            // (Pedals cards x=874, Buttons panel x=886, Settings x=683) is
-            // fixed per-page by explicit content widths (see the FIX notes
-            // in pedals/buttons/settings), so every page prefers the full
+            // (Pedals cards x=874, Settings x=683) is fixed per-page
+            // by explicit content widths (see the FIX notes in
+            // pedals/settings), so every page prefers the full
             // 736px column here.
             if page == 0 : OverviewPage {
                 steer-angle: steer-angle;
@@ -1049,64 +938,11 @@ export component MainWindow inherits Window {
                 throttle-saturation-changed(v) => { throttle-saturation-changed(v); }
                 throttle-saturation-edited(t) => { throttle-saturation-edited(t); }
                 combine-pedals-changed(b) => { combine-pedals-changed(b); }
+                reset-defaults => { pedals-reset-defaults(); }
             }
-            if page == 3 : ButtonsPage {
+            if page == 3 : ExtrasScreen {
                 busy-kind: busy-kind;
-                // P2-11: the "Unsaved changes" line, like Steering.
-                unsaved: unsaved;
-                button-actions: button-actions;
-                pressed-index: pressed-index;
-                selected-index: selected-index;
-                selected-action: selected-action;
-                selected-long-action: selected-long-action;
-                knob1-left: knob1-left;
-                knob1-right: knob1-right;
-                knob1-press: knob1-press;
-                knob2-left: knob2-left;
-                knob2-right: knob2-right;
-                knob2-press: knob2-press;
-                knob-flash-index: -1;
-                knob-flash-text: "";
-                knob-row-action: knob-row-action;
-                enc-pulse-ms: enc-pulse-ms;
-                enc-pulse-text: enc-pulse-text;
-                enc-counts: enc-counts;
-                enc-accel: enc-accel;
-                enc-accel-sens: enc-accel-sens;
-                enc-accel-sens-text: enc-accel-sens-text;
-                enc-invert1: enc-invert1;
-                enc-invert2: enc-invert2;
-                btn-debounce-ms: btn-debounce-ms;
-                btn-debounce-text: btn-debounce-text;
-                btn-longpress-ms: btn-longpress-ms;
-                btn-longpress-text: btn-longpress-text;
-                btn-doublepress-ms: btn-doublepress-ms;
-                btn-doublepress-text: btn-doublepress-text;
-                enc-pulse-changed(v) => { enc-pulse-changed(v); }
-                enc-pulse-edited(t) => { enc-pulse-edited(t); }
-                enc-counts-changed(i) => { enc-counts-changed(i); }
-                enc-accel-changed(b) => { enc-accel-changed(b); }
-                enc-accel-sens-changed(v) => { enc-accel-sens-changed(v); }
-                enc-accel-sens-edited(t) => { enc-accel-sens-edited(t); }
-                enc-invert-changed(i, b) => { enc-invert-changed(i, b); }
-                btn-debounce-changed(v) => { btn-debounce-changed(v); }
-                btn-debounce-edited(t) => { btn-debounce-edited(t); }
-                btn-longpress-changed(v) => { btn-longpress-changed(v); }
-                btn-longpress-edited(t) => { btn-longpress-edited(t); }
-                btn-doublepress-changed(v) => { btn-doublepress-changed(v); }
-                btn-doublepress-edited(t) => { btn-doublepress-edited(t); }
-                listening: buttons-listening;
-                tile-selected(i) => { tile-selected(i); }
-                knob-selected(i) => { knob-selected(i); }
-                knob-row-selected(i) => { knob-row-selected(i); }
-                action-selected(a) => { action-chip(a); }
-                long-action-selected(a) => { long-action-chip(a); }
-                learn-clicked => { learn-clicked(); }
-                edit-cancel => { edit-cancel(); }
-                edit-save => { edit-save(); }
-            }
-            if page == 4 : ExtrasScreen {
-                busy-kind: busy-kind;
+                advanced: advanced;
                 // P2-11: the "Unsaved changes" line, like Steering.
                 unsaved: unsaved;
                 handbrake-pct: handbrake;
@@ -1127,8 +963,6 @@ export component MainWindow inherits Window {
                 handbrake-grab-ms-text: handbrake-grab-ms-text;
                 handbrake-auto-release: handbrake-auto-release;
                 calibration-disabled: extras-calibration-disabled;
-                gear: gear;
-                shifter-mode: shifter-mode;
                 shifter-sensitivity: shifter-sensitivity;
                 shifter-sensitivity-text: shifter-sensitivity-text;
                 sensitivity-disabled: sensitivity-disabled;
@@ -1187,8 +1021,9 @@ export component MainWindow inherits Window {
                 horn-min-changed(v) => { extras-horn-min(v); }
                 horn-min-edited(t) => { extras-horn-min-edited(t); }
                 horn-mode-selected(i) => { extras-horn-mode(i); }
+                reset-defaults => { extras-reset-defaults(); }
             }
-            if page == 5 : SettingsScreen {
+            if page == 4 : SettingsScreen {
                 connected: connected;
                 busy-kind: busy-kind;
                 backend-cooldown-secs: backend-cooldown-secs;
@@ -1201,10 +1036,6 @@ export component MainWindow inherits Window {
                 backend <=> controller;
                 start-with-windows <=> autostart-enabled;
                 keep-in-tray <=> keep-in-tray;
-                steam-fh4-mode <=> steam-fh4-mode;
-                g29-spoof-mode <=> g29-spoof-mode;
-                g29-pedal-layout <=> g29-pedal-layout;
-                g29-handbrake-button <=> g29-handbrake-button;
                 // R2-31 (h): the segment shows the STORED choice
                 // (theme-choice, 0/1/2) — never the resolved `theme`
                 // (0/1), so Auto stays visibly selected.
@@ -1232,10 +1063,6 @@ export component MainWindow inherits Window {
                 toggled-start-windows(b) => { autostart-selected(b); }
                 // M-7: forward the new switch state, don't drop it.
                 toggled-keep-tray(b) => { keep-tray-selected(b); }
-                toggled-steam-fh4-mode(b) => { steam-fh4-mode-selected(b); }
-                toggled-g29-spoof-mode(b) => { g29-spoof-mode-selected(b); }
-                g29-pedal-layout-selected(s) => { g29-pedal-layout-chosen(s); }
-                g29-handbrake-button-selected(n) => { g29-handbrake-button-chosen(n); }
                 theme-selected(i) => { theme-choice = i; theme-persist(i); }
                 new-profile => { settings-action("new-profile"); }
                 use-profile(i) => { settings-use-profile(i); }
@@ -1251,9 +1078,9 @@ export component MainWindow inherits Window {
                 run-setup => { run-setup-again(); }
                 open-diagnostics => { open-diagnostics(); }
             }
-            if page == 6 : AboutPage {
+            if page == 5 : AboutPage {
                 app-version: app-version;
-                back => { page = 5; }
+                back => { page = 4; }
             }
         }
     }
@@ -1296,11 +1123,7 @@ export component MainWindow inherits Window {
         vjoy-elapsed: setup-vjoy-elapsed;
         vjoy-version: setup-vjoy-version;
         vjoy-error: setup-vjoy-error;
-        vjoy-fallback: setup-vjoy-fallback;
-        wheel-checked: setup-vjoy-wheel-checked;
-        wheel-ok: setup-vjoy-wheel-ok;
-        wheel-line: setup-vjoy-wheel-line;
-        wheel-next: setup-vjoy-wheel-next;
+        xbox-fallback: setup-xbox-fallback;
         calibration-available: setup-calibration-available;
         calibration-reason: setup-calibration-reason;
         live-throttle: setup-live-throttle;
@@ -1310,7 +1133,7 @@ export component MainWindow inherits Window {
         next => { setup-next(); }
         skip => { setup-skip(); }
         install-vjoy => { setup-install-vjoy(); }
-        use-hidmaestro => { setup-use-hidmaestro(); }
+        use-xbox => { setup-use-xbox(); }
         connect-action(a) => { setup-connect(a); }
         calibrate-action(a) => { setup-calibrate(a); }
         add-game => { add-game(); }
@@ -1439,7 +1262,7 @@ export component MainWindow inherits Window {
         y: 0px;
         // R2-12 (c): the drawer stops 40px above the window bottom
         // so the status bar never covers its bottom edge
-        // (event log / encoders) while a job runs.
+        // (event log) while a job runs.
         height: parent.height - 40px;
         steer-chart: diag-steer-chart;
         steer-readout: diag-steer-readout;
@@ -1461,8 +1284,6 @@ export component MainWindow inherits Window {
         daemon-live: diag-daemon-live;
         app-version: diag-app-version;
         firmware: diag-firmware;
-        wheel-text: diag-wheel-text;
-        wheel-ok: diag-wheel-ok;
         throttle-pct: throttle;
         brake-pct: brake;
         clutch-pct: clutch;

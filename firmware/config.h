@@ -24,8 +24,7 @@
 // ---------- FW-11 naye modules (Phase D) ----------
 // Handbrake analog: GPIO32 (ADC1_CH4, free — v3.3 map mein istemal nahi).
 // Horn button: GPIO4 (digital pull-up, free). Shifter sequential =
-// PIN_GEAR_UP/DOWN (upar); H-pattern alternate mode ke pins neeche.
-// Encoders: ENC1 (23, 19), ENC2 (16, 17) — sab free digital pull-up pins.
+// PIN_GEAR_UP/DOWN (upar).
 // LED strip: GPIO21 digital (R-L9 — direct full rig mein LED sirf yahin
 // fit hoti hai; expanders hon to strip freed pin par jati hai).
 // Battery sense: GPIO39 (ADC1_CH3, input-only) — preset mein hai; read
@@ -52,22 +51,7 @@
 #define PIN_HANDBRAKE_ADC 32  // ADC1 — handbrake pot/hall
 #define PIN_HORN_BTN      4   // digital button (INPUT_PULLUP)
 #define PIN_BATTERY_ADC   39  // ADC1 — battery sense (input-only)
-#define PIN_ENC1_A        23  // encoder 1, channel A (INPUT_PULLUP)
-#define PIN_ENC1_B        19  // encoder 1, channel B (INPUT_PULLUP)
-#define PIN_ENC2_A        16  // encoder 2, channel A (INPUT_PULLUP)
-#define PIN_ENC2_B        17  // encoder 2, channel B (INPUT_PULLUP)
 #define PIN_LED_STRIP     21  // WS2812 strip data (digital-out, R-L9)
-// H-pattern shifter (alternate mode): gears 1..6. NOTE: 16/17/19 encoder
-// pins se takrate hain — H-pattern + encoders ek saath nahi chal sakte
-// (modules.h: rsh_modules_hpattern_encoder_conflict, FW-4 validation).
-#define PIN_SHIFT_H1      13
-#define PIN_SHIFT_H2      14
-#define PIN_SHIFT_H3      16
-#define PIN_SHIFT_H4      17
-#define PIN_SHIFT_H5      18
-#define PIN_SHIFT_H6      19
-// Shifter mode: 0 = sequential (GEAR_UP/DOWN), 1 = H-pattern (upar wale pins).
-#define RSH_SHIFTER_MODE  0
 // LED strip mein LEDs ki tadaad (validator limit ≤ 60, PIN-RULES.md §4).
 #define LED_STRIP_COUNT   16
 #define LED_ACTIVE_LOW 0    // DevKit ki LED aam tor par active-HIGH hai;

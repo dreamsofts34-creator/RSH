@@ -26,8 +26,11 @@
 //       err 3 button-matrix record (type 4, koi firmware consumer nahi —
 //           P1-3, expander jaisa hi fail-closed reject)
 //           -> UNSUPPORTED (6)
+//       err 3 encoder record (type 5, module DELETE — v2.0.19/4.0.7,
+//           expander/matrix jaisa hi fail-closed reject)
+//           -> UNSUPPORTED (6)
 //       err 2 slot out of range (P2-5: AXIS/AS5600 slot > 4, BUTTON > 2,
-//           ENCODER > 1, LED_STRIP/BATTERY slot != 0 — pinmap ka koi
+//           LED_STRIP/BATTERY slot != 0 — pinmap ka koi
 //           consumer nahi, lekin pin reserve ho jata) -> PIN_CONFLICT (5)
 //       err 4 chunk/blob CRC mismatch        -> BAD_CRC (3)
 //       err 5 total size mismatch            -> TOO_BIG (4)
@@ -71,25 +74,26 @@
 #define RSH_CFG_TYPE_AXIS_ADS1115    2
 #define RSH_CFG_TYPE_BUTTON          3
 #define RSH_CFG_TYPE_BUTTON_MATRIX   4
+// v2.0.19/4.0.7: ENCODER module DELETE — type 5 records validator mein
+// reject hote hain (expander/matrix jaisa fail-closed backstop, purani
+// apps / direct SET_CFG ke liye). Define sirf is liye rehta hai taake
+// reject branch + tests type ko naam se likh sakein; koi consumer nahi.
 #define RSH_CFG_TYPE_ENCODER         5
 #define RSH_CFG_TYPE_LED_STRIP       6
 #define RSH_CFG_TYPE_BATTERY         7
 #define RSH_CFG_TYPE_EXP_MCP23017    8
 #define RSH_CFG_TYPE_EXP_PCF8574     9
 #define RSH_CFG_TYPE_AXIS_GENERIC    10
-// Phase F WS5: shifter gate-mode record (type 11). Layout (16 B record):
-//   slot = 0 (reserved), flags = 0, pinA/pinB/pinC = gear pins 1..3,
-//   params[0] = gate mode (0 sequential, 1 H-pattern),
-//   params[1..3] = gear pins 4..6, params[4..9] = 0 (reserved).
-// Sequential mode mein is record ki zaroorat nahi (default sequential);
-// H-pattern ke liye ye record lazmi hai — baghair is ke mode sequential
-// rehta hai. Gear pins 1..6 PIN_SHIFT_H1..H6 hone chahiye (validation
-// range + uniqueness + pull-up (digital input) + H+encoder conflict
-// check karti hai — pin numbers ki exact match caller/config ki
-// zimmedari hai).
+// Phase F WS5: shifter record (type 11). Layout (16 B record):
+//   slot = 0 (reserved), flags = 0, pinA/pinB/pinC = 0xFF (koi pin nahi),
+//   params[0] = gate mode — v2.0.19 mein DELETE: hamesha 0 (sequential)
+//     hona lazmi hai, validator mode != 0 reject karta hai,
+//   params[1..3] = 0 (reserved — H-pattern gear pins khatam),
+//   params[4] = shifter sensitivity (0..100, D-4), params[5..9] = 0.
+// Sequential mode mein is record ki zaroorat nahi (default sequential +
+// sensitivity 50); sensitivity badalni ho to ye record bhejo.
 #define RSH_CFG_TYPE_SHIFTER         11
-#define RSH_CFG_SHIFTER_GATE_PARAM   0   // params[0] = gate mode
-#define RSH_CFG_SHIFTER_GEAR_PIN_PARAM_FIRST 1  // params[1..3] = gear pins 4..6
+#define RSH_CFG_SHIFTER_GATE_PARAM   0   // params[0] = gate mode (hamesha 0 — v2.0.19)
 // Phase G WS4: AS5600 magnetic encoder axis (type 12, docs/AS5600-SPEC.md).
 // Layout (16 B record): slot = axis slot, flags bit0 = multi-turn
 // (0 = <=360° direct, 1 = turn counter on), pinA/pinB/pinC = 0xFF
@@ -115,8 +119,7 @@
 #define RSH_CFG_LED_CONFIG_BRIGHTNESS_PARAM 4  // params[4] = brightness 0..100
 // v4.0.2 (D-4): shifter sensitivity — type-11 record params[4]
 // (0..100, default 50): sequential gear buttons ka debounce
-// 20 ms (0) .. 5 ms (100) hota hai; H-pattern gear ko bhi utni hi der
-// stable rehna hota hai. params[5..9] = 0 (reserved).
+// 20 ms (0) .. 5 ms (100) hota hai. params[5..9] = 0 (reserved).
 #define RSH_CFG_SHIFTER_SENSITIVITY_PARAM 4
 #define RSH_CFG_SHIFTER_SENSITIVITY_DEFAULT 50
 // v4.0.2 (F-15/D-3): handbrake button mode — AXIS_ADC/GENERIC record
@@ -198,22 +201,22 @@ static inline size_t rsh_cfg_blob_build(uint8_t *out, const uint8_t *records,
 // Factory default blob — POORA pin map (§3.6 slot scheme, PC builder
 // jaisa; Phase G C3). Replace semantics hai (pinmap.h): jis function ka
 // record NAHI hai, board usay sample NAHI karta — is liye factory blob
-// mein har default-on function ka record hai (11 records, 188 B):
+// mein har default-on function ka record hai (9 records, 156 B):
 // steering ADC GPIO34 (slot 0), accel 35 (1), brake 36 (2), handbrake
 // 32 (slot 4), battery 39, gear-up BUTTON 27 (slot 0), gear-down 33
-// (slot 1), horn 4 (slot 2), encoder 1 (23/19), encoder 2 (16/17),
-// LED strip 21. Clutch NAHI hai (default off — AXIS slot 3 record
-// sirf config se aata hai); SHIFTER record NAHI hai (sequential
-// default). Accel/brake BUTTON pins (25/26) blob mein NAHI — wo pedal
-// button-mode ke fixed pins hain (pinmap.h).
+// (slot 1), horn 4 (slot 2), LED strip 21. Clutch NAHI hai (default
+// off — AXIS slot 3 record sirf config se aata hai); SHIFTER record
+// NAHI hai (sequential default). Accel/brake BUTTON pins (25/26) blob
+// mein NAHI — wo pedal button-mode ke fixed pins hain (pinmap.h).
+// v2.0.19: encoder records (pehle 2) DELETE — encoders khatam.
 // Purana factory blob (7 records, BUTTON slots 0..3 = accel/brake/
 // gear-up/gear-down) Phase G mein KHATAM — BUTTON slot scheme badal
 // gaya hai; purana NVS blob ab validate nahi hota (P2-5: BUTTON slot
 // > 2 reject) aur boot par LKG/factory fallback leta hai (wahi end
 // state jo purani migration deti thi).
-// Return length (188 B), ya 0.
+// Return length (156 B), ya 0.
 static inline size_t rsh_cfg_factory_blob(uint8_t *out) {
-  uint8_t rec[11 * RSH_CFG_RECORD_SIZE];
+  uint8_t rec[9 * RSH_CFG_RECORD_SIZE];
   rsh_cfg_record(rec + 0 * 16, RSH_CFG_TYPE_AXIS_ADC, 0, 0, 34, 0xFF, 0xFF, NULL);
   rsh_cfg_record(rec + 1 * 16, RSH_CFG_TYPE_AXIS_ADC, 1, 0, 35, 0xFF, 0xFF, NULL);
   rsh_cfg_record(rec + 2 * 16, RSH_CFG_TYPE_AXIS_ADC, 2, 0, 36, 0xFF, 0xFF, NULL);
@@ -222,10 +225,8 @@ static inline size_t rsh_cfg_factory_blob(uint8_t *out) {
   rsh_cfg_record(rec + 5 * 16, RSH_CFG_TYPE_BUTTON, 0, 0, 27, 0xFF, 0xFF, NULL);
   rsh_cfg_record(rec + 6 * 16, RSH_CFG_TYPE_BUTTON, 1, 0, 33, 0xFF, 0xFF, NULL);
   rsh_cfg_record(rec + 7 * 16, RSH_CFG_TYPE_BUTTON, 2, 0, 4, 0xFF, 0xFF, NULL);
-  rsh_cfg_record(rec + 8 * 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 19, 0xFF, NULL);
-  rsh_cfg_record(rec + 9 * 16, RSH_CFG_TYPE_ENCODER, 1, 0, 16, 17, 0xFF, NULL);
-  rsh_cfg_record(rec + 10 * 16, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
-  return rsh_cfg_blob_build(out, rec, 11, 1);
+  rsh_cfg_record(rec + 8 * 16, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
+  return rsh_cfg_blob_build(out, rec, 9, 1);
 }
 
 // ---------- PIN-RULES (docs/PIN-RULES.md + docs/board-esp32-devkitv1.json) ----------
@@ -236,7 +237,7 @@ static inline size_t rsh_cfg_factory_blob(uint8_t *out) {
 //     {32, 33, 34, 35, 36, 39} (ADC2 pin Wi-Fi on par garbage deta hai).
 //   * Barred pins kabhi nahi: flash 6-11, UART0 1/3, strapping 0/12/15,
 //     status LED 2, maujood hi nahi 20/24/28-31/37/38.
-//   * Digital input (BUTTON/ENCODER/MATRIX + H-pattern gear pins) ko
+//   * Digital input (BUTTON/MATRIX) ko
 //     internal pull-up chahiye: input-only pins 34-39 reject (inputs.cpp
 //     hamesha INPUT_PULLUP lagata hai — wahan pull-up maujood hi nahi).
 //     NOTE (PC-builder farq): PC ValidatePin input-only digital par sirf
@@ -303,20 +304,20 @@ static inline uint8_t rsh_cfg_pin_check_(uint8_t pin, uint8_t rule,
 //   unknown type (1..13 ke bahar)                   -> UNSUPPORTED, err 3
 //   expander record (type 8/9, sampling not implemented — v4.0.4)
 //                                                    -> UNSUPPORTED, err 3
+//   encoder record (type 5, module DELETE — v2.0.19/4.0.7)
+//                                                    -> UNSUPPORTED, err 3
 //   pin 0xFF ke ilawa 0..39 ke bahar                -> PIN_CONFLICT, err 2
 //   pin barred (flash/UART/strapping/LED/nonexistent)
 //     ya kind-ghalat (ADC2 axis, input-only digital/LED)
 //     ya I2C kind (ADS/expander/AS5600) par GPIO pin -> PIN_CONFLICT, err 2
 //   I2C kinds maujood hon to direct pin 21/22       -> PIN_CONFLICT, err 1
 //   ek GPIO do records mein                          -> PIN_CONFLICT, err 1
-//   axes > 8 / encoders > 4 / batteries > 1 /
+//   axes > 8 / batteries > 1 /
 //     pin wale LED strips > 1                        -> PIN_CONFLICT, err 2
-//   axes > 8 / encoders > 4                         -> PIN_CONFLICT, err 2
 //   button records 65..128                          -> UNSUPPORTED, err 3 (N1)
 //   button records > 128                            -> PIN_CONFLICT, err 2
-//   SHIFTER record: mode params[0] > 1              -> PIN_CONFLICT, err 2
+//   SHIFTER record: mode params[0] != 0             -> PIN_CONFLICT, err 2
 //   SHIFTER record: sensitivity params[4] > 100      -> PIN_CONFLICT, err 2 (D-4)
-//   SHIFTER H-pattern + ENCODER record              -> PIN_CONFLICT, err 1
 //   LED_CONFIG record (type 13): > 1, patternId > 4, brightness > 100,
 //     flags != 0 ya koi pin set                     -> PIN_CONFLICT, err 2 (F-14)
 //   Handbrake AXIS slot 4 flags bit0 (button mode): pinA par PULLUP rule
@@ -375,9 +376,8 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
     // overflow kar jata (T14 jaisa wrap bug) — yahan wrap nahi hona chahiye.
     uint8_t used_pin[40];
     memset(used_pin, 0, sizeof(used_pin));
-    uint16_t n_axes = 0, n_enc = 0, n_btn = 0, n_as5600 = 0, n_bat = 0, n_led = 0;
+    uint16_t n_axes = 0, n_btn = 0, n_as5600 = 0, n_bat = 0, n_led = 0;
     uint16_t n_ledcfg = 0;  // F-14: persistent LED config records (max 1)
-    uint8_t has_hpattern = 0;
     uint8_t ads_ch_used = 0;  // FW-01: ADS1115 AIN channels (bit n = ch n istemal)
     // Pre-scan: I2C kinds (ADS1115/expander/AS5600) hon to GPIO21/22 I2C
     // hain (R-L9) — direct pin istemal neeche reject hota hai.
@@ -446,8 +446,20 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
         if (status == RSH_CTRL_OK) status = RSH_CTRL_UNSUPPORTED;
         continue;
       }
+      if (type == RSH_CFG_TYPE_ENCODER) {
+        // v2.0.19/4.0.7: ENCODER module DELETE — koi firmware consumer
+        // nahi raha (pinmap case + quadrature decoder + GET_CAPS rows
+        // sab khatam). Accept karne se encoder pins silently dead
+        // hote (expander/matrix gap jaisa). Reject fail-closed:
+        // err 3 -> UNSUPPORTED. The app (`validate_blob`,
+        // rsh-protocol) rejects first with a plain message; this is
+        // the backstop for old apps / direct SET_CFG.
+        RSH_CFG_ADD_ERR(RSH_CFG_ERR_UNKNOWN_TYPE);
+        if (status == RSH_CTRL_OK) status = RSH_CTRL_UNSUPPORTED;
+        continue;
+      }
       // P2-5: slot range — pinmap ke paas in slots ka koi consumer
-      // nahi (AXIS > 4, BUTTON > 2, ENCODER > 1, LED_STRIP/BATTERY
+      // nahi (AXIS > 4, BUTTON > 2, LED_STRIP/BATTERY
       // != 0, AS5600 > 4), lekin record ka pin used_pin mein reserve
       // ho jata — silently dead function + zaya pin. Reject
       // fail-closed: err 2 -> PIN_CONFLICT. (BUTTON slot 3 purane
@@ -465,8 +477,6 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
           slot_bad = (slot > 4);
         else if (type == RSH_CFG_TYPE_BUTTON)
           slot_bad = (slot > 2);
-        else if (type == RSH_CFG_TYPE_ENCODER)
-          slot_bad = (slot > 1);
         else if (type == RSH_CFG_TYPE_LED_STRIP ||
                  type == RSH_CFG_TYPE_BATTERY)
           slot_bad = (slot != 0);
@@ -504,7 +514,6 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
           if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
         }
       }
-      else if (type == RSH_CFG_TYPE_ENCODER) n_enc++;
       else if (type == RSH_CFG_TYPE_BUTTON) n_btn++;
       else if (type == RSH_CFG_TYPE_BATTERY) n_bat++;
       else if (type == RSH_CFG_TYPE_LED_STRIP) {
@@ -512,43 +521,20 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
       }
       else if (type == RSH_CFG_TYPE_SHIFTER) {
         // Phase F WS5: gate mode params[0] mein (record offset 6).
+        // v2.0.19: mode hamesha 0 (sequential) — H-pattern DELETE,
+        // mode != 0 reject (fail closed).
         uint8_t mode = r[6];
         // D-4 (v4.0.2): sensitivity params[4] mein (record offset 10),
-        // 0..100 — dono modes par check hota hai.
+        // 0..100.
         if (r[6 + RSH_CFG_SHIFTER_SENSITIVITY_PARAM] > 100) {
           RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
           if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
           continue;
         }
-        if (mode > 1) {
+        if (mode != 0) {
           RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
           if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
           continue;
-        }
-        if (mode == 1) {
-          has_hpattern = 1;
-          // Gear pins 1..3 (pinA/B/C) 0xFF nahi ho sakte; maujood hon to
-          // digital input hain (INPUT_PULLUP — PIN-RULES pullup rule).
-          for (int gp = 3; gp <= 5; gp++) {
-            if (r[gp] == 0xFF) {
-              RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
-              if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
-            } else {
-              RSH_CFG_CHECK_PIN(r[gp], RSH_PIN_RULE_PULLUP);
-            }
-          }
-          // Gear pins 4..6 (params[1..3], record offsets 7..9):
-          // generic loop inhein nahi dekhta — yahin check karo.
-          for (int gp = 7; gp <= 9; gp++) {
-            uint8_t pin = r[gp];
-            if (pin == 0xFF) {
-              RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
-              if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
-            } else {
-              RSH_CFG_CHECK_PIN(pin, RSH_PIN_RULE_PULLUP);
-            }
-          }
-          continue;  // generic loop skip — gear pins pehle hi check ho chuke
         }
       }
       // I2C kinds (ADS1115/expander): koi GPIO pin nahi (0xFF lazmi,
@@ -595,8 +581,7 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
               type == RSH_CFG_TYPE_BATTERY)
             rule = RSH_PIN_RULE_ADC1;
           else if (type == RSH_CFG_TYPE_BUTTON ||
-                   type == RSH_CFG_TYPE_BUTTON_MATRIX ||
-                   type == RSH_CFG_TYPE_ENCODER)
+                   type == RSH_CFG_TYPE_BUTTON_MATRIX)
             rule = RSH_PIN_RULE_PULLUP;
           else if (type == RSH_CFG_TYPE_LED_STRIP)
             rule = RSH_PIN_RULE_DIGOUT;
@@ -609,8 +594,7 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
             rule = RSH_PIN_RULE_PULLUP;
           }
         } else if (p == 4) {
-          if (type == RSH_CFG_TYPE_ENCODER ||
-              type == RSH_CFG_TYPE_BUTTON_MATRIX)
+          if (type == RSH_CFG_TYPE_BUTTON_MATRIX)
             rule = RSH_PIN_RULE_PULLUP;
         } else {  // p == 5 (pinC)
           if (type == RSH_CFG_TYPE_BUTTON_MATRIX)
@@ -619,19 +603,12 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
         RSH_CFG_CHECK_PIN(pin, rule);
       }
     }
-    if (n_axes > 8 || n_enc > 4) {
+    if (n_axes > 8) {
       RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
       if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
     }
     if (n_bat > 1 || n_led > 1) {
       RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
-      if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
-    }
-    // Phase F WS5: H-pattern + encoders ek saath nahi (shared pins
-    // 16/17/19 — modules.h rsh_modules_hpattern_encoder_conflict).
-    // COMMIT par reject — board par dono ek saath kabhi live nahi hote.
-    if (has_hpattern && n_enc > 0) {
-      RSH_CFG_ADD_ERR(RSH_CFG_ERR_PIN_CONFLICT);
       if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
     }
     if (n_btn > 128) {
@@ -652,23 +629,10 @@ done:
 }
 
 // ---------- Blob queries (Phase F WS5) ----------
-// Dono getters pehle blob validate karte hain (magic/schema/CRC) —
+// Getters pehle blob validate karte hain (magic/schema/CRC) —
 // kharab blob se mode/pin kabhi nahi nikala jata (default milta hai).
-
-// Shifter gate mode (§3.6, type-11 record params[0]): 0 sequential
-// (default — record na ho to bhi), 1 H-pattern. Record maujood magar
-// mode > 1 ho to bhi 0 (validation COMMIT par reject karti hai — ye
-// getter live apply ke liye mehfooz default deta hai).
-static inline uint8_t rsh_cfg_shifter_mode(const uint8_t *blob, size_t len) {
-  if (!blob) return 0;
-  if (rsh_cfg_blob_validate(blob, len, NULL, NULL) != RSH_CTRL_OK) return 0;
-  uint8_t mc = blob[5];
-  for (uint8_t i = 0; i < mc; i++) {
-    const uint8_t *r = blob + RSH_CFG_HEADER_SIZE + (size_t)i * RSH_CFG_RECORD_SIZE;
-    if (r[0] == RSH_CFG_TYPE_SHIFTER) return r[6] <= 1 ? r[6] : 0;
-  }
-  return 0;
-}
+// v2.0.19: rsh_cfg_shifter_mode() DELETE — gate mode khatam, shifter
+// hamesha sequential hai.
 
 // LED strip pin (§3.6, type-6 record pinA): LED_STRIP record ho to 1 +
 // pin_out mein pinA; na ho to 0 (pin_out untouched). R-L9 rule ke liye

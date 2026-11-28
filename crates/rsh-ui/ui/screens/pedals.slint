@@ -277,11 +277,17 @@ component PedalCard inherits Card {
                 }
             }
         }
-        if show-chips : HorizontalLayout {
-            spacing: 4px;
-            FeelChip { horizontal-stretch: 1; label: "Linear"; active: feel == 0; clicked => { feel-selected(0); } }
-            FeelChip { horizontal-stretch: 1; label: "Soft"; active: feel == 1; clicked => { feel-selected(1); } }
-            FeelChip { horizontal-stretch: 1; label: "Sharp"; active: feel == 2; clicked => { feel-selected(2); } }
+        // v2.0.19 (F4): feel presets — Soft / Normal / Firm.
+        if show-chips : VerticalLayout {
+            spacing: 6px;
+            Text { text: "Feel preset"; font-size: Theme.fs-label; font-weight: 500; color: Theme.text; }
+            HorizontalLayout {
+                spacing: 4px;
+                FeelChip { horizontal-stretch: 1; label: "Soft"; active: feel == 1; clicked => { feel-selected(1); } }
+                FeelChip { horizontal-stretch: 1; label: "Normal"; active: feel == 0; clicked => { feel-selected(0); } }
+                FeelChip { horizontal-stretch: 1; label: "Firm"; active: feel == 2; clicked => { feel-selected(2); } }
+            }
+            Text { text: feel == 1 ? "Soft — gentle, forgiving pedal." : feel == 0 ? "Normal — even response, the default." : "Firm — quick, direct response."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
         }
         // --- Brake per-module tuning ---
         // B1 brake force first (the headline brake control), then
@@ -422,6 +428,9 @@ export component PedalsPage inherits PageScaffold {
     callback throttle-saturation-changed(float); // 0..1 of 70..100%
     callback throttle-saturation-edited(string); // typed "85%"
     callback combine-pedals-changed(bool);
+    // v2.0.19 (F4): 1-tap reset — all three pedals back to the
+    // Normal preset + default deadzone / ramps / saturation.
+    callback reset-defaults();
 
     // P1: the page is a PageScaffold (ScrollView + standard
     // padding) — the clutch card used to clip ~11 px Basic /
@@ -622,4 +631,39 @@ export component PedalsPage inherits PageScaffold {
     // removed — the Set up / Set down buttons carry the action.
     // (The old stretch absorber is gone — the ScrollView inside
     // the PageScaffold owns the slack now.)
+    // v2.0.19 (F4): 1-tap reset, same text-link pattern as Steering.
+    HorizontalLayout { cross-axis-alignment: center;
+        spacing: 8px;
+        Text {
+            text: "Reset to defaults";
+            font-size: Theme.fs-label;
+            font-weight: 600;
+            color: reset-fs.has-focus || reset-ta.has-hover ? Theme.text : Theme.accent-text;
+            accessible-label: "Reset pedals to defaults";
+            accessible-role: button;
+            reset-fs := FocusScope {
+                y: -4px;
+                width: 100%;
+                height: parent.height + 8px;
+                key-pressed(event) => {
+                    if (event.text == Key.Return || event.text == Key.Space) {
+                        reset-defaults();
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+            if reset-fs.has-focus : Rectangle {
+                x: -6px;
+                y: -3px;
+                width: parent.width + 12px;
+                height: parent.height + 6px;
+                border-radius: 6px;
+                border-width: 2px;
+                border-color: Theme.accent-text;
+            }
+            reset-ta := TouchArea { y: -4px; width: 100%; height: parent.height + 8px; mouse-cursor: pointer; clicked => { reset-defaults(); } }
+        }
+        if unsaved : Text { text: "Unsaved changes"; font-size: Theme.fs-hint; color: Theme.warn; }
+    }
 }

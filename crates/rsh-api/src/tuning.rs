@@ -91,11 +91,9 @@ pub fn default_release_ms(module: &str) -> Option<f64> {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub enum ShifterGate {
     /// Sequential up/down (buttons).
+    /// (v2.0.19: H-pattern is deleted — sequential is the only gate.)
     #[serde(rename = "sequential")]
     Sequential,
-    /// H-pattern (6 gear pins).
-    #[serde(rename = "h-pattern")]
-    HPattern,
 }
 
 /// LED pattern for the WS2812 strip (`rsh-led`: OFF / SOLID / BLINK /
@@ -225,8 +223,8 @@ pub struct TuningSettings {
     // --- Shifter per-module tuning ---
     /// Shift lockout in ms (SH2, shifter module only): new gear
     /// inputs within this long of the last accepted shift are
-    /// ignored — 0–200 (default 50). `0` = off. Kills gate-bounce
-    /// double-shifts in H-pattern and double-taps in sequential.
+    /// ignored — 0–200 (default 50). `0` = off. Kills double-taps
+    /// in sequential shifting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shift_lockout_ms: Option<f64>,
     /// Button number (1–32) the horn is bound to (horn module only).
@@ -265,47 +263,6 @@ pub struct TuningSettings {
     /// carry it). Default off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub combine_pedals: Option<bool>,
-    // --- Encoder per-module tuning ---
-    /// Pulse length in ms (E1, encoders module only): how long each
-    /// step holds its virtual button, 20–200 (default 50).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encoder_pulse_ms: Option<f64>,
-    /// Counts per click (E2, encoders module only): quadrature
-    /// counts per emitted step — 1, 2 or 4 (default 4).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encoder_counts_per_click: Option<u8>,
-    /// Acceleration on/off (E3, encoders module only): fast spins
-    /// emit extra steps.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encoder_accel: Option<bool>,
-    /// Acceleration sensitivity (E3, encoders module only): extra
-    /// steps as a multiple of the spun steps, 0–2 (default 1.0).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encoder_accel_sensitivity: Option<f64>,
-    /// Per-encoder direction invert (E4, encoders module only):
-    /// bit `i` inverts encoder `i` (only bits 0–3 used).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encoder_invert_mask: Option<u8>,
-    // --- Buttons per-module tuning ---
-    /// Button debounce in ms (BU1, buttons module only): a press /
-    /// release must hold steady this long (5 ms ticks at 200 Hz)
-    /// before the engine reports it — 0–50 (default 10). `None` =
-    /// never set (old profile) — the 10 ms default applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub button_debounce_ms: Option<f64>,
-    /// Long-press threshold in ms (BU2, buttons module only): how
-    /// long a button must be held before its long-press action
-    /// takes over — 300–1500 (default 800). `None` = never set
-    /// (old profile) — the 800 ms default applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub button_long_press_ms: Option<f64>,
-    /// Double-press window in ms (BU3, buttons module only): a
-    /// second press within this long of the previous release
-    /// counts as a double-press and fires the button's long-press
-    /// (2nd) action — 150–500 (default 300). `None` = never set
-    /// (old profile) — the 300 ms default applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub button_double_press_ms: Option<f64>,
     // --- Handbrake/clutch per-module tuning ---
     /// Latch mode (H1, handbrake module only): press once = the
     /// handbrake stays on, press again = release. `None` = not
@@ -384,16 +341,6 @@ impl TuningSettings {
             } else {
                 None
             },
-            // --- Encoder per-module tuning ---
-            encoder_pulse_ms: None,
-            encoder_counts_per_click: None,
-            encoder_accel: None,
-            encoder_accel_sensitivity: None,
-            encoder_invert_mask: None,
-            // --- Buttons per-module tuning ---
-            button_debounce_ms: None,
-            button_long_press_ms: None,
-            button_double_press_ms: None,
             // --- Handbrake/clutch per-module tuning ---
             // Latch + auto-release live on the handbrake record
             // only (both off); the slip zone on the clutch record
@@ -524,73 +471,17 @@ pub fn validate_tuning(tuning: &TuningSettings) -> Vec<String> {
     {
         errors.push(format!("release_ms {release_ms} is outside 0..=2000"));
     }
-    // --- Encoder per-module tuning ---
-    validate_encoder_tuning(tuning, &mut errors);
-    validate_led_horn_tuning(tuning, &mut errors);
-    errors
-}
-
-/// Validate the encoder extension fields (E1–E4): one message per
-/// failed rule, appended to `errors`. Split out of
-/// [`validate_tuning`] so that function stays under Clippy's
-/// 100-line limit.
-fn validate_encoder_tuning(tuning: &TuningSettings, errors: &mut Vec<String>) {
-    if let Some(pulse_ms) = tuning.encoder_pulse_ms
-        && !(20.0..=200.0).contains(&pulse_ms)
-    {
-        errors.push(format!(
-            "encoder_pulse_ms {pulse_ms} is outside 20..=200 (ms)"
-        ));
-    }
-    if let Some(counts) = tuning.encoder_counts_per_click
-        && !matches!(counts, 1 | 2 | 4)
-    {
-        errors.push(format!(
-            "encoder_counts_per_click {counts} is not one of 1, 2, 4"
-        ));
-    }
-    if let Some(sensitivity) = tuning.encoder_accel_sensitivity
-        && !(0.0..=2.0).contains(&sensitivity)
-    {
-        errors.push(format!(
-            "encoder_accel_sensitivity {sensitivity} is outside 0..=2"
-        ));
-    }
-    if let Some(mask) = tuning.encoder_invert_mask
-        && mask & !0x0F != 0
-    {
-        errors.push(format!(
-            "encoder_invert_mask {mask} uses bits outside 0..=3"
-        ));
-    }
-    // --- Buttons per-module tuning ---
-    if let Some(debounce_ms) = tuning.button_debounce_ms
-        && !(0.0..=50.0).contains(&debounce_ms)
-    {
-        errors.push(format!(
-            "button_debounce_ms {debounce_ms} is outside 0..=50 (ms)"
-        ));
-    }
-    if let Some(long_press_ms) = tuning.button_long_press_ms
-        && !(300.0..=1500.0).contains(&long_press_ms)
-    {
-        errors.push(format!(
-            "button_long_press_ms {long_press_ms} is outside 300..=1500 (ms)"
-        ));
-    }
-    if let Some(double_press_ms) = tuning.button_double_press_ms
-        && !(150.0..=500.0).contains(&double_press_ms)
-    {
-        errors.push(format!(
-            "button_double_press_ms {double_press_ms} is outside 150..=500 (ms)"
-        ));
-    }
     // --- Handbrake/clutch per-module tuning ---
+    // (v2.0.19: this check used to live in the deleted
+    // `validate_encoder_tuning` helper alongside the encoder/buttons
+    // checks — it survives because `bite_width` is a clutch field.)
     if let Some(width) = tuning.bite_width
         && !(0.05..=0.40).contains(&width)
     {
         errors.push(format!("bite_width {width} is outside 0.05..=0.40"));
     }
+    validate_led_horn_tuning(tuning, &mut errors);
+    errors
 }
 
 /// Validate the LED/horn extension fields (L1/HO1): one message
@@ -721,11 +612,11 @@ mod tests {
         let back: TuningSettings = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, led);
         let mut shifter = tuning("shifter");
-        shifter.shifter_gate = Some(ShifterGate::HPattern);
+        shifter.shifter_gate = Some(ShifterGate::Sequential);
         shifter.horn_button = None;
         assert_eq!(validate_tuning(&shifter), Vec::<String>::new());
         let json = serde_json::to_string(&shifter).expect("serialize");
-        assert!(json.contains("\"shifterGate\":\"h-pattern\""), "{json}");
+        assert!(json.contains("\"shifterGate\":\"sequential\""), "{json}");
     }
 
     #[test]
@@ -769,56 +660,6 @@ mod tests {
         assert!(errors.iter().any(|e| e.contains("span")));
         assert!(errors.iter().any(|e| e.contains("bite_point")));
         assert!(errors.iter().any(|e| e.contains("horn_button")));
-    }
-
-    #[test]
-    fn encoder_fields_round_trip_and_validate() {
-        let mut settings = tuning("encoders");
-        settings.encoder_pulse_ms = Some(120.0);
-        settings.encoder_counts_per_click = Some(2);
-        settings.encoder_accel = Some(true);
-        settings.encoder_accel_sensitivity = Some(1.5);
-        settings.encoder_invert_mask = Some(0b0010);
-        assert_eq!(validate_tuning(&settings), Vec::<String>::new());
-        let json = serde_json::to_string(&settings).expect("serialize");
-        assert!(json.contains("\"encoderPulseMs\":120.0"), "{json}");
-        assert!(json.contains("\"encoderCountsPerClick\":2"), "{json}");
-        assert!(json.contains("\"encoderAccel\":true"), "{json}");
-        assert!(json.contains("\"encoderAccelSensitivity\":1.5"), "{json}");
-        assert!(json.contains("\"encoderInvertMask\":2"), "{json}");
-        let back: TuningSettings = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, settings);
-        // Other modules never carry them: omitted from the JSON.
-        let json = serde_json::to_string(&tuning("brake")).expect("serialize");
-        assert!(!json.contains("encoderPulseMs"), "{json}");
-        assert!(!json.contains("encoderCountsPerClick"), "{json}");
-        assert!(!json.contains("encoderAccel"), "{json}");
-        assert!(!json.contains("encoderInvertMask"), "{json}");
-        // Out-of-range values are rejected, never silently clamped here.
-        let mut bad = tuning("encoders");
-        bad.encoder_pulse_ms = Some(10.0);
-        bad.encoder_counts_per_click = Some(3);
-        bad.encoder_accel_sensitivity = Some(3.0);
-        bad.encoder_invert_mask = Some(0x10);
-        let errors = validate_tuning(&bad);
-        assert_eq!(errors.len(), 4, "errors: {errors:?}");
-        assert!(errors.iter().any(|e| e.contains("encoder_pulse_ms")));
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("encoder_counts_per_click")),
-            "{errors:?}"
-        );
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("encoder_accel_sensitivity")),
-            "{errors:?}"
-        );
-        assert!(
-            errors.iter().any(|e| e.contains("encoder_invert_mask")),
-            "{errors:?}"
-        );
     }
 
     /// LED/horn per-module tuning (L1/HO1/HO2): period, minimum
@@ -868,58 +709,6 @@ mod tests {
         let errors = validate_tuning(&bad_horn);
         assert_eq!(errors.len(), 1, "errors: {errors:?}");
         assert!(errors[0].contains("horn_min_ms"), "{}", errors[0]);
-    }
-
-    #[test]
-    fn button_fields_round_trip_and_validate() {
-        // BU1+BU2+BU3: debounce 0–50 ms (default 10), long-press
-        // threshold 300–1500 ms (default 800), double-press
-        // window 150–500 ms (default 300). Old profiles load them
-        // as None and the daemon applies the defaults.
-        let mut settings = tuning("buttons");
-        assert_eq!(settings.button_debounce_ms, None);
-        assert_eq!(settings.button_long_press_ms, None);
-        assert_eq!(settings.button_double_press_ms, None);
-        assert_eq!(validate_tuning(&settings), Vec::<String>::new());
-        settings.button_debounce_ms = Some(25.0);
-        settings.button_long_press_ms = Some(1200.0);
-        settings.button_double_press_ms = Some(250.0);
-        assert_eq!(validate_tuning(&settings), Vec::<String>::new());
-        let json = serde_json::to_string(&settings).expect("serialize");
-        assert!(json.contains("\"buttonDebounceMs\":25.0"), "{json}");
-        assert!(json.contains("\"buttonLongPressMs\":1200.0"), "{json}");
-        assert!(json.contains("\"buttonDoublePressMs\":250.0"), "{json}");
-        let back: TuningSettings = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, settings);
-        // Other modules never carry them: omitted from the JSON.
-        let json = serde_json::to_string(&tuning("brake")).expect("serialize");
-        assert!(!json.contains("buttonDebounceMs"), "{json}");
-        assert!(!json.contains("buttonLongPressMs"), "{json}");
-        assert!(!json.contains("buttonDoublePressMs"), "{json}");
-        // Old JSON without the fields loads as None.
-        let old: TuningSettings = serde_json::from_str(
-            r#"{"module":"buttons","deadzone":0.0,"curve":1.0,"minMv":0.0,"maxMv":3300.0,"smoothing":0.0}"#,
-        )
-        .expect("deserialize old");
-        assert_eq!(old.button_debounce_ms, None);
-        assert_eq!(old.button_long_press_ms, None);
-        assert_eq!(old.button_double_press_ms, None);
-        // Out-of-range values are rejected, never silently clamped here.
-        let mut bad = tuning("buttons");
-        bad.button_debounce_ms = Some(60.0);
-        bad.button_long_press_ms = Some(200.0);
-        bad.button_double_press_ms = Some(100.0);
-        let errors = validate_tuning(&bad);
-        assert_eq!(errors.len(), 3, "errors: {errors:?}");
-        assert!(errors.iter().any(|e| e.contains("button_debounce_ms")));
-        assert!(
-            errors.iter().any(|e| e.contains("button_long_press_ms")),
-            "{errors:?}"
-        );
-        assert!(
-            errors.iter().any(|e| e.contains("button_double_press_ms")),
-            "{errors:?}"
-        );
     }
 
     #[test]

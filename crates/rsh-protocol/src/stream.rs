@@ -15,8 +15,10 @@ use crate::error::{RejectCounters, StatusError, StreamError};
 pub const VERSION: u8 = 0x22;
 /// Maximum axes (D6).
 pub const MAX_AXES: usize = 8;
-/// Maximum encoders (D6).
-pub const MAX_ENCODERS: usize = 4;
+/// Wire encoder slots (v2.2 frozen): the frame still carries 4
+/// cumulative `i16` encoder slots, but firmware 4.0.7 sends them all
+/// zero and nothing reads them any more (v2.0.19: encoders deleted).
+/// The literal `4` below is the frozen wire width, not a live limit.
 /// Maximum buttons in a config (D6 ceiling; wire carries 0–63).
 pub const MAX_BUTTONS: usize = 128;
 /// Stream header size in bytes.
@@ -81,8 +83,9 @@ pub struct StreamFrame {
     pub flags: StreamFlags,
     /// Axis values in mV by slot 0–7 (`None` = slot not present).
     pub axes_mv: [Option<u16>; MAX_AXES],
-    /// Cumulative encoder counts, `n_enc` entries used.
-    pub encoders: [i16; MAX_ENCODERS],
+    /// Cumulative encoder counts, `n_enc` entries used. v2.0.19:
+    /// firmware 4.0.7 sends all zeros; the pipeline ignores them.
+    pub encoders: [i16; 4],
     /// Number of encoders present (0–4).
     pub n_enc: usize,
     /// Buttons 0–31, bit *n* = button *n*.
@@ -110,7 +113,7 @@ impl StreamFrame {
         encoders: &[i16],
         buttons: u32,
     ) -> Result<Self, StreamError> {
-        if axes.len() > MAX_AXES || encoders.len() > MAX_ENCODERS {
+        if axes.len() > MAX_AXES || encoders.len() > 4 {
             return Err(StreamError::BadFrame);
         }
         let mut axes_mv = [None; MAX_AXES];
@@ -120,7 +123,7 @@ impl StreamFrame {
             }
             axes_mv[slot] = Some(mv);
         }
-        let mut enc = [0i16; MAX_ENCODERS];
+        let mut enc = [0i16; 4];
         enc[..encoders.len()].copy_from_slice(encoders);
         Ok(Self {
             seq,
@@ -228,7 +231,7 @@ impl StreamFrame {
         let timestamp_us = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         let axis_mask = data[12];
         let n_enc = data[13] as usize;
-        if n_enc > MAX_ENCODERS {
+        if n_enc > 4 {
             return Err(StreamError::BadFrame);
         }
         let n_axes = axis_mask.count_ones() as usize;
@@ -251,7 +254,7 @@ impl StreamFrame {
                 off += 2;
             }
         }
-        let mut encoders = [0i16; MAX_ENCODERS];
+        let mut encoders = [0i16; 4];
         for e in encoders.iter_mut().take(n_enc) {
             *e = i16::from_le_bytes([data[off], data[off + 1]]);
             off += 2;

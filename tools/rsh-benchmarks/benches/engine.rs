@@ -3,7 +3,8 @@
 //! Every bench measures one tick of the 200 Hz hot path on the fixed
 //! representative input from [`rsh_benchmarks::fixture`]
 //! (`representative_inputs()`: 1024 frames, steering + accelerator +
-//! brake + handbrake in mV, 2 encoders stepping `+2` / `-1`, horn bit
+//! brake + handbrake in mV, encoder words stepping `+2` / `-1`
+//! (sent in the frame, ignored by the pipeline since v2.0.19), horn bit
 //! on every 7th frame, `seq` incrementing from 0, 5000 µs per frame).
 //! No randomness, no wall clock: the same index always yields the same
 //! frame, so numbers are comparable run to run. Benches cycle through
@@ -69,7 +70,6 @@ fn run_pipeline_ticks(
             .wrapping_add(u64::from(out.steering.to_bits()))
             .wrapping_add(u64::from(out.accelerator.to_bits()))
             .wrapping_add(u64::from(out.buttons))
-            .wrapping_add(u64::from(out.encoder_deltas[0].cast_unsigned()));
     }
     checksum
 }
@@ -120,7 +120,7 @@ fn bench_timing(c: &mut Criterion, inputs: &[rsh_benchmarks::fixture::TickInput]
     c.bench_function("pipeline_tick", |b| {
         let mut pipeline = ProcessingPipeline::default();
         let mut index = 0usize;
-        // Warm up filters/ramps/encoder baseline so the timed loop
+        // Warm up filters/ramps so the timed loop
         // measures steady-state ticks, not first-sample transients.
         let _warmup = run_pipeline_ticks(&mut pipeline, inputs, &mut index, 64);
         b.iter(|| {

@@ -243,42 +243,6 @@ pub struct PerModuleTuning {
     /// applies (old profiles load with `None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_ms: Option<f64>,
-    // --- Encoder per-module tuning ---
-    /// Pulse length in ms (E1, encoders module only), 20–200.
-    /// `None` = never set (old profile) — the 50 ms default applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encoder_pulse_ms: Option<f64>,
-    /// Counts per click (E2, encoders module only): 1, 2 or 4.
-    /// `None` = never set (old profile) — the default 4 applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encoder_counts_per_click: Option<u8>,
-    /// Acceleration on/off (E3, encoders module only).
-    /// `None` = never set — off applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encoder_accel: Option<bool>,
-    /// Acceleration sensitivity (E3, encoders module only), 0–2.
-    /// `None` = never set — 1.0 applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encoder_accel_sensitivity: Option<f64>,
-    /// Per-encoder direction invert mask (E4, encoders module
-    /// only), bits 0–3. `None` = never set — 0 (no invert) applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encoder_invert_mask: Option<u8>,
-    // --- Buttons per-module tuning ---
-    /// Button debounce in ms (BU1, buttons module only), 0–50.
-    /// `None` = never set (old profile) — the 10 ms default applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub button_debounce_ms: Option<f64>,
-    /// Long-press threshold in ms (BU2, buttons module only),
-    /// 300–1500. `None` = never set (old profile) — the 800 ms
-    /// default applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub button_long_press_ms: Option<f64>,
-    /// Double-press window in ms (BU3, buttons module only),
-    /// 150–500. `None` = never set (old profile) — the 300 ms
-    /// default applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub button_double_press_ms: Option<f64>,
     // --- Shifter per-module tuning ---
     /// Shift lockout in ms (SH2, shifter module only), 0–200.
     /// `None` = never set (old profile) — the 50 ms default applies.
@@ -470,13 +434,12 @@ pub struct AppSettings {
     /// vJoy device id, clamped to 1..=16 on parse.
     #[serde(default = "default_vjoy_device_id")]
     pub vjoy_device_id: u32,
-    /// Output backend: `VJoy` (default), `HIDMaestro` (explicit
-    /// choice — elevated, UAC prompt on activation), or `None` (no
-    /// output device).
+    /// Output backend: `VJoy` (default), `Xbox` (`ViGEmBus`
+    /// fallback), or `None` (no output device). A persisted
+    /// `"HIDMaestro"` value sanitizes to the vJoy default (see
+    /// [`sanitize_settings`]) — the `HIDMaestro` backend is gone.
     #[serde(default = "default_output_backend")]
     pub output_backend: String,
-    /// `HIDMaestro` profile id (empty = none selected).
-    pub hid_maestro_profile_id: String,
     /// Log level: `Debug`, `Information`, `Warning`, or `Error`.
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -492,45 +455,10 @@ pub struct AppSettings {
     /// is on. Default `false` (not paused).
     #[serde(default)]
     pub auto_switch_paused: bool,
-    /// Steam FH4 wheel mode (FH4 fix, v2.0.15): when on, the vJoy
-    /// device-1 `OEMData` flag (`40 00 00 00 00 00 00 00`) is
-    /// written so Steam Forza Horizon 4 shows the Wheel tab, and
-    /// the vJoy feed dedupes + hysteresis-filters idle output.
-    /// Default `false` (off) — never on for a fresh install, and
-    /// never applied to the HID backend.
-    #[serde(default)]
-    pub steam_fh4_mode: bool,
-    /// `G29` spoof mode (v2.0.16): when on, the `HIDMaestro` backend
-    /// presents the built-in `logitech-g29` catalog profile (VID
-    /// `0x046D` / PID `0xC24F`) instead of the custom no-brand wheel,
-    /// so games that match wheels by VID/PID see a G29. Default
-    /// `false` (off) — never on for a fresh install, and never
-    /// applied to the vJoy backend (the daemon refuses enabling
-    /// there with `g29_spoof_hid_only`). RISK: presenting
-    /// Logitech's VID/PID violates USB-IF policy as written (no
-    /// enforcement found for private hobby use); FH4 end-to-end is
-    /// unproven — even a real G29 needs a custom control scheme in
-    /// FH4, so this mode promises no auto-recognition.
-    #[serde(default)]
-    pub g29_spoof_mode: bool,
-    /// G29 pedal layout (v2.0.17): which descriptor axes carry the
-    /// pedals in G29 mode — `"hidmaestro"` (default; Z =
-    /// accelerator, Rz = brake, Y = clutch) or `"pcgamingwiki"` (Y
-    /// = accelerator, Rz = brake, Z = clutch — Z carries clutch
-    /// because the G29 descriptor has no Slider axis). Unknown
-    /// values canonicalize back to the default on load (see
-    /// [`sanitize_settings`]).
-    #[serde(default = "default_g29_pedal_layout")]
-    pub g29_pedal_layout: String,
-    /// G29 handbrake button (v2.0.17): which G29 button (1–25)
-    /// the handbrake drives in G29 mode. Default 8 (L2); out of
-    /// range values clamp to 1–25 on load (see [`sanitize_settings`]).
-    #[serde(default = "default_g29_handbrake_button")]
-    pub g29_handbrake_button: u32,
     /// Per-module on/off switches, keyed by canonical module id
     /// (`"steering"`, `"accelerator"`, `"brake"`, `"clutch"`,
-    /// `"handbrake"`, `"shifter"`, `"horn"`, `"buttons"`,
-    /// `"encoders"`, `"led"`). Absent keys mean "on" (see
+    /// `"handbrake"`, `"shifter"`, `"horn"`, `"led"`). Absent keys
+    /// mean "on" (see
     /// [`sanitize_settings`]); a disabled module never reaches the
     /// pipeline. Unknown keys are preserved verbatim.
     #[serde(default = "default_modules")]
@@ -588,21 +516,14 @@ fn default_vjoy_device_id() -> u32 {
 fn default_output_backend() -> String {
     // v2.0.1 hotfix: the default output backend is vJoy — HIDMaestro
     // was the default until v2.0.0 (architecture Phase G), but its
-    // elevated sidecar pops a UAC prompt on every launch, so it is
-    // now an explicit choice only; "None" is the no-device choice.
+    // elevated sidecar pops a UAC prompt on every launch, so vJoy
+    // became the default; the HIDMaestro backend was deleted in
+    // v2.0.19, so "None" is the only other choice.
     "VJoy".to_owned()
 }
 
 fn default_log_level() -> String {
     "Warning".to_owned()
-}
-
-fn default_g29_pedal_layout() -> String {
-    G29_PEDAL_LAYOUT_HIDMAESTRO.to_owned()
-}
-
-fn default_g29_handbrake_button() -> u32 {
-    DEFAULT_G29_HANDBRAKE_BUTTON
 }
 
 /// Manual `Default` impls (Phase F): the derived `Default` gave all-zero
@@ -635,16 +556,6 @@ impl Default for PerModuleTuning {
             // --- Pedal ramps/curves per-module tuning ---
             press_ms: None,
             release_ms: None,
-            // --- Encoder per-module tuning ---
-            encoder_pulse_ms: None,
-            encoder_counts_per_click: None,
-            encoder_accel: None,
-            encoder_accel_sensitivity: None,
-            encoder_invert_mask: None,
-            // --- Buttons per-module tuning ---
-            button_debounce_ms: None,
-            button_long_press_ms: None,
-            button_double_press_ms: None,
             // --- Shifter per-module tuning ---
             shift_lockout_ms: None,
             // --- Handbrake/clutch per-module tuning ---
@@ -712,16 +623,11 @@ impl Default for AppSettings {
             esp_ip: default_esp_ip(),
             vjoy_device_id: default_vjoy_device_id(),
             output_backend: default_output_backend(),
-            hid_maestro_profile_id: String::new(),
             log_level: default_log_level(),
             wizard_completed: false,
             first_run_done: false,
             auto_switch_profiles: true,
             auto_switch_paused: false,
-            steam_fh4_mode: false,
-            g29_spoof_mode: false,
-            g29_pedal_layout: default_g29_pedal_layout(),
-            g29_handbrake_button: default_g29_handbrake_button(),
             modules: default_modules(),
         }
     }
@@ -738,8 +644,6 @@ pub const KNOWN_MODULES: &[&str] = &[
     "handbrake",
     "shifter",
     "horn",
-    "buttons",
-    "encoders",
     "led",
 ];
 
@@ -794,28 +698,6 @@ pub fn canonical_theme(value: &str) -> Option<&'static str> {
     }
 }
 
-/// Persisted `g29_pedal_layout` value for the `HIDMaestro` profile
-/// layout (v2.0.17): Z = accelerator, Rz = brake, Y = clutch.
-/// The default — see `G29PedalMap` in `rsh-output-hidmaestro`.
-pub const G29_PEDAL_LAYOUT_HIDMAESTRO: &str = "hidmaestro";
-/// Persisted `g29_pedal_layout` value for the `PCGamingWiki`
-/// layout (v2.0.17): Y = accelerator, Rz = brake, Z = clutch.
-pub const G29_PEDAL_LAYOUT_PCGAMINGWIKI: &str = "pcgamingwiki";
-/// Default G29 handbrake button (v2.0.17): 8 (L2).
-pub const DEFAULT_G29_HANDBRAKE_BUTTON: u32 = 8;
-
-/// Canonicalize a `g29_pedal_layout` value (v2.0.17): the two known
-/// layouts, case-insensitive; `None` for anything else (the caller
-/// falls back to the default instead of guessing).
-#[must_use]
-pub fn canonical_g29_pedal_layout(value: &str) -> Option<&'static str> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        G29_PEDAL_LAYOUT_HIDMAESTRO => Some(G29_PEDAL_LAYOUT_HIDMAESTRO),
-        G29_PEDAL_LAYOUT_PCGAMINGWIKI => Some(G29_PEDAL_LAYOUT_PCGAMINGWIKI),
-        _ => None,
-    }
-}
-
 /// A partial settings update (C-SET-1, PATCH semantics): only the
 /// fields that are `Some` overwrite the stored settings; absent fields
 /// keep their existing values. This is what the `set_settings` Tauri
@@ -842,10 +724,8 @@ pub struct AppSettingsPatch {
     pub esp_ip: Option<String>,
     /// vJoy device id, clamped to 1..=16.
     pub vjoy_device_id: Option<u32>,
-    /// Output backend (`HIDMaestro` / `VJoy` / `None`).
+    /// Output backend (`VJoy` / `Xbox` / `None`).
     pub output_backend: Option<String>,
-    /// `HIDMaestro` profile id.
-    pub hid_maestro_profile_id: Option<String>,
     /// Log level.
     pub log_level: Option<String>,
     /// Whether the setup wizard has been completed.
@@ -856,16 +736,6 @@ pub struct AppSettingsPatch {
     pub auto_switch_profiles: Option<bool>,
     /// Whether auto-switching is paused (M6, v2.0.2).
     pub auto_switch_paused: Option<bool>,
-    /// Steam FH4 wheel mode (default off — see [`AppSettings::steam_fh4_mode`]).
-    pub steam_fh4_mode: Option<bool>,
-    /// G29 spoof mode (default off — see [`AppSettings::g29_spoof_mode`]).
-    pub g29_spoof_mode: Option<bool>,
-    /// G29 pedal layout (default `"hidmaestro"` — see
-    /// [`AppSettings::g29_pedal_layout`]).
-    pub g29_pedal_layout: Option<String>,
-    /// G29 handbrake button (default 8 — see
-    /// [`AppSettings::g29_handbrake_button`]).
-    pub g29_handbrake_button: Option<u32>,
     /// Per-module switches, merged per key.
     pub modules: Option<HashMap<String, bool>>,
 }
@@ -903,9 +773,6 @@ impl AppSettings {
         if let Some(output_backend) = patch.output_backend {
             self.output_backend = output_backend;
         }
-        if let Some(hid_maestro_profile_id) = patch.hid_maestro_profile_id {
-            self.hid_maestro_profile_id = hid_maestro_profile_id;
-        }
         if let Some(log_level) = patch.log_level {
             self.log_level = log_level;
         }
@@ -920,18 +787,6 @@ impl AppSettings {
         }
         if let Some(auto_switch_paused) = patch.auto_switch_paused {
             self.auto_switch_paused = auto_switch_paused;
-        }
-        if let Some(steam_fh4_mode) = patch.steam_fh4_mode {
-            self.steam_fh4_mode = steam_fh4_mode;
-        }
-        if let Some(g29_spoof_mode) = patch.g29_spoof_mode {
-            self.g29_spoof_mode = g29_spoof_mode;
-        }
-        if let Some(g29_pedal_layout) = patch.g29_pedal_layout {
-            self.g29_pedal_layout = g29_pedal_layout;
-        }
-        if let Some(g29_handbrake_button) = patch.g29_handbrake_button {
-            self.g29_handbrake_button = g29_handbrake_button;
         }
         if let Some(modules) = patch.modules {
             for (module, enabled) in modules {
@@ -955,8 +810,7 @@ struct ProfileFileRaw {
 /// recursively, so C# JSON deserializes into the `snake_case`-renamed Rust
 /// structs. `VJoy` is one word in Rust field names (`vjoy_device_id`), so
 /// that brand-name sequence is folded to `Vjoy` before conversion; other
-/// acronym boundaries follow the usual rule (`HIDMaestro` -> `hid_maestro`,
-/// `EspIp` -> `esp_ip`).
+/// acronym boundaries follow the usual rule (`EspIp` -> `esp_ip`).
 ///
 /// `pub(crate)` so the store can parse a C# settings file into a
 /// *patch* (merge import, M6) instead of a full replace.
@@ -1061,23 +915,10 @@ pub fn sanitize_settings(settings: &mut AppSettings) {
         settings.esp_ip = default_esp_ip();
     }
     settings.vjoy_device_id = settings.vjoy_device_id.clamp(1, 16);
-    // G29 settings (v2.0.17): an unknown pedal layout falls back
-    // to the default (hand-edited settings must never select a
-    // map that does not exist); a handbrake button of 0 (absent
-    // in old settings files, or hand-edited) means the default 8,
-    // anything else clamps to the 25-button G29 range.
-    settings.g29_pedal_layout = canonical_g29_pedal_layout(&settings.g29_pedal_layout)
-        .unwrap_or(G29_PEDAL_LAYOUT_HIDMAESTRO)
-        .to_string();
-    if settings.g29_handbrake_button == 0 {
-        settings.g29_handbrake_button = DEFAULT_G29_HANDBRAKE_BUTTON;
-    } else {
-        settings.g29_handbrake_button = settings.g29_handbrake_button.clamp(1, 25);
-    }
-    if !matches!(
-        settings.output_backend.as_str(),
-        "VJoy" | "HIDMaestro" | "None"
-    ) {
+    // v2.0.19: the HIDMaestro backend is gone — a persisted
+    // "HIDMaestro" value falls back to the vJoy default, same as
+    // any other unknown value.
+    if !matches!(settings.output_backend.as_str(), "VJoy" | "Xbox" | "None") {
         settings.output_backend = default_output_backend();
     }
     if !matches!(
@@ -1338,83 +1179,11 @@ mod tests {
         let settings = parse_csharp_settings(SAMPLE_SETTINGS_JSON).expect("sample settings parse");
         assert_eq!(settings.theme, "Dark");
         assert_eq!(settings.esp_ip, "10.0.0.5");
-        assert_eq!(settings.output_backend, "HIDMaestro");
+        // v2.0.19: the sample's persisted "HIDMaestro" migrates
+        // to the vJoy default — the HIDMaestro backend is gone.
+        assert_eq!(settings.output_backend, "VJoy");
         assert!(settings.close_to_tray);
         assert!(settings.auto_switch_profiles);
-        // FH4 fix (v2.0.15): absent in the old sample → default off.
-        assert!(!settings.steam_fh4_mode);
-    }
-
-    #[test]
-    fn parses_steam_fh4_mode_when_present() {
-        // FH4 fix (v2.0.15): PascalCase key normalizes like the rest.
-        let json = r#"{
-          "SteamFh4Mode": true
-        }"#;
-        let settings = parse_csharp_settings(json).expect("SteamFh4Mode parses");
-        assert!(settings.steam_fh4_mode);
-        let json = r#"{
-          "SteamFh4Mode": false
-        }"#;
-        let settings = parse_csharp_settings(json).expect("SteamFh4Mode false parses");
-        assert!(!settings.steam_fh4_mode);
-    }
-
-    #[test]
-    fn parses_g29_spoof_mode_when_present() {
-        // G29 spoof (v2.0.16): PascalCase key normalizes like the
-        // rest; absent in old settings → default off.
-        let settings = parse_csharp_settings(SAMPLE_SETTINGS_JSON).expect("sample settings parse");
-        assert!(!settings.g29_spoof_mode);
-        let json = r#"{
-          "G29SpoofMode": true
-        }"#;
-        let settings = parse_csharp_settings(json).expect("G29SpoofMode parses");
-        assert!(settings.g29_spoof_mode);
-        let json = r#"{
-          "G29SpoofMode": false
-        }"#;
-        let settings = parse_csharp_settings(json).expect("G29SpoofMode false parses");
-        assert!(!settings.g29_spoof_mode);
-    }
-
-    #[test]
-    fn parses_g29_pedal_layout_and_handbrake_button_when_present() {
-        // G29 settings (v2.0.17): PascalCase keys normalize like the
-        // rest; absent in old settings → layout default, button 8.
-        let settings = parse_csharp_settings(SAMPLE_SETTINGS_JSON).expect("sample settings parse");
-        assert_eq!(settings.g29_pedal_layout, "hidmaestro");
-        assert_eq!(settings.g29_handbrake_button, 8);
-        let json = r#"{
-          "G29PedalLayout": "pcgamingwiki",
-          "G29HandbrakeButton": 12
-        }"#;
-        let settings = parse_csharp_settings(json).expect("G29 settings parse");
-        assert_eq!(settings.g29_pedal_layout, "pcgamingwiki");
-        assert_eq!(settings.g29_handbrake_button, 12);
-    }
-
-    #[test]
-    fn sanitizes_g29_settings_to_defaults() {
-        // G29 settings (v2.0.17): unknown layout → default; 0 → 8;
-        // out of range clamps to the 25-button G29 range; the
-        // canonical layout spelling survives sanitize.
-        let json = r#"{
-          "G29PedalLayout": "Banana",
-          "G29HandbrakeButton": 0
-        }"#;
-        let settings = parse_csharp_settings(json).expect("bad G29 settings parse");
-        assert_eq!(settings.g29_pedal_layout, "hidmaestro");
-        assert_eq!(settings.g29_handbrake_button, 8);
-        let json = r#"{
-          "G29PedalLayout": "PCGamingWiki",
-          "G29HandbrakeButton": 99
-        }"#;
-        let settings = parse_csharp_settings(json).expect("clamped G29 settings parse");
-        assert_eq!(settings.g29_pedal_layout, "pcgamingwiki");
-        assert_eq!(settings.g29_handbrake_button, 25);
-        assert_eq!(canonical_g29_pedal_layout("HIDMAESTRO"), Some("hidmaestro"));
-        assert_eq!(canonical_g29_pedal_layout("nope"), None);
     }
 
     #[test]

@@ -1,26 +1,11 @@
-//! vJoy device-1 configuration as a general wheel (FH4 fix #1).
+//! vJoy device-1 configuration as a general wheel.
 //!
-//! UWP wheel games (Forza Horizon 4/5, Forza Motorsport on the
-//! Store) show no Wheel tab for RSH because of *classification*,
-//! not visibility: both RSH devices are generic HID joysticks with
-//! no `Windows.Gaming.Input` `RacingWheel` classification. The
-//! vJoy half of the fix has two parts — this module is the first:
-//! reconfigure vJoy device 1 to the `EmuWheel` envelope (8 axes,
-//! 128 buttons, 1× 4-direction POV, all FFB effects enabled), so
-//! the device the `GameInput` mapping (written by the installer,
-//! see `installer/rsh.nsi`) points at is the wheel-shaped device a
-//! `Windows.Gaming.Input` wheel game expects. The mapping is a
-//! Windows-level classification, not a per-game hack: no game is
-//! detected, no game-specific key is written — any game that reads
-//! the `RacingWheel` classification sees the same wheel. The
-//! second part — the `1234BEAD00010004` `RacingWheel` registry
-//! mapping itself (plus the HID one) — lives in the installer,
-//! which is already elevated. The app-side repair path is
-//! [`configure_device_1_envelope_and_mappings`]: one elevated
-//! PowerShell run that applies the envelope AND re-writes the
-//! complete mapping tree (both devices) from the same
-//! [`wheel_check::mapping_entries`] source of truth, so a
-//! post-install repair needs exactly one UAC prompt.
+//! RSH feeds vJoy device 1 as a plain joystick (steering, pedals,
+//! handbrake, shifter, horn — see `vjoy.rs`). For games to see a
+//! wheel-shaped device, device 1 must have the envelope shape:
+//! 8 axes, 128 buttons, 1× 4-direction POV, all FFB effects
+//! enabled. This module reconfigures device 1 to that envelope
+//! with vJoy's own CLI — it never hand-builds a HID descriptor.
 //!
 //! # Why `vJoyConfig.exe`, not a hand-built descriptor
 //!
@@ -51,18 +36,15 @@
 //! * `-a x y z rx ry rz sl0 sl1` — the 8 axes. Descriptor order is
 //!   fixed upstream (X, Y, Z, Rx, Ry, Rz, Slider0, Slider1, …), so
 //!   the `RawGameController` axis array a game reads is X=0, Y=1,
-//!   Z=2, Rx=3, Ry=4, Rz=5, Slider=6, Dial=7 — the `GameInput`
-//!   mapping in the installer relies on exactly this order
-//!   (Wheel=X/0, Throttle=Y/1, Brake=Z/2, Handbrake=Slider/6).
-//! * `-b 128` — 128 buttons (the feed already writes buttons
-//!   1–128 across `lButtons` / `lButtonsEx1–3`; see `vjoy.rs`).
+//!   Z=2, Rx=3, Ry=4, Rz=5, Slider=6, Dial=7.
+//! * `-b 128` — 128 buttons (the feed writes buttons 1–128
+//!   across `lButtons` / `lButtonsEx1–3`; see `vjoy.rs`).
 //! * `-s 1` — one *discrete* (4-direction) POV hat. `-p` would be
-//!   a continuous POV; the `EmuWheel` envelope is the 4-direction
-//!   one, and RSH feeds no hat input either way (hats stay neutral).
+//!   a continuous POV; the envelope is the 4-direction one, and
+//!   RSH feeds no hat input either way (hats stay neutral).
 //! * `-e All` — all eleven FFB effects (Const, Ramp, Sq, Sine, Tr,
 //!   `StUp`, `StDn`, Spr, Dm, Inr, Fric). FFB lives in the descriptor's
-//!   FFB section; without it the device reports no force feedback
-//!   and a wheel game has no reason to treat it as a wheel.
+//!   FFB section; without it the device reports no force feedback.
 //!
 //! # Device restart after the config change
 //!
@@ -82,8 +64,7 @@
 //! class: the device node restarts, so the descriptor a game
 //! enumerates afterwards is the new one. A game that already
 //! enumerated the old descriptor still needs a restart; nothing
-//! here can fix that from the RSH side. No strengthening was
-//! needed (FH4 fix, v2.0.14).
+//! here can fix that from the RSH side.
 //!
 //! # Who runs it
 //!
@@ -93,21 +74,17 @@
 //!   `vJoyConfig.exe` directly when vJoy is already installed —
 //!   fresh install and update alike (the install section runs on
 //!   every install). vJoy missing → skipped: the wizard installs
-//!   vJoy later, and the second call site covers that. The
-//!   installer also writes the complete `GameInput` mapping tree
-//!   (both devices) directly.
-//! * [`configure_device_1_envelope_and_mappings`] (Windows-only)
-//!   is the in-app path, called after the wizard's vJoy install
+//!   vJoy later, and the second call site covers that.
+//! * [`configure_device_1_envelope`] (Windows-only) is the
+//!   in-app path, called after the wizard's vJoy install
 //!   (`rsh-app-core`, `run_vjoy_install_inner`). One elevated
-//!   PowerShell run applies the envelope AND the complete mapping
-//!   tree. The daemon runs non-elevated, so this runs elevated via
-//!   PowerShell `Start-Process -Verb RunAs` (one UAC prompt — the
-//!   vJoy installer itself already prompted once). A declined
-//!   prompt, a timeout, or a non-zero exit is a loud failure: the
-//!   caller reports it and points at re-running the RSH installer
-//!   (which writes the envelope *and* the `GameInput` mapping).
-//!   [`configure_device_1_envelope`] (envelope only) is kept for
-//!   callers that only need the envelope.
+//!   PowerShell run applies the envelope. The daemon runs
+//!   non-elevated, so this runs elevated via PowerShell
+//!   `Start-Process -Verb RunAs` (one UAC prompt — the vJoy
+//!   installer itself already prompted once). A declined prompt,
+//!   a timeout, or a non-zero exit is a loud failure: the caller
+//!   reports it and points at re-running the RSH installer
+//!   (which writes the envelope).
 //!
 //! # Verification (and its limit)
 //!
@@ -117,18 +94,27 @@
 //! landed. The real verification is the envelope-shape read: the
 //! connect-time [`validate_envelope`](super::vjoy::validate_envelope)
 //! (which REPORTS a wrong-shaped device instead of refusing it —
-//! feeding keeps working) and the daemon wheel check
-//! ([`super::wheel_check::run_wheel_check`], which re-measures the
-//! mappings + envelope + FFB live and surfaces them as
-//! `VjoyStatus.wheel_check`). An earlier version of these docs
+//! feeding keeps working). An earlier version of these docs
 //! claimed the connect-time caps read "is the verification" —
 //! that was false: the caps read never checked the button count
 //! against 128, Rx/Ry/Rz/Dial, the POVs, or FFB.
 //! The installer additionally checks the descriptor landed by
 //! reading back `HidReportDescriptorSize` for `Device01`.
-//! The only proof a game shows the Wheel tab is the user's PC
-//! retest — in Forza Horizon 4 and in a second game — and nothing
-//! here claims the wheel works in every game.
+//! The only proof a game accepts the wheel is the user's PC
+//! retest — and nothing here claims the wheel works in every game.
+//!
+//! # v2.0.19 cleanup: no more game-classification writes
+//!
+//! v2.0.15–v2.0.18 wrote game-classification data on top of the
+//! envelope: a Steam FH4 `OEMData` wheel flag on the vJoy OEM key
+//! and a `Windows.Gaming.Input` `RacingWheel` mapping tree. Both
+//! are deleted in v2.0.19 — RSH is simply a controller now (vJoy
+//! default, Xbox via `ViGEmBus` as fallback), and games classify
+//! it themselves. The leftover `OEMData` value on a user's PC is
+//! cleaned up in two halves: the installer deletes the HKLM half
+//! at install time, and the daemon deletes the HKCU half on first
+//! start via [`delete_stale_oemdata_hkcu`]. Nothing here ever
+//! writes that value again.
 
 #[cfg(windows)]
 use std::env;
@@ -138,24 +124,23 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// vJoy device id RSH drives (and the only device this module ever
-/// configures). The `GameInput` mapping key `1234BEAD00010004` is
-/// vJoy device 1's VID/PID (`1234`/`BEAD`).
-pub const VJOY_FH4_DEVICE_ID: u32 = 1;
+/// configures).
+pub const VJOY_DEVICE_ID: u32 = 1;
 /// File name of vJoy's command-line config tool. Shipped with the
 /// driver (never bundled by RSH, same as `vJoyInterface.dll`).
 pub const VJOY_CONFIG_EXE_FILE_NAME: &str = "vJoyConfig.exe";
-/// The `EmuWheel` envelope's axes, in vJoyConfig `-a` spelling.
-/// Descriptor order is fixed upstream (X, Y, Z, Rx, Ry, Rz,
-/// Slider0, Slider1), so these are `RawGameController` axes 0–7.
-pub const VJOY_FH4_AXES: [&str; 8] = ["x", "y", "z", "rx", "ry", "rz", "sl0", "sl1"];
-/// The `EmuWheel` envelope's button count (`-b`).
-pub const VJOY_FH4_BUTTONS: i32 = 128;
-/// The `EmuWheel` envelope's discrete (4-direction) POV hat count
-/// (`-s`). RSH feeds no hat input; the hat exists so the device
-/// shape matches the envelope.
-pub const VJOY_FH4_DISCRETE_POVS: i32 = 1;
-/// The `EmuWheel` envelope's FFB effects (`-e`): all eleven.
-pub const VJOY_FH4_FFB_EFFECTS: &str = "All";
+/// The envelope's axes, in vJoyConfig `-a` spelling. Descriptor
+/// order is fixed upstream (X, Y, Z, Rx, Ry, Rz, Slider0,
+/// Slider1), so these are `RawGameController` axes 0–7.
+pub const VJOY_ENVELOPE_AXES: [&str; 8] = ["x", "y", "z", "rx", "ry", "rz", "sl0", "sl1"];
+/// The envelope's button count (`-b`).
+pub const VJOY_ENVELOPE_BUTTONS: i32 = 128;
+/// The envelope's discrete (4-direction) POV hat count (`-s`).
+/// RSH feeds no hat input; the hat exists so the device shape
+/// matches the envelope.
+pub const VJOY_ENVELOPE_DISCRETE_POVS: i32 = 1;
+/// The envelope's FFB effects (`-e`): all eleven.
+pub const VJOY_ENVELOPE_FFB_EFFECTS: &str = "All";
 
 /// Registry subkey (under HKLM) where vJoy stores device 1's HID
 /// report descriptor — the shape `vJoyConfig.exe` writes. The
@@ -168,58 +153,12 @@ pub const VJOY_DEVICE1_REGISTRY_SUBKEY: &str =
 /// descriptor's byte size (`REG_DWORD`).
 pub const VJOY_DESCRIPTOR_SIZE_VALUE: &str = "HidReportDescriptorSize";
 
-/// Steam FH4 wheel flag (FH4 fix, v2.0.15): the registry value that
-/// makes Steam Forza Horizon 4 show the Wheel tab for vJoy device 1.
-///
-/// The user's own PC test proved `OEMData` =
-/// `40 00 00 00 00 00 00 00` on the vJoy device key makes FH4 (Steam)
-/// show the Wheel tab. The flag is written to BOTH hives of the
-/// vJoy OEM key below — never to the HID key
-/// (`VID_1209&PID_5253`): the HID backend must never be flagged
-/// (A4 — no source or test says the flag works there, and the
-/// `GameInput` mapping already classifies it).
-///
-/// # Which hive is which
-///
-/// * HKCU is written in-process by [`set_wheel_flag`] via the
-///   `windows` crate: the daemon runs as the logged-in user, not
-///   SYSTEM or a service (autostart is the per-user HKCU Run key,
-///   the IPC pipe carries a current-user-only DACL, and the design
-///   is "daemon must never run elevated" — see `rsh-daemon`'s
-///   `main.rs` elevation log and `tray_autostart.rs`), so the
-///   daemon's HKCU IS the user's HKCU. The UAC-elevated run below
-///   is the same user with an elevated token, so its HKCU is the
-///   same hive — the HKCU lines in [`wheel_flag_script`] are the
-///   in-process half's mirror, kept so the script is the complete,
-///   standalone operation.
-/// * HKLM needs elevation, so it goes through the same elevated
-///   PowerShell pattern as
-///   [`configure_device_1_envelope_and_mappings`] (one UAC prompt).
-///   When HKLM already holds the desired state, no prompt happens
-///   at all ([`set_wheel_flag`] reads first).
-///
-/// Disabling deletes ONLY the `OEMData` value — never the whole key
-/// (it is vJoy's key, not RSH's).
-pub const WHEEL_FLAG_OEM_SUBKEY: &str = r"SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_1234&PID_BEAD";
-/// Value name under [`WHEEL_FLAG_OEM_SUBKEY`] holding the wheel flag.
-pub const WHEEL_FLAG_VALUE_NAME: &str = "OEMData";
-/// The exact wheel-flag bytes (FH4 fix, v2.0.15): `40 00 00 00 00
-/// 00 00 00` — verified on the user's PC, not a guess.
-pub const WHEEL_FLAG_BYTES: [u8; 8] = [0x40, 0, 0, 0, 0, 0, 0, 0];
-/// [`WHEEL_FLAG_BYTES`] as the `reg add /t REG_BINARY /d` hex
-/// spelling (no spaces, no commas — that is what `reg.exe` takes).
-pub const WHEEL_FLAG_HEX: &str = "4000000000000000";
-/// RSH's own registry subkey (under HKLM), holding the installer
-/// marker below. Never a joystick key — nothing here is ever read
-/// by a game.
-pub const RSH_REGISTRY_SUBKEY: &str = r"Software\RSH";
-/// Installer marker value under [`RSH_REGISTRY_SUBKEY`]: the
-/// installer checkbox ("Steam version of FH4") writes
-/// `SteamFh4OemData` `REG_DWORD` 1. The daemon adopts it on read
-/// (mode on when the marker exists and the config is off) and
-/// deletes it when the mode is toggled off. RSH never WRITES this
-/// marker — only the installer does.
-pub const STEAM_FH4_MARKER_VALUE: &str = "SteamFh4OemData";
+/// Registry subkey (under HKCU) where v2.0.15–v2.0.18 wrote the
+/// Steam FH4 `OEMData` wheel flag. v2.0.19 deletes the value
+/// (see [`delete_stale_oemdata_hkcu`]); nothing writes it again.
+pub const STALE_OEMDATA_SUBKEY: &str = r"SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_1234&PID_BEAD";
+/// Value name under [`STALE_OEMDATA_SUBKEY`] holding the stale flag.
+pub const STALE_OEMDATA_VALUE_NAME: &str = "OEMData";
 
 /// Everything that can go wrong configuring vJoy device 1.
 ///
@@ -262,30 +201,30 @@ impl fmt::Display for VJoyConfigError {
 
 impl std::error::Error for VJoyConfigError {}
 
-/// The exact `vJoyConfig.exe` argument list for the `EmuWheel`
-/// envelope on device 1 (no program name — the caller supplies
-/// the resolved exe path).
+/// The exact `vJoyConfig.exe` argument list for the envelope on
+/// device 1 (no program name — the caller supplies the resolved
+/// exe path).
 ///
 /// `1 -f -a x y z rx ry rz sl0 sl1 -b 128 -s 1 -e All`
 /// (see the module docs for what each flag means and where it was
 /// verified). Pure, so the installer and the tests share the one
 /// spelling — a drift between them would configure a different
-/// device than the `GameInput` mapping expects.
+/// device than the feed expects.
 #[must_use]
 pub fn vjoy_config_argv() -> Vec<String> {
     let mut argv = vec![
-        VJOY_FH4_DEVICE_ID.to_string(),
+        VJOY_DEVICE_ID.to_string(),
         "-f".to_string(),
         "-a".to_string(),
     ];
-    argv.extend(VJOY_FH4_AXES.iter().map(|axis| (*axis).to_string()));
+    argv.extend(VJOY_ENVELOPE_AXES.iter().map(|axis| (*axis).to_string()));
     argv.extend([
         "-b".to_string(),
-        VJOY_FH4_BUTTONS.to_string(),
+        VJOY_ENVELOPE_BUTTONS.to_string(),
         "-s".to_string(),
-        VJOY_FH4_DISCRETE_POVS.to_string(),
+        VJOY_ENVELOPE_DISCRETE_POVS.to_string(),
         "-e".to_string(),
-        VJOY_FH4_FFB_EFFECTS.to_string(),
+        VJOY_ENVELOPE_FFB_EFFECTS.to_string(),
     ]);
     argv
 }
@@ -331,7 +270,7 @@ pub fn resolve_vjoy_config_path_from_env(
 /// wait includes the user answering the UAC prompt).
 pub const VJOY_CONFIG_TIMEOUT_SECS: u64 = 120;
 
-/// Configure vJoy device 1 to the `EmuWheel` envelope (Windows-only).
+/// Configure vJoy device 1 to the envelope (Windows-only).
 ///
 /// Locates `vJoyConfig.exe` ([`resolve_vjoy_config_path`]) and runs
 /// it elevated (`Start-Process -Verb RunAs`, one UAC prompt) with
@@ -371,31 +310,21 @@ pub fn configure_device_1_envelope() -> Result<(), VJoyConfigError> {
         return Ok(());
     }
     Err(VJoyConfigError::Failed(format!(
-        "vJoyConfig.exe failed (exit {}) — the device-1 envelope was not applied. If the UAC prompt was declined, accept it; otherwise re-run the RSH installer, which writes the envelope and the Windows.Gaming.Input RacingWheel mapping together.",
+        "vJoyConfig.exe failed (exit {}) — the device-1 envelope was not applied. If the UAC prompt was declined, accept it; otherwise re-run the RSH installer, which writes the envelope.",
         status.code().unwrap_or(-1)
     )))
 }
 
-/// The PowerShell script (one file) that applies the envelope AND
-/// the complete `GameInput` mapping tree, for one elevated run.
+/// The PowerShell script (one file) that applies the envelope, for
+/// one elevated run.
 ///
-/// Pure — testable on any OS. The script:
-/// * runs `vJoyConfig.exe` with [`vjoy_config_argv`] and exits with
-///   its exit code on failure (the envelope step);
-/// * then writes every mapping entry of both devices with `reg add`
-///   (`/f`, output silenced) and exits 1 on the first failed write;
-/// * exits 0 when everything landed.
-///
-/// The entries come from [`wheel_check::mapping_entries`], the same
-/// source of truth the self-check verifies and the installer
-/// mirrors — a drift would fail the installer's mapping test.
-/// `reg.exe` runs from the elevated 64-bit PowerShell, so it writes
-/// the native 64-bit registry view — the same view the installer
-/// targets with `SetRegView 64` and the view 64-bit games read.
+/// Pure — testable on any OS. The script runs `vJoyConfig.exe`
+/// with [`vjoy_config_argv`] and exits with its exit code on
+/// failure, else exits 0. No game-classification registry writes:
+/// v2.0.19 deleted the `GameInput` mapping tree — the envelope is
+/// the whole script.
 #[must_use]
 pub fn wheel_setup_script(tool: &Path) -> String {
-    use crate::wheel_check::{HID_EXPECTED_MAPPING, VJOY_EXPECTED_MAPPING, mapping_entries};
-    use crate::wheel_check::{HID_GAMEINPUT_SUBKEY, MappingValue, VJOY_GAMEINPUT_SUBKEY};
     use std::fmt::Write as _;
     let mut script = String::new();
     let args = vjoy_config_argv().join(" ");
@@ -405,348 +334,40 @@ pub fn wheel_setup_script(tool: &Path) -> String {
         tool.display()
     );
     let _ = writeln!(script, "if ($p.ExitCode -ne 0) {{ exit $p.ExitCode }}");
-    for (device_subkey, expected) in [
-        (VJOY_GAMEINPUT_SUBKEY, VJOY_EXPECTED_MAPPING),
-        (HID_GAMEINPUT_SUBKEY, HID_EXPECTED_MAPPING),
-    ] {
-        for entry in mapping_entries(&expected) {
-            let full_key = if entry.subkey.is_empty() {
-                device_subkey.to_string()
-            } else {
-                format!("{device_subkey}\\{}", entry.subkey)
-            };
-            let (kind, value) = match entry.value {
-                MappingValue::Str(text) => ("REG_SZ", format!("\"{text}\"")),
-                MappingValue::Dword(number) => ("REG_DWORD", number.to_string()),
-            };
-            let _ = writeln!(
-                script,
-                "reg add \"HKLM\\{full_key}\" /v \"{}\" /t {kind} /d {value} /f > $null",
-                entry.name
-            );
-            let _ = writeln!(script, "if ($LASTEXITCODE -ne 0) {{ exit 1 }}");
-        }
-    }
     script.push_str("exit 0\n");
     script
 }
 
-/// Configure vJoy device 1 AND re-write the complete `GameInput`
-/// mapping tree (Windows-only) — the in-app repair path, called
-/// after the wizard's vJoy install
-/// (`rsh-app-core`, `run_vjoy_install_inner`).
+/// Delete the stale Steam FH4 `OEMData` wheel flag from HKCU
+/// (v2.0.19 cleanup, Windows-only, best-effort, never fails).
 ///
-/// Writes [`wheel_setup_script`] to a temp `.ps1` file and runs it
-/// elevated in ONE PowerShell (`Start-Process -Verb RunAs` — one
-/// UAC prompt for the envelope + both mappings together), waiting
-/// at most [`VJOY_CONFIG_TIMEOUT_SECS`] seconds. The temp script
-/// is removed afterwards (best effort).
-///
-/// # Errors
-///
-/// [`VJoyConfigError::ToolNotFound`] when vJoy is not installed,
-/// [`VJoyConfigError::SpawnFailed`] when the elevated run could
-/// not be started, [`VJoyConfigError::TimedOut`] when it did not
-/// finish in time (child killed), [`VJoyConfigError::Failed`]
-/// when it exited non-zero (including a declined UAC prompt, or a
-/// failed `reg add` — the mapping was not fully written).
-#[cfg(windows)]
-pub fn configure_device_1_envelope_and_mappings() -> Result<(), VJoyConfigError> {
-    let tool = resolve_vjoy_config_path().ok_or(VJoyConfigError::ToolNotFound)?;
-    let script = wheel_setup_script(&tool);
-    let dir = std::env::temp_dir().join("RSH");
-    std::fs::create_dir_all(&dir).map_err(|error| {
-        VJoyConfigError::SpawnFailed(format!("could not create the temp folder: {error}"))
-    })?;
-    let ps1 = dir.join("rsh-wheel-setup.ps1");
-    std::fs::write(&ps1, script).map_err(|error| {
-        VJoyConfigError::SpawnFailed(format!("could not write the wheel setup script: {error}"))
-    })?;
-    // One elevated PowerShell runs the script file; `-PassThru`
-    // + `exit $p.ExitCode` propagates the script's exit code, so
-    // a declined UAC prompt (Start-Process throws) and a failed
-    // envelope/mapping step both surface as non-zero here.
-    let runner = format!(
-        "$p = Start-Process -FilePath \"powershell.exe\" -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','{}') -Verb RunAs -Wait -PassThru; exit $p.ExitCode",
-        ps1.display()
-    );
-    let outcome = run_powershell(&runner);
-    let _ = std::fs::remove_file(&ps1);
-    let status = outcome?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(VJoyConfigError::Failed(format!(
-        "the wheel setup failed (exit {}) — vJoy device 1 and/or the Windows.Gaming.Input RacingWheel mapping were not fully applied. If the UAC prompt was declined, accept it; otherwise re-run the RSH installer, which writes the envelope and the mapping together.",
-        status.code().unwrap_or(-1)
-    )))
-}
-
-/// The `reg add` / `reg delete` lines for the wheel flag in one
-/// hive (`"HKCU"` or `"HKLM"`), as PowerShell lines.
-///
-/// Enable writes [`WHEEL_FLAG_BYTES`] as `REG_BINARY` and aborts
-/// the script on failure (a write must land). Disable deletes ONLY
-/// the `OEMData` value — never the key — and never aborts: deleting
-/// an already-absent value is the goal state, not a failure (and
-/// `reg delete` exits 1 for both "value missing" and "access
-/// denied", so the exit code cannot tell them apart).
-fn wheel_flag_lines(hive: &str, enable: bool) -> String {
-    use std::fmt::Write as _;
-    let mut lines = String::new();
-    if enable {
-        let _ = writeln!(
-            lines,
-            "reg add \"{hive}\\{WHEEL_FLAG_OEM_SUBKEY}\" /v \"{WHEEL_FLAG_VALUE_NAME}\" /t REG_BINARY /d {WHEEL_FLAG_HEX} /f > $null"
-        );
-        let _ = writeln!(lines, "if ($LASTEXITCODE -ne 0) {{ exit 1 }}");
-    } else {
-        let _ = writeln!(
-            lines,
-            "reg delete \"{hive}\\{WHEEL_FLAG_OEM_SUBKEY}\" /v \"{WHEEL_FLAG_VALUE_NAME}\" /f > $null 2>&1"
-        );
-    }
-    lines
-}
-
-/// The PowerShell script (one file) that applies the Steam FH4
-/// wheel flag to BOTH hives.
-///
-/// Pure — testable on any OS. Enable writes
-/// [`WHEEL_FLAG_BYTES`] (`REG_BINARY`, exact hex
-/// `4000000000000000`) to the vJoy OEM key in HKCU and HKLM;
-/// disable deletes only the `OEMData` value in both hives (never
-/// the key — it is vJoy's). A failed enable write aborts the
-/// script with exit 1; a delete never aborts (see
-/// [`wheel_flag_lines`]).
-#[must_use]
-pub fn wheel_flag_script(enable: bool) -> String {
-    let mut script = wheel_flag_lines("HKCU", enable);
-    script.push_str(&wheel_flag_lines("HKLM", enable));
-    script.push_str("exit 0\n");
-    script
-}
-
-/// The `reg delete` line that removes the installer marker
-/// ([`STEAM_FH4_MARKER_VALUE`] under HKLM
-/// [`RSH_REGISTRY_SUBKEY`]). Pure — testable on any OS. Never
-/// aborts: a missing marker is the goal state, not a failure.
-#[must_use]
-pub fn steam_fh4_marker_delete_script() -> String {
-    format!(
-        "reg delete \"HKLM\\{RSH_REGISTRY_SUBKEY}\" /v \"{STEAM_FH4_MARKER_VALUE}\" /f > $null 2>&1\n"
-    )
-}
-
-/// The HKLM half of [`wheel_flag_script`] (plus the marker delete
-/// when asked): the part [`set_wheel_flag`] runs elevated. HKCU is
-/// written in-process instead — the elevated run is the same user,
-/// so running the HKCU lines elevated too would be redundant.
-#[cfg(windows)]
-fn wheel_flag_hklm_script(enable: bool, delete_marker: bool) -> String {
-    let mut script = wheel_flag_lines("HKLM", enable);
-    if delete_marker {
-        script.push_str(&steam_fh4_marker_delete_script());
-    }
-    script.push_str("exit 0\n");
-    script
-}
-
-/// Whether the installer marker is present (Windows-only): HKLM
-/// [`RSH_REGISTRY_SUBKEY`] value [`STEAM_FH4_MARKER_VALUE`]
-/// `REG_DWORD` 1. Any read failure (key missing, value missing or
-/// wrong type/value) is "absent" — the marker is advisory, never
-/// load-bearing. Always `false` off Windows.
-#[must_use]
-pub fn steam_fh4_marker_present() -> bool {
+/// v2.0.15–v2.0.18 wrote `OEMData` =
+/// `40 00 00 00 00 00 00 00` under [`STALE_OEMDATA_SUBKEY`] to
+/// make Steam Forza Horizon 4 show its Wheel tab. v2.0.19 removed
+/// that mode entirely, so the value is dead weight — worse, the
+/// Steam guide warns a stale value can confuse the Store build.
+/// The daemon calls this once on first start (the installer
+/// deletes the HKLM half at install time). A missing key or value
+/// is already the goal state; any failure is swallowed, because a
+/// cleanup must never block startup or surface an error for a
+/// value nobody needs anymore. Off Windows this is a no-op.
+pub fn delete_stale_oemdata_hkcu() {
     #[cfg(windows)]
     {
-        use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
-        read_registry_dword(
-            HKEY_LOCAL_MACHINE,
-            RSH_REGISTRY_SUBKEY,
-            STEAM_FH4_MARKER_VALUE,
-        )
-        .is_some_and(|value| value == 1)
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
+        use windows::Win32::System::Registry::{
+            HKEY_CURRENT_USER, KEY_SET_VALUE, RegCloseKey, RegDeleteValueW, RegOpenKeyExW,
+        };
+        use windows::core::PCWSTR;
 
-/// Set (or clear) the Steam FH4 wheel flag (Windows-only).
-///
-/// HKCU is written in-process (the daemon runs as the logged-in
-/// user — see the [`WHEEL_FLAG_OEM_SUBKEY`] docs); HKLM goes
-/// through one elevated PowerShell run of the HKLM half of
-/// [`wheel_flag_script`] — unless HKLM already holds the desired
-/// state, in which case no UAC prompt happens at all. Only ever
-/// touches the vJoy key (`VID_1234&PID_BEAD`); the HID key is
-/// never written. Disable deletes only the `OEMData` value, never
-/// the key.
-///
-/// All-or-nothing from the caller's view: when the HKLM step fails
-/// after HKCU was changed, HKCU is restored to its prior state
-/// best-effort (in-process, no prompt), so a declined UAC prompt
-/// leaves no half-applied flag behind.
-///
-/// # Errors
-///
-/// [`VJoyConfigError::SpawnFailed`] when the HKCU write or the
-/// elevated run could not be started, [`VJoyConfigError::TimedOut`]
-/// when the elevated run did not finish in time,
-/// [`VJoyConfigError::Failed`] when the elevated run failed
-/// (including a declined UAC prompt) or the HKCU write failed.
-/// Off Windows this always fails: the flag is Windows-only.
-#[cfg(windows)]
-pub fn set_wheel_flag(enable: bool) -> Result<(), VJoyConfigError> {
-    set_wheel_flag_inner(enable, false)
-}
-
-/// Set (or clear) the wheel flag AND delete the installer marker
-/// (Windows-only) — the toggle-off path: turning the mode off
-/// removes both the flag and the marker that would re-adopt it on
-/// the next read. The marker delete rides in the same elevated run
-/// as the HKLM flag delete, so toggle-off costs one UAC prompt,
-/// not two. Off Windows this always fails, like
-/// [`set_wheel_flag`].
-///
-/// # Errors
-///
-/// Same as [`set_wheel_flag`].
-#[cfg(windows)]
-pub fn set_wheel_flag_and_clear_marker(enable: bool) -> Result<(), VJoyConfigError> {
-    set_wheel_flag_inner(enable, true)
-}
-
-/// Off-Windows stub for [`set_wheel_flag`]: the flag is
-/// Windows-only, so this always fails.
-///
-/// # Errors
-///
-/// Always [`VJoyConfigError::Failed`] — the registry write cannot
-/// run off Windows.
-#[cfg(not(windows))]
-pub fn set_wheel_flag(_enable: bool) -> Result<(), VJoyConfigError> {
-    Err(VJoyConfigError::Failed(
-        "Steam FH4 wheel mode is Windows-only — the OEMData flag can only be written on Windows."
-            .to_string(),
-    ))
-}
-
-/// Off-Windows stub for [`set_wheel_flag_and_clear_marker`]: the
-/// flag is Windows-only, so this always fails.
-///
-/// # Errors
-///
-/// Always [`VJoyConfigError::Failed`] — the registry write cannot
-/// run off Windows.
-#[cfg(not(windows))]
-pub fn set_wheel_flag_and_clear_marker(_enable: bool) -> Result<(), VJoyConfigError> {
-    Err(VJoyConfigError::Failed(
-        "Steam FH4 wheel mode is Windows-only — the OEMData flag can only be written on Windows."
-            .to_string(),
-    ))
-}
-
-/// Shared implementation of [`set_wheel_flag`] and
-/// [`set_wheel_flag_and_clear_marker`] (Windows-only).
-#[cfg(windows)]
-fn set_wheel_flag_inner(enable: bool, delete_marker: bool) -> Result<(), VJoyConfigError> {
-    // HKCU first, in-process (no prompt): if THIS fails, nothing
-    // else is attempted, so no half-applied state exists.
-    write_wheel_flag_hkcu(enable)?;
-    // HKLM: skip the prompt entirely when already in the desired state.
-    let hklm_done = read_wheel_flag_hklm().is_some_and(|bytes| {
-        if enable {
-            bytes == WHEEL_FLAG_BYTES
-        } else {
-            false // absent is the goal; a present value (any bytes) needs deleting
+        fn wide(text: &str) -> Vec<u16> {
+            text.encode_utf16().chain(std::iter::once(0)).collect()
         }
-    });
-    let marker_done = !delete_marker || !steam_fh4_marker_present();
-    if hklm_done && marker_done {
-        return Ok(());
-    }
-    let script = wheel_flag_hklm_script(enable, delete_marker);
-    match run_wheel_flag_script_elevated(&script) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            // Best-effort rollback of the HKCU half, so a declined
-            // UAC prompt leaves no half-applied flag: enable
-            // restores "absent", disable restores the flag bytes.
-            let _ = write_wheel_flag_hkcu(!enable);
-            Err(error)
-        }
-    }
-}
 
-/// Write (or delete) the wheel flag in HKCU, in-process
-/// (Windows-only). Creating the OEM subkey when missing is fine —
-/// it is vJoy's key shape, and the value is what matters. Deleting
-/// a missing key/value is success (goal state: absent).
-#[cfg(windows)]
-fn write_wheel_flag_hkcu(enable: bool) -> Result<(), VJoyConfigError> {
-    use windows::Win32::System::Registry::{
-        HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_BINARY, REG_OPTION_NON_VOLATILE, RegCloseKey,
-        RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW,
-    };
-    use windows::core::PCWSTR;
-
-    fn wide(text: &str) -> Vec<u16> {
-        text.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-
-    let subkey_w = wide(WHEEL_FLAG_OEM_SUBKEY);
-    let value_w = wide(WHEEL_FLAG_VALUE_NAME);
-    if enable {
-        let mut key = HKEY::default();
-        let class_w = wide("");
-        // SAFETY: `RegCreateKeyExW` with valid NUL-terminated wide
+        let subkey_w = wide(STALE_OEMDATA_SUBKEY);
+        let value_w = wide(STALE_OEMDATA_VALUE_NAME);
+        let mut key = windows::Win32::System::Registry::HKEY::default();
+        // SAFETY: `RegOpenKeyExW` with valid NUL-terminated wide
         // strings; `key` is closed below on every path that opened it.
-        let created = unsafe {
-            RegCreateKeyExW(
-                HKEY_CURRENT_USER,
-                PCWSTR::from_raw(subkey_w.as_ptr()),
-                Some(0),
-                PCWSTR::from_raw(class_w.as_ptr()),
-                REG_OPTION_NON_VOLATILE,
-                KEY_SET_VALUE,
-                None,
-                &raw mut key,
-                None,
-            )
-        };
-        if created.0 != 0 {
-            return Err(VJoyConfigError::Failed(format!(
-                "could not open the vJoy wheel-flag key in HKCU (Win32 error {}) — the Steam FH4 wheel flag was not written. Re-run the RSH installer.",
-                created.0
-            )));
-        }
-        // SAFETY: `key` is open; the byte slice is the exact flag.
-        let written = unsafe {
-            RegSetValueExW(
-                key,
-                PCWSTR::from_raw(value_w.as_ptr()),
-                Some(0),
-                REG_BINARY,
-                Some(&WHEEL_FLAG_BYTES),
-            )
-        };
-        // SAFETY: closing an open key.
-        let _ = unsafe { RegCloseKey(key) };
-        if written.0 != 0 {
-            return Err(VJoyConfigError::Failed(format!(
-                "could not write the Steam FH4 wheel flag (OEMData) to HKCU (Win32 error {}) — the flag was not applied. Re-run the RSH installer.",
-                written.0
-            )));
-        }
-        Ok(())
-    } else {
-        let mut key = HKEY::default();
-        // SAFETY: `RegOpenKeyExW` with a valid NUL-terminated wide
-        // string; `key` is closed below on every path that opened it.
         let opened = unsafe {
             RegOpenKeyExW(
                 HKEY_CURRENT_USER,
@@ -757,186 +378,19 @@ fn write_wheel_flag_hkcu(enable: bool) -> Result<(), VJoyConfigError> {
             )
         };
         if opened.0 != 0 {
-            // Key missing (or unreadable): the value is absent, which
-            // is the goal state — success, not an error.
-            return Ok(());
+            return; // Key missing: the value is absent — goal state.
         }
         // SAFETY: `key` is open; deleting a missing value is the
-        // goal state too.
-        let deleted = unsafe { RegDeleteValueW(key, PCWSTR::from_raw(value_w.as_ptr())) };
+        // goal state too, and the result is ignored on purpose.
+        let _ = unsafe { RegDeleteValueW(key, PCWSTR::from_raw(value_w.as_ptr())) };
         // SAFETY: closing an open key.
         let _ = unsafe { RegCloseKey(key) };
-        if deleted.0 != 0 && deleted != windows::Win32::Foundation::ERROR_FILE_NOT_FOUND {
-            return Err(VJoyConfigError::Failed(format!(
-                "could not delete the Steam FH4 wheel flag (OEMData) from HKCU (Win32 error {}) — the flag may still be set. Re-run the RSH installer.",
-                deleted.0
-            )));
-        }
-        Ok(())
     }
-}
-
-/// Read the wheel flag's current HKLM bytes (Windows-only):
-/// `Some(bytes)` when the `OEMData` value exists and is
-/// `REG_BINARY`, else `None` (key/value missing, wrong type, or
-/// any read failure — all mean "not in the desired state").
-#[cfg(windows)]
-fn read_wheel_flag_hklm() -> Option<Vec<u8>> {
-    use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
-    read_registry_binary(
-        HKEY_LOCAL_MACHINE,
-        WHEEL_FLAG_OEM_SUBKEY,
-        WHEEL_FLAG_VALUE_NAME,
-    )
-}
-
-/// Read one value's raw bytes + type (Windows-only, same probe
-/// pattern as `wheel_check::query_value` — `KEY_READ`, never a
-/// write). `None` on any failure.
-#[cfg(windows)]
-fn read_registry_value(
-    hkey: windows::Win32::System::Registry::HKEY,
-    subkey: &str,
-    value_name: &str,
-) -> Option<(windows::Win32::System::Registry::REG_VALUE_TYPE, Vec<u8>)> {
-    use windows::Win32::System::Registry::{
-        KEY_READ, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
-    };
-    use windows::core::PCWSTR;
-
-    fn wide(text: &str) -> Vec<u16> {
-        text.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-
-    let subkey_w = wide(subkey);
-    let value_w = wide(value_name);
-    let mut key = windows::Win32::System::Registry::HKEY::default();
-    // SAFETY: `RegOpenKeyExW` with valid NUL-terminated wide strings;
-    // `key` is closed below on every path that opened it.
-    let opened = unsafe {
-        RegOpenKeyExW(
-            hkey,
-            PCWSTR::from_raw(subkey_w.as_ptr()),
-            Some(0),
-            KEY_READ,
-            &raw mut key,
-        )
-    };
-    if opened.0 != 0 {
-        return None;
-    }
-    let mut byte_len: u32 = 0;
-    let mut value_type = REG_VALUE_TYPE::default();
-    // SAFETY: size probe — `lpData` is null, so only `byte_len` (and
-    // the type) are written.
-    let probed = unsafe {
-        RegQueryValueExW(
-            key,
-            PCWSTR::from_raw(value_w.as_ptr()),
-            None,
-            Some(&raw mut value_type),
-            None,
-            Some(&raw mut byte_len),
-        )
-    };
-    if probed.0 != 0 || byte_len == 0 {
-        // SAFETY: closing an open key.
-        let _ = unsafe { RegCloseKey(key) };
-        return None;
-    }
-    let mut buf = vec![0u8; usize::try_from(byte_len).unwrap_or(0)];
-    // SAFETY: `key` is open; `buf` is a live byte buffer of the
-    // declared byte length; the call only writes into it.
-    let queried = unsafe {
-        RegQueryValueExW(
-            key,
-            PCWSTR::from_raw(value_w.as_ptr()),
-            None,
-            Some(&raw mut value_type),
-            Some(buf.as_mut_ptr()),
-            Some(&raw mut byte_len),
-        )
-    };
-    // SAFETY: closing an open key.
-    let _ = unsafe { RegCloseKey(key) };
-    if queried.0 != 0 {
-        return None;
-    }
-    buf.truncate(usize::try_from(byte_len).unwrap_or(0));
-    Some((value_type, buf))
-}
-
-/// Read one `REG_BINARY` value's raw bytes (Windows-only).
-/// `None` on any failure or when the type is not `REG_BINARY`.
-#[cfg(windows)]
-fn read_registry_binary(
-    hkey: windows::Win32::System::Registry::HKEY,
-    subkey: &str,
-    value_name: &str,
-) -> Option<Vec<u8>> {
-    use windows::Win32::System::Registry::REG_BINARY;
-    read_registry_value(hkey, subkey, value_name)
-        .and_then(|(value_type, bytes)| (value_type == REG_BINARY).then_some(bytes))
-}
-
-/// Read one `REG_DWORD` value (Windows-only). `None` on any failure
-/// or when the type is not `REG_DWORD`.
-#[cfg(windows)]
-fn read_registry_dword(
-    hkey: windows::Win32::System::Registry::HKEY,
-    subkey: &str,
-    value_name: &str,
-) -> Option<u32> {
-    use windows::Win32::System::Registry::REG_DWORD;
-    read_registry_value(hkey, subkey, value_name).and_then(|(value_type, bytes)| {
-        if value_type != REG_DWORD || bytes.len() < 4 {
-            return None;
-        }
-        Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    })
-}
-
-/// Run one HKLM wheel-flag script elevated (Windows-only): writes
-/// the script to a temp `.ps1` file and runs it with
-/// `Start-Process -Verb RunAs` (one UAC prompt), mirroring
-/// [`configure_device_1_envelope_and_mappings`]. The temp script
-/// is removed afterwards (best effort).
-///
-/// # Errors
-///
-/// [`VJoyConfigError::SpawnFailed`] when the temp script could not
-/// be written, [`VJoyConfigError::TimedOut`] when the run did not
-/// finish in time, [`VJoyConfigError::Failed`] when it exited
-/// non-zero (including a declined UAC prompt).
-#[cfg(windows)]
-fn run_wheel_flag_script_elevated(script: &str) -> Result<(), VJoyConfigError> {
-    let dir = std::env::temp_dir().join("RSH");
-    std::fs::create_dir_all(&dir).map_err(|error| {
-        VJoyConfigError::SpawnFailed(format!("could not create the temp folder: {error}"))
-    })?;
-    let ps1 = dir.join("rsh-wheel-flag.ps1");
-    std::fs::write(&ps1, script).map_err(|error| {
-        VJoyConfigError::SpawnFailed(format!("could not write the wheel flag script: {error}"))
-    })?;
-    let runner = format!(
-        "$p = Start-Process -FilePath \"powershell.exe\" -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','{}') -Verb RunAs -Wait -PassThru; exit $p.ExitCode",
-        ps1.display()
-    );
-    let outcome = run_powershell(&runner);
-    let _ = std::fs::remove_file(&ps1);
-    let status = outcome?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(VJoyConfigError::Failed(format!(
-        "the Steam FH4 wheel flag was not fully applied (exit {}) — the HKLM half needs elevation. If the UAC prompt was declined, accept it and toggle the mode again; otherwise re-run the RSH installer.",
-        status.code().unwrap_or(-1)
-    )))
 }
 
 /// Run one (already complete) PowerShell `-Command` script and
 /// wait for it, bounded by [`VJOY_CONFIG_TIMEOUT_SECS`]
-/// (Windows-only shared helper for the two elevated entry points
+/// (Windows-only shared helper for the elevated entry point
 /// above — the wait/timeout mapping lives in exactly one place).
 ///
 /// # Errors
@@ -987,7 +441,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn argv_is_the_exact_emu_wheel_envelope() {
+    fn argv_is_the_exact_envelope() {
         assert_eq!(
             vjoy_config_argv(),
             vec![
@@ -1000,23 +454,23 @@ mod tests {
     #[test]
     fn argv_targets_device_1_only_and_forces() {
         let argv = vjoy_config_argv();
-        assert_eq!(argv[0], VJOY_FH4_DEVICE_ID.to_string());
-        assert_eq!(VJOY_FH4_DEVICE_ID, 1);
+        assert_eq!(argv[0], VJOY_DEVICE_ID.to_string());
+        assert_eq!(VJOY_DEVICE_ID, 1);
         assert_eq!(argv[1], "-f");
         // No other device id appears anywhere in the argv.
         assert!(!argv[2..].iter().any(|arg| arg == "2"));
     }
 
     #[test]
-    fn envelope_constants_are_the_emu_wheel_shape() {
-        assert_eq!(VJOY_FH4_AXES.len(), 8);
+    fn envelope_constants_are_the_device_shape() {
+        assert_eq!(VJOY_ENVELOPE_AXES.len(), 8);
         assert_eq!(
-            VJOY_FH4_AXES,
+            VJOY_ENVELOPE_AXES,
             ["x", "y", "z", "rx", "ry", "rz", "sl0", "sl1"]
         );
-        assert_eq!(VJOY_FH4_BUTTONS, 128);
-        assert_eq!(VJOY_FH4_DISCRETE_POVS, 1);
-        assert_eq!(VJOY_FH4_FFB_EFFECTS, "All");
+        assert_eq!(VJOY_ENVELOPE_BUTTONS, 128);
+        assert_eq!(VJOY_ENVELOPE_DISCRETE_POVS, 1);
+        assert_eq!(VJOY_ENVELOPE_FFB_EFFECTS, "All");
     }
 
     #[test]
@@ -1077,120 +531,38 @@ mod tests {
     }
 
     #[test]
-    fn wheel_flag_bytes_are_exact() {
-        // The user's PC test proved exactly these bytes — not a guess.
-        assert_eq!(WHEEL_FLAG_BYTES, [0x40, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(WHEEL_FLAG_HEX, "4000000000000000");
-        assert_eq!(WHEEL_FLAG_VALUE_NAME, "OEMData");
-    }
-
-    #[test]
-    fn wheel_flag_key_is_vjoy_only_never_hid() {
-        // A4: the flag must only ever touch the vJoy key — the HID
-        // key (VID_1209&PID_5253) must not appear anywhere in it.
-        assert!(WHEEL_FLAG_OEM_SUBKEY.contains("VID_1234&PID_BEAD"));
-        assert!(!WHEEL_FLAG_OEM_SUBKEY.contains("1209"));
-        assert!(!WHEEL_FLAG_OEM_SUBKEY.contains("5253"));
-        assert!(!WHEEL_FLAG_OEM_SUBKEY.contains("HID"));
-    }
-
-    #[test]
-    fn wheel_flag_script_enable_writes_both_hives() {
-        let script = wheel_flag_script(true);
-        for hive in ["HKCU", "HKLM"] {
-            assert!(
-                script.contains(&format!(
-                    "reg add \"{hive}\\{WHEEL_FLAG_OEM_SUBKEY}\" /v \"OEMData\" /t REG_BINARY /d 4000000000000000 /f"
-                )),
-                "{script}"
-            );
-        }
-        // A failed enable write aborts the script.
-        assert_eq!(
-            script
-                .matches("if ($LASTEXITCODE -ne 0) { exit 1 }")
-                .count(),
-            2,
-            "{script}"
-        );
-        assert!(script.trim_end().ends_with("exit 0"));
-    }
-
-    #[test]
-    fn wheel_flag_script_disable_deletes_only_the_value() {
-        let script = wheel_flag_script(false);
-        for hive in ["HKCU", "HKLM"] {
-            assert!(
-                script.contains(&format!(
-                    "reg delete \"{hive}\\{WHEEL_FLAG_OEM_SUBKEY}\" /v \"OEMData\" /f"
-                )),
-                "{script}"
-            );
-        }
-        // Never a bare key delete, never a write.
-        assert!(!script.contains("reg add"), "{script}");
-        assert!(!script.contains(WHEEL_FLAG_HEX), "{script}");
-        assert!(script.trim_end().ends_with("exit 0"));
-    }
-
-    #[test]
-    fn marker_delete_script_targets_the_rsh_marker_only() {
-        let script = steam_fh4_marker_delete_script();
-        assert!(
-            script.contains("reg delete \"HKLM\\Software\\RSH\" /v \"SteamFh4OemData\" /f"),
-            "{script}"
-        );
-        // The marker delete never touches a joystick key.
-        assert!(!script.contains("Joystick"), "{script}");
-        assert!(!script.contains("OEMData"), "{script}");
+    fn stale_oemdata_target_is_the_vjoy_key_only() {
+        // The cleanup must only ever touch the vJoy OEM key — never
+        // the HID key (VID_1209&PID_5253) or any other key.
+        assert!(STALE_OEMDATA_SUBKEY.contains("VID_1234&PID_BEAD"));
+        assert!(!STALE_OEMDATA_SUBKEY.contains("1209"));
+        assert!(!STALE_OEMDATA_SUBKEY.contains("5253"));
+        assert!(!STALE_OEMDATA_SUBKEY.contains("HID"));
+        assert_eq!(STALE_OEMDATA_VALUE_NAME, "OEMData");
     }
 
     #[test]
     #[cfg(not(windows))]
-    fn set_wheel_flag_is_windows_only_off_windows() {
-        // Linux build: the registry write cannot run here.
-        assert!(
-            set_wheel_flag(true).is_err(),
-            "no registry write may pretend to succeed off Windows"
-        );
-        assert!(
-            set_wheel_flag_and_clear_marker(false).is_err(),
-            "no registry delete may pretend to succeed off Windows"
-        );
-        assert!(!steam_fh4_marker_present(), "no marker off Windows");
+    fn delete_stale_oemdata_is_a_noop_off_windows() {
+        // Linux build: no registry exists, so this must not panic.
+        delete_stale_oemdata_hkcu();
     }
 
     #[test]
-    fn wheel_setup_script_applies_envelope_then_both_mappings() {
+    fn wheel_setup_script_applies_envelope_only() {
         let tool = Path::new(r"C:\Program Files\vJoy\x64\vJoyConfig.exe");
         let script = wheel_setup_script(tool);
         // Envelope first, with the exact argv, and a failure exits
-        // with the tool's code before any registry write.
+        // with the tool's code before anything else runs.
         assert!(
             script.contains("1 -f -a x y z rx ry rz sl0 sl1 -b 128 -s 1 -e All"),
             "{script}"
         );
         assert!(script.contains("if ($p.ExitCode -ne 0) { exit $p.ExitCode }"));
-        // Both device keys, complete tree: 40 reg adds each.
-        assert_eq!(script.matches("reg add ").count(), 80, "{script}");
-        assert!(script.contains("1234BEAD00010004"));
-        assert!(script.contains("1209525300010004"));
-        assert!(script.contains("Labels\\Buttons"));
-        assert!(script.contains("Labels\\Switches"));
-        assert!(script.contains("RacingWheel\\DPadUp"));
-        assert!(script.contains("RacingWheel\\Clutch"));
-        // Spot-check value spellings (DWORD decimal, strings quoted).
-        assert!(script.contains("/t REG_DWORD /d 450 /f"));
-        assert!(script.contains("/v \"Button0\" /t REG_SZ /d \"LetterA\" /f"));
-        assert!(script.contains("/v \"SwitchPosition\" /t REG_SZ /d \"Up\" /f"));
-        // Every write is checked; the script exits 0 at the end.
-        assert_eq!(
-            script
-                .matches("if ($LASTEXITCODE -ne 0) { exit 1 }")
-                .count(),
-            80,
-            "{script}"
-        );
+        // v2.0.19: no game-classification writes at all.
+        assert!(!script.contains("reg add"), "{script}");
+        assert!(!script.contains("GameInput"), "{script}");
+        assert!(!script.contains("OEMData"), "{script}");
         assert!(script.trim_end().ends_with("exit 0"));
     }
 }

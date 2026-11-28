@@ -20,9 +20,11 @@
 // par lagta tha — 1650 mV -> 1330 mV, full travel kabhi 100% nahi).
 // Caller har slot ke liye `axes_is_mv` bit deta hai (inputs_axis_is_mv).
 // Clutch slot 3, handbrake slot 4 (Phase F WS5).
-// Encoders cumulative i16 hain (D1). Buttons v1 byte (RSH_BTN_* bits)
-// ki bit positions v2 bits 0..4 se milti hain (gear up/down, accel,
-// brake, horn) — module gating rsh_stream_button_bits karta hai.
+// Encoders v2.0.19 mein DELETE — wire slots barqarar hain (protocol
+// v2.2 frozen), values hamesha 0 (n_enc hamesha 2, enc = {0, 0}).
+// Buttons v1 byte (RSH_BTN_* bits) ki bit positions v2 bits 0/1/4 se
+// milti hain (gear up/down, horn) — module gating
+// rsh_stream_button_bits karta hai; bits 2/3/5..10 hamesha 0 hain.
 //
 // Flags (§1.3): axis-invalid (F2) aur tick-skipped (D5, seqGap badla ho
 // to) yahan se aate hain. config-changed / low-supply ke liye abhi koi
@@ -67,21 +69,20 @@ static inline rsh_emit_kind_t rsh_stream_emit_kind(uint8_t pc_active,
 ///     steering), clear ho to raw counts hain aur raw->mV convert hota
 ///     hai. P1-1: pehle sirf steering ka flag tha — I2C pedals do
 ///     dafa convert hote thay (mV -> dobara mV scale).
-///   n_enc: encoders enabled hon to 2 (enc[0..1]), warna 0.
-///   buttons_v1: RSH_BTN_* byte.
+///   n_enc: hamesha 2 (enc values hamesha 0 — v2.0.19, encoders DELETE;
+///     wire slots barqarar hain, protocol v2.2 frozen).
+///   buttons_v1: RSH_BTN_* byte (bits 0/1/4 — shifter up/down, horn).
 ///   clutch_raw: clutch raw counts (slot 3, Phase F WS5 — module band
 ///     ho to ignore hota hai, mask mein bit hi nahi hoti).
-///   shifter_gear: H-pattern gear 0..6 (sequential mein 0) — button
-///     bits 5..10 mein jata hai (rsh_stream_button_bits).
 /// Return packet length (20 + 2*axes + 2*n_enc + 2), ya 0 (ghalat input).
 static inline size_t rsh_build_v2_stream_packet(
     uint8_t *buf, size_t buf_len, uint16_t seq, uint32_t timestamp_us,
     uint8_t flags, uint16_t steering, uint8_t axes_is_mv,
     uint16_t accel_raw, uint16_t brake_raw, uint16_t handbrake_raw,
     const int16_t *enc, uint8_t n_enc, uint8_t buttons_v1,
-    const RshModuleEnable *en, uint16_t clutch_raw, uint8_t shifter_gear) {
+    const RshModuleEnable *en, uint16_t clutch_raw) {
   if (!buf || !enc) return 0;
-  if (n_enc > 2) return 0;  // sirf 2 encoders maujood hain (enc[0..1])
+  if (n_enc > 2) return 0;  // wire slots: 2 enc values (hamesha 0 — v2.0.19)
   if (flags & 0xF0) return 0;  // flags bits 4-7 reserved 0 (§1.3)
   uint8_t mask = rsh_stream_axis_mask(en);
   uint16_t axes[5];  // Phase F WS5: 5 axes max (clutch + handbrake)
@@ -113,9 +114,7 @@ static inline size_t rsh_build_v2_stream_packet(
   uint32_t buttons = rsh_stream_button_bits(
       en, (uint8_t)((buttons_v1 & RSH_BTN_GEAR_UP) != 0),
       (uint8_t)((buttons_v1 & RSH_BTN_GEAR_DOWN) != 0),
-      (uint8_t)((buttons_v1 & RSH_BTN_ACCEL) != 0),
-      (uint8_t)((buttons_v1 & RSH_BTN_BRAKE) != 0),
-      (uint8_t)((buttons_v1 & RSH_BTN_HORN) != 0), shifter_gear);
+      (uint8_t)((buttons_v1 & RSH_BTN_HORN) != 0));
   size_t total = (size_t)RSH_V2_STREAM_HEADER_SIZE + 2u * n + 2u * n_enc + 2u;
   if (buf_len < total) return 0;
   return rsh_v2_build_stream(buf, seq, timestamp_us, flags, mask, axes,

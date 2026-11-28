@@ -9,7 +9,7 @@ import { AboutSlint, ScrollView } from "std-widgets.slint";
 import { Card, NavItem, SubItem, StatusCard, Btn } from "components.slint";
 
 // Page ids (shared with Rust): 0 Overview, 1 Steering, 2 Pedals,
-// 3 Buttons, 4 Extras, 5 Settings, 6 About.
+// 3 Extras, 4 Settings, 5 About.
 export component Sidebar inherits Rectangle {
     in property <int> page;
     in property <bool> connected;
@@ -95,18 +95,17 @@ export component Sidebar inherits Rectangle {
                 padding-left: 10px;
                 Text { text: "DEVICE"; font-size: Theme.fs-hint; font-weight: 600; color: Theme.faint; }
             }
-            NavItem { label: "RSH Wheel"; icon: @image-url("../assets/icons/wheel.svg"); active: page >= 1 && page <= 4; show-dot: connected; clicked => { nav(1); } }
+            NavItem { label: "RSH Wheel"; icon: @image-url("../assets/icons/wheel.svg"); active: page >= 1 && page <= 3; show-dot: connected; clicked => { nav(1); } }
             SubItem { label: "Steering"; active: page == 1; clicked => { nav(1); } }
             SubItem { label: "Pedals"; active: page == 2; clicked => { nav(2); } }
-            SubItem { label: "Buttons"; active: page == 3; clicked => { nav(3); } }
-            SubItem { label: "Extras"; active: page == 4; clicked => { nav(4); } }
+            SubItem { label: "Extras"; active: page == 3; clicked => { nav(3); } }
             HorizontalLayout {
                 padding-top: 10px;
                 padding-bottom: 2px;
                 padding-left: 10px;
                 Text { text: "APP"; font-size: Theme.fs-hint; font-weight: 600; color: Theme.faint; }
             }
-            NavItem { label: "Settings"; icon: @image-url("../assets/icons/gear.svg"); active: page == 5 || page == 6; clicked => { nav(5); } }
+            NavItem { label: "Settings"; icon: @image-url("../assets/icons/gear.svg"); active: page == 4 || page == 5; clicked => { nav(4); } }
             Rectangle { vertical-stretch: 1; }
             StatusCard {
                 connected: connected;

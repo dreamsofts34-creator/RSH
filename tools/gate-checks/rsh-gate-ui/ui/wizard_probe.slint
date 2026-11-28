@@ -19,7 +19,7 @@ export component GateWizardWindow inherits Window {
     in property <bool> connect-done: false;
     in property <string> connect-hint: "";
     in property <bool> vjoy-installed: false;
-    in property <bool> vjoy-fallback: false;
+    in property <bool> xbox-fallback: false;
     in property <bool> calibration-available: false;
     in property <bool> centre-done: false;
     in property <bool> pedals-done: false;
@@ -36,7 +36,7 @@ export component GateWizardWindow inherits Window {
         connect-done: root.connect-done;
         connect-hint: root.connect-hint;
         vjoy-installed: root.vjoy-installed;
-        vjoy-fallback: root.vjoy-fallback;
+        xbox-fallback: root.xbox-fallback;
         calibration-available: root.calibration-available;
         centre-done: root.centre-done;
         pedals-done: root.pedals-done;

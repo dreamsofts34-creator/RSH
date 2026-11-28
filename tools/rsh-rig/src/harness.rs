@@ -95,7 +95,7 @@ use rsh_benchmarks::alloc::net_live_bytes;
 use rsh_engine::engine::{
     EngineReport, OutputSink, PacketSource, PingSender, SinkError, WheelEngine,
 };
-use rsh_engine::pipeline::{OutputState, PipelinePlan, ProcessingPipeline, ShifterGateMode};
+use rsh_engine::pipeline::{OutputState, PipelinePlan, ProcessingPipeline};
 use rsh_engine::sequence::SequenceTracker;
 use rsh_protocol::control::{ControlFrame, DuplicateCache, build_frame};
 use rsh_protocol::error::RejectCounters;
@@ -145,10 +145,10 @@ struct SinkState {
     handbrake_max: i64,
     /// OR of all observed button words.
     button_mask_or: u32,
-    /// Bit `g` set when gear `g` was observed.
+    /// Bit `g` set when gear `g` was observed (always 0 since
+    /// v2.0.19: H-pattern decoding is deleted, no gear is ever
+    /// decoded — the sequential scenario asserts the 0).
     gear_mask_seen: u32,
-    /// Largest |encoder delta| observed in one tick.
-    max_abs_encoder_delta: i64,
     /// Distinct button words seen (capped at 256).
     distinct_masks: Vec<u32>,
 }
@@ -240,15 +240,9 @@ impl OutputSink for RecordingSink {
         s.handbrake_min = s.handbrake_min.min(handbrake);
         s.handbrake_max = s.handbrake_max.max(handbrake);
         s.button_mask_or |= state.buttons;
-        if state.gear != 0 {
-            s.gear_mask_seen |= 1u32 << state.gear;
-        }
-        for d in state.encoder_deltas {
-            let a = i64::from(d).abs();
-            if a > s.max_abs_encoder_delta {
-                s.max_abs_encoder_delta = a;
-            }
-        }
+        // v2.0.19: `OutputState` has no `gear` / `encoder_deltas`
+        // anymore (H-pattern + encoders deleted) — `gear_mask_seen`
+        // stays 0 and there is no encoder-delta metric.
         if !s.distinct_masks.contains(&state.buttons) && s.distinct_masks.len() < 256 {
             s.distinct_masks.push(state.buttons);
         }
@@ -480,9 +474,6 @@ fn plan_for(h: &HarnessConfig) -> PipelinePlan {
     }
     if h.accel_disabled {
         plan.accelerator.enabled = false;
-    }
-    if h.hpattern {
-        plan.shifter.gate_mode = ShifterGateMode::HPattern;
     }
     plan
 }
@@ -1139,7 +1130,6 @@ pub async fn run_live(
     }
     metrics.set("buttonMaskOr", sink.button_mask_or as f64);
     metrics.set("gearMaskSeen", sink.gear_mask_seen as f64);
-    metrics.set("maxAbsEncoderDelta", sink.max_abs_encoder_delta as f64);
     metrics.set("distinctButtonMasks", sink.distinct_masks.len() as f64);
     metrics.set(
         "allocBytesDelta",
@@ -1231,11 +1221,9 @@ pub fn run_contract(scenario: &Scenario) -> Metrics {
         "gate-notifications-source" => crate::gate_checks::gate_notifications_source(),
         // Cards layout fix (2026-11-19): Extras ON/OFF size + responsive gaps.
         "gate-extras-card-size-source" => crate::gate_checks::gate_extras_card_size_source(),
-        "gate-card-gap-source" => crate::gate_checks::gate_card_gap_source(),
         // v2.0.2 gate checks, re-scan findings (B-2, H-3, H-4, M-9).
         // (B-1, gate-pairing-long-call, was deleted with pairing.)
-        "gate-hid-uac-dwell" => crate::gate_checks::gate_hid_uac_dwell(),
-        "gate-bindings-ui" => crate::gate_checks::gate_bindings_ui(),
+        "gate-backend-single-attempt" => crate::gate_checks::gate_backend_switch_single_attempt(),
         "gate-ota-flash-caller" => crate::gate_checks::gate_ota_flash_caller(),
         "gate-version-bump" => crate::gate_checks::gate_version_bump(),
         // v2.0.3 lifecycle checks (F17): real daemon/UI processes

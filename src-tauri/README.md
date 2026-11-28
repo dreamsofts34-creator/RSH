@@ -7,8 +7,9 @@
 > `tauri.conf.json` version (`1.0.2`) and updater config (`active:
 > false`, no `latest.json` published) are therefore stale-by-design —
 > do not "fix" them or re-enable the updater without a migration plan.
-> `src-tauri/binaries/` is still live: it stages the HIDMaestro
-> sidecar exe the v2.0 installer bundles beside the daemon.
+> v2.0.19: `src-tauri/binaries/` no longer stages anything — the
+> HIDMaestro sidecar it used to hold is deleted with the backend, and
+> the directory is empty (kept only so the path still exists).
 
 Minimal app shell (Phase A2 / P2.1 scope):
 

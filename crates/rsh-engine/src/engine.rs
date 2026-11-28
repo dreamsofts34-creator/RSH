@@ -32,10 +32,9 @@
 //! channels handed out before `run`: [`WheelEngine::status_sender`]
 //! and [`WheelEngine::ping_reply_sender`]. The engine drains both
 //! channels once per tick. A status packet updates the sequence
-//! tracker's board counters (`seqGap`/`txFail`), the metrics, and the
-//! latest `btnsEx` value (buttons 32–63), which the engine merges
-//! into the [`OutputState::buttons_ex`] field — the pipeline itself
-//! never sees status packets. A ping reply is fed to the
+//! tracker's board counters (`seqGap`/`txFail`) and the metrics.
+//! (v2.0.19: the old `btnsEx` merge is gone - buttons 32-63 were
+//! deleted with the buttons/encoders cleanup.) A ping reply is fed to the
 //! [`PingTracker`] and its measurement recorded in the metrics.
 //!
 //! # Stopping
@@ -176,7 +175,6 @@ const MAX_FRAMES_PER_TICK: usize = 32;
 /// (HID P2-3): the extended packet arrives at ~1 Hz, so 2 s without
 /// one means the source is gone — the value must age out instead of
 /// holding a stale press forever.
-const BTNS_EX_MAX_AGE: Duration = Duration::from_secs(2);
 /// Max status packets drained per tick (L-1: 2× the 16-slot channel
 /// capacity — a racing producer cannot make one tick drain
 /// unboundedly).
@@ -321,8 +319,6 @@ pub struct EngineCounters {
     /// Reconnect attempts: one per [`SourceFactory::create_source`]
     /// call after the source dropped.
     pub source_reconnects: u64,
-    /// Encoder glitch jumps dropped by the filter so far (M4).
-    pub encoder_glitch_dropped: u64,
 }
 
 /// What [`WheelEngine::run`] returns when the loop stops: the final
@@ -409,15 +405,6 @@ pub struct WheelEngine<S: PacketSource> {
     /// Last output sent (repeated on ticks with no new frame while
     /// the watchdog still reports fresh data).
     last_output: OutputState,
-    /// Latest `btnsEx` (buttons 32–63) from a status packet, merged
-    /// into every processed output.
-    last_btns_ex: u32,
-    /// When `last_btns_ex` was last refreshed by a status packet
-    /// (HID P2-3, polish round): the firmware never emits the
-    /// extended status packet today, so without ageing the engine
-    /// would hold a stale value indefinitely. Older than
-    /// [`BTNS_EX_MAX_AGE`] it reads as 0.
-    last_btns_ex_at: Option<Instant>,
     /// `timestamp_us` of the last processed frame, for the
     /// inter-arrival jitter metric.
     last_frame_ts: Option<u32>,
@@ -481,8 +468,6 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
             metrics: EngineMetrics::new(),
             counters: EngineCounters::default(),
             last_output: OutputState::neutral(),
-            last_btns_ex: 0,
-            last_btns_ex_at: None,
             last_frame_ts: None,
             last_status_uptime_ms: None,
             status_uptime_reset: false,
@@ -758,10 +743,9 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
                 self.sequence.board_seq_gap(),
                 self.sequence.board_tx_fail(),
             );
-            if let Some(btns_ex) = status.btns_ex {
-                self.last_btns_ex = btns_ex;
-                self.last_btns_ex_at = Some(Instant::now());
-            }
+            // v2.0.19: `status.btns_ex` (buttons 32-63) is ignored -
+            // the buttons/encoders cleanup deleted every reader of it.
+            let _ = status.btns_ex;
         }
     }
 
@@ -929,17 +913,8 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
             }
             SeqDecision::Duplicate => unreachable!("duplicates returned above"),
         };
-        let mut out = self.pipeline.process_with_gap(frame, skipped);
-        // HID P2-3 (polish round): age the extended buttons out —
-        // a `btnsEx` older than `BTNS_EX_MAX_AGE` with no status
-        // refresh is stale (the firmware never emits it today) and
-        // must not hold a press indefinitely.
-        let btns_ex_fresh = self
-            .last_btns_ex_at
-            .is_some_and(|at| at.elapsed() <= BTNS_EX_MAX_AGE);
-        out.buttons_ex = if btns_ex_fresh { self.last_btns_ex } else { 0 };
+        let out = self.pipeline.process_with_gap(frame, skipped);
         self.counters.frames_processed += 1;
-        self.counters.encoder_glitch_dropped = self.pipeline.encoder_glitch_dropped();
         self.last_output = out;
         out
     }
@@ -1166,9 +1141,8 @@ mod tests {
         )
     }
 
-    /// A status packet carrying only the loss counters (and optional
-    /// `btnsEx`) the engine consumes.
-    fn status(seq_gap: u16, tx_fail: u16, btns_ex: Option<u32>) -> StatusPacket {
+    /// A status packet carrying only the loss counters the engine consumes.
+    fn status(seq_gap: u16, tx_fail: u16) -> StatusPacket {
         StatusPacket {
             seq: 0,
             uptime_ms: 0,
@@ -1184,7 +1158,7 @@ mod tests {
             cfg_ver: 0,
             seq_gap,
             tx_fail,
-            btns_ex,
+            btns_ex: None,
         }
     }
 
@@ -2014,12 +1988,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_packet_updates_metrics_and_btns_ex() {
+    async fn status_packet_updates_metrics() {
         let mut harness = start(false);
-        // Status first: seq_gap 7, tx_fail 3, buttons 32–63 word.
+        // Status first: seq_gap 7, tx_fail 3.
         harness
             .status_tx
-            .send(status(7, 3, Some(0x0000_0005)))
+            .send(status(7, 3))
             .await
             .expect("status channel open");
         sleep(Duration::from_millis(60)).await;
@@ -2032,10 +2006,5 @@ mod tests {
         let report = stop_and_report(&mut harness).await;
         assert_eq!(report.metrics.seq_gap, 7);
         assert_eq!(report.metrics.tx_fail, 3);
-        let states = recorded(&harness.states);
-        assert!(
-            states.iter().any(|s| s.buttons_ex == 0x0000_0005),
-            "btnsEx merged into the output: {states:?}"
-        );
     }
 }

@@ -8,7 +8,6 @@
 //! mock transports and mock outputs.
 
 pub mod calibration;
-pub mod encoder;
 pub mod engine;
 pub mod metrics;
 pub mod ping_client;

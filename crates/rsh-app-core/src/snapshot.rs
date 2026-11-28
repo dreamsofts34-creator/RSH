@@ -15,12 +15,9 @@
 //!   window. Fewer than 2 ticks in the window means "unmeasured"
 //!   (`None`) — a single tick cannot define a rate, and a constant
 //!   (e.g. a hardcoded 200) would be fake data.
-//! - Encoders arrive as cumulative `i16` counts (protocol v2.1 §1.1,
-//!   `n_enc <= 4`). [`EncoderState`] wraps the engine's
-//!   [`EncoderTracker`](rsh_engine::encoder::EncoderTracker) and derives
-//!   the per-encoder snapshot: cumulative count, wrap-aware delta, and
-//!   the derived virtual-button states (buttons 65–72, one CW and one
-//!   CCW button per encoder).
+//! - v2.0.19: encoders are deleted (firmware sends zeros, nothing
+//!   reads them) and the H-pattern gear is deleted — the snapshot
+//!   carries steering/pedals/handbrake only, never a gear.
 //!
 //! The snapshot event name is [`SNAPSHOT_EVENT`]. Emission itself is the
 //! Tauri shell's job (`src-tauri/src/main.rs` emits it from the engine
@@ -30,10 +27,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use rsh_engine::encoder::EncoderDirection;
-use rsh_engine::encoder::{EncoderTracker, deltas_to_buttons, encoder_button_number};
 use rsh_engine::metrics::EngineMetrics;
-use rsh_protocol::stream::MAX_ENCODERS;
 use serde::{Deserialize, Serialize};
 
 /// Event name for the 30 Hz engine snapshot feed (UI plan §6.1).
@@ -79,28 +73,6 @@ pub struct EngineStats {
     pub output_latency_ms: Option<f64>,
     /// End-to-end latency p99 in milliseconds (ping-derived).
     pub e2e_ms: Option<f64>,
-}
-
-/// One encoder in a snapshot: its cumulative count, the wrap-aware delta
-/// since the previous snapshot, and the derived virtual-button states
-/// (buttons 65–72).
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct EncoderSnapshot {
-    /// Encoder index, 0-based (frontend displays it as 1-based).
-    pub index: usize,
-    /// Cumulative `i16` count from the latest stream frame.
-    pub count: i16,
-    /// Wrap-aware delta since the previous snapshot (0 on the first sample).
-    pub delta: i16,
-    /// Clockwise virtual button number (`65 + 2*index`).
-    pub cw_button: u8,
-    /// Counter-clockwise virtual button number (`66 + 2*index`).
-    pub ccw_button: u8,
-    /// True when this encoder stepped clockwise in this snapshot's tick.
-    pub cw_pressed: bool,
-    /// True when this encoder stepped counter-clockwise in this snapshot's tick.
-    pub ccw_pressed: bool,
 }
 
 /// Pedal positions in a snapshot, 0..1 (`clutch` is `None` when the
@@ -160,10 +132,6 @@ pub struct EngineSnapshot {
     pub active_profile_id: Option<String>,
     /// Monotonic sequence number; gaps mean dropped snapshots.
     pub seq: u64,
-    /// Encoder snapshots (one per encoder present in the frame).
-    pub encoders: Vec<EncoderSnapshot>,
-    /// Virtual buttons pressed this tick (subset of 65–72).
-    pub encoder_buttons: Vec<u8>,
     /// `seqGap` counter passed through from the latest status packet.
     pub seq_gap: u64,
     /// `txFail` counter passed through from the latest status packet.
@@ -172,10 +140,6 @@ pub struct EngineSnapshot {
     /// axis this tick. `0.0` = released; never faked — the pipeline
     /// reports the real axis, and no frame yet means `0.0`.
     pub handbrake: f64,
-    /// Decoded H-pattern gear (M-3, v2.0.2): `0` = neutral, `1..=6`
-    /// = gear. `0` in sequential mode or when the shifter module is
-    /// disabled — the pipeline's decoded gear, never a guess.
-    pub gear: u8,
 }
 
 /// Measures the engine tick rate over a sliding 1 s window.
@@ -272,71 +236,6 @@ impl LoopRateTracker {
     }
 }
 
-/// Tracks cumulative encoder counts across snapshots and derives the
-/// per-encoder snapshot entries (counts, wrap-aware deltas, virtual
-/// buttons 65–72).
-#[derive(Clone, Debug, Default)]
-pub struct EncoderState {
-    /// Wrap-aware delta tracker from the engine.
-    tracker: EncoderTracker,
-}
-
-impl EncoderState {
-    /// An empty encoder state (no baselines yet).
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Update from one stream frame's encoder counts and return the
-    /// per-encoder snapshots. Only the first `n_enc` entries are read
-    /// (`n_enc <= 4`); the rest of the frame is ignored. The first
-    /// sample for an encoder only sets the baseline (delta 0).
-    #[must_use]
-    pub fn update(&mut self, counts: &[i16; MAX_ENCODERS], n_enc: usize) -> Vec<EncoderSnapshot> {
-        let deltas = self.tracker.update_all(counts, n_enc);
-        let buttons = deltas_to_buttons(&deltas);
-        let mut out = Vec::with_capacity(n_enc.min(MAX_ENCODERS));
-        for (index, &count) in counts.iter().enumerate().take(n_enc.min(MAX_ENCODERS)) {
-            out.push(EncoderSnapshot {
-                index,
-                count,
-                delta: deltas[index],
-                cw_button: encoder_button_number(index, EncoderDirection::Clockwise).unwrap_or(0),
-                ccw_button: encoder_button_number(index, EncoderDirection::CounterClockwise)
-                    .unwrap_or(0),
-                cw_pressed: buttons.clockwise(index),
-                ccw_pressed: buttons.counter_clockwise(index),
-            });
-        }
-        out
-    }
-
-    /// Virtual buttons pressed in the latest update (subset of 65–72).
-    ///
-    /// Computed from the same deltas as [`EncoderState::update`]; call
-    /// it with the snapshots that update returned.
-    #[must_use]
-    pub fn pressed_buttons(snapshots: &[EncoderSnapshot]) -> Vec<u8> {
-        let mut pressed = Vec::new();
-        for snapshot in snapshots {
-            if snapshot.cw_pressed {
-                pressed.push(snapshot.cw_button);
-            }
-            if snapshot.ccw_pressed {
-                pressed.push(snapshot.ccw_button);
-            }
-        }
-        pressed
-    }
-
-    /// Forget all baselines; the next sample for each encoder is a first
-    /// sample again (delta 0).
-    pub fn reset(&mut self) {
-        self.tracker.reset();
-    }
-}
-
 /// Map [`EngineMetrics`] to the frontend [`EngineStats`] contract.
 ///
 /// `loop_hz` comes from [`LoopRateTracker::rate_hz`] — pass `None` when
@@ -371,8 +270,8 @@ pub fn build_engine_stats_cached(metrics: &mut EngineMetrics, loop_hz: Option<f6
 }
 
 /// Inputs for one [`EngineSnapshot`]. The caller owns the live values
-/// (steering/pedals come from the pipeline output, encoders from
-/// [`EncoderState::update`], stats from [`build_engine_stats`]).
+/// (steering/pedals come from the pipeline output, stats from
+/// [`build_engine_stats`]).
 #[derive(Clone, Debug, Default)]
 pub struct SnapshotInput {
     /// Steering angle in degrees, -450..450.
@@ -387,24 +286,17 @@ pub struct SnapshotInput {
     pub active_profile_id: Option<String>,
     /// Monotonic sequence number.
     pub seq: u64,
-    /// Encoder snapshots for this tick.
-    pub encoders: Vec<EncoderSnapshot>,
     /// `seqGap` counter from the latest status packet.
     pub seq_gap: u64,
     /// `txFail` counter from the latest status packet.
     pub tx_fail: u64,
     /// Handbrake position 0..1 (pipeline output this tick).
     pub handbrake: f64,
-    /// Decoded H-pattern gear: `0` = neutral, `1..=6` = gear.
-    pub gear: u8,
 }
 
-/// Build one [`EngineSnapshot`] from its inputs. The pressed virtual
-/// buttons (65–72) are derived from the encoder snapshots, never passed
-/// in separately, so the two can never disagree.
+/// Build one [`EngineSnapshot`] from its inputs.
 #[must_use]
 pub fn build_snapshot(input: SnapshotInput) -> EngineSnapshot {
-    let encoder_buttons = EncoderState::pressed_buttons(&input.encoders);
     EngineSnapshot {
         steering_deg: input.steering_deg,
         pedals: input.pedals,
@@ -412,21 +304,17 @@ pub fn build_snapshot(input: SnapshotInput) -> EngineSnapshot {
         stats: input.stats,
         active_profile_id: input.active_profile_id,
         seq: input.seq,
-        encoders: input.encoders,
-        encoder_buttons,
         seq_gap: input.seq_gap,
         tx_fail: input.tx_fail,
         handbrake: input.handbrake,
-        gear: input.gear,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectionState, EncoderSnapshot, EncoderState, EngineSnapshot, LoopRateTracker,
-        PedalSnapshot, SnapshotInput, build_engine_stats, build_snapshot, loss_fraction_to_pct,
-        us_to_ms,
+        ConnectionState, EngineSnapshot, LoopRateTracker, PedalSnapshot, SnapshotInput,
+        build_engine_stats, build_snapshot, loss_fraction_to_pct, us_to_ms,
     };
     use rsh_engine::metrics::EngineMetrics;
     use std::time::{Duration, Instant};
@@ -559,67 +447,9 @@ mod tests {
     }
 
     #[test]
-    fn encoder_snapshot_counts_deltas_and_virtual_buttons() {
-        let mut state = EncoderState::new();
-        // First sample: baselines only, deltas 0, nothing pressed.
-        let first = state.update(&[10, -5, 0, 0], 2);
-        assert_eq!(first.len(), 2);
-        assert_eq!(first[0].count, 10);
-        assert_eq!(first[0].delta, 0);
-        assert_eq!(first[0].cw_button, 65);
-        assert_eq!(first[0].ccw_button, 66);
-        assert_eq!(first[1].cw_button, 67);
-        assert_eq!(first[1].ccw_button, 68);
-        assert!(!first[0].cw_pressed && !first[0].ccw_pressed);
-        assert_eq!(EncoderState::pressed_buttons(&first), Vec::<u8>::new());
-        // Second sample: enc 0 +3 (CW, button 65), enc 1 -2 (CCW, button 68).
-        let second = state.update(&[13, -7, 0, 0], 2);
-        assert_eq!(second[0].delta, 3);
-        assert!(second[0].cw_pressed);
-        assert!(!second[0].ccw_pressed);
-        assert_eq!(second[1].delta, -2);
-        assert!(second[1].ccw_pressed);
-        assert_eq!(EncoderState::pressed_buttons(&second), vec![65, 68]);
-    }
-
-    #[test]
-    fn encoder_snapshot_wrap_delta() {
-        let mut state = EncoderState::new();
-        let _ = state.update(&[32767, 0, 0, 0], 1);
-        // Wrap 32767 -> -32768 is +1, not -65535.
-        let second = state.update(&[-32768, 0, 0, 0], 1);
-        assert_eq!(second[0].delta, 1);
-        assert!(second[0].cw_pressed);
-        assert_eq!(second[0].count, -32768);
-    }
-
-    #[test]
-    fn encoder_snapshot_respects_n_enc_and_resets() {
-        let mut state = EncoderState::new();
-        let snaps = state.update(&[1, 2, 3, 4], 4);
-        assert_eq!(snaps.len(), 4);
-        assert_eq!(snaps[3].cw_button, 71);
-        assert_eq!(snaps[3].ccw_button, 72);
-        let snaps = state.update(&[9, 9, 9, 9], 1);
-        assert_eq!(snaps.len(), 1);
-        state.reset();
-        let snaps = state.update(&[100, 0, 0, 0], 1);
-        assert_eq!(snaps[0].delta, 0);
-    }
-
-    #[test]
-    fn snapshot_build_derives_pressed_buttons_and_serializes() {
+    fn snapshot_build_serializes() {
         let metrics = EngineMetrics::new();
         let stats = build_engine_stats(&metrics, Some(200.0));
-        let encoders = vec![EncoderSnapshot {
-            index: 0,
-            count: 13,
-            delta: 3,
-            cw_button: 65,
-            ccw_button: 66,
-            cw_pressed: true,
-            ccw_pressed: false,
-        }];
         let snapshot = build_snapshot(SnapshotInput {
             steering_deg: 12.5,
             pedals: PedalSnapshot {
@@ -631,21 +461,16 @@ mod tests {
             stats,
             active_profile_id: Some("default".to_string()),
             seq: 42,
-            encoders,
             seq_gap: 7,
             tx_fail: 3,
             handbrake: 0.0,
-            gear: 0,
         });
-        assert_eq!(snapshot.encoder_buttons, vec![65]);
         assert_eq!(snapshot.seq, 42);
         let json = serde_json::to_string(&snapshot).expect("snapshot serialize");
         assert!(json.contains("\"steeringDeg\":12.5"), "{json}");
         assert!(json.contains("\"connection\":\"connected\""), "{json}");
         assert!(json.contains("\"seqGap\":7"), "{json}");
         assert!(json.contains("\"txFail\":3"), "{json}");
-        assert!(json.contains("\"cwButton\":65"), "{json}");
-        assert!(json.contains("\"encoderButtons\":[65]"), "{json}");
         // Round-trip through the frontend shape.
         let back: EngineSnapshot = serde_json::from_str(&json).expect("snapshot round-trip");
         assert_eq!(back, snapshot);

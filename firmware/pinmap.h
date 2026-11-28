@@ -22,10 +22,11 @@
 //     slot > 2 ka koi consumer nahi. NOTE: purana factory blob BUTTON
 //     slots 0..3 = accel-btn/brake-btn/gear-up/gear-down istemal karta
 //     tha — wo scheme KHATAM hai (neeche legacy detection).
-//   ENCODER (type 5): slot 0 encoder 1 (pinA/pinB), slot 1 encoder 2.
 //   LED_STRIP (type 6): slot 0.
-//   SHIFTER (type 11): params[0] gate mode (0 sequential, 1 H-pattern);
-//     H-pattern gear pins 1..6 = pinA/pinB/pinC + params[1..3].
+//   SHIFTER (type 11): params[4] = shifter sensitivity (0..100, D-4);
+//     gate mode v2.0.19 mein DELETE — shifter hamesha sequential hai,
+//     is liye record ka params[0] (mode) 0 hona lazmi hai (validator
+//     reject karta hai) aur pinmap is record se kuch nahi leta.
 //   BUTTON_MATRIX (4): COMMIT par REJECT (P1-3) — koi firmware consumer
 //     nahi, is liye accept karna silently dead buttons deta (expander
 //     gap jaisa). Validator (config_transaction.h) err 3 deta hai.
@@ -39,7 +40,7 @@
 //
 // Replace semantics: blob poori sach hai — jis function ka record NAHI
 // hai, wo sample NAHI hota (pin 0xFF). Is liye factory blob POORA map
-// hai (11 records — har function jo default on hai). PC builder bhi
+// hai (9 records — har function jo default on hai). PC builder bhi
 // sirf assigned functions ke records bhejta hai; unassign = record
 // gayab = board sample nahi karta (PIN-MAP-PUSH.md ka waada).
 // Duplicate slot (do records, ek slot, alag pins): PEHLA jeetta hai
@@ -61,8 +62,6 @@
 #define RSH_PINMAP_BTN_SHIFT_UP   0
 #define RSH_PINMAP_BTN_SHIFT_DOWN 1
 #define RSH_PINMAP_BTN_HORN       2
-#define RSH_PINMAP_ENC_1          0
-#define RSH_PINMAP_ENC_2          1
 
 #define RSH_PINMAP_ABSENT 0xFF  // function ka record nahi — sample nahi hota
 
@@ -77,13 +76,7 @@ typedef struct {
   uint8_t gearUp;     // BUTTON slot 0
   uint8_t gearDown;   // BUTTON slot 1
   uint8_t horn;       // BUTTON slot 2
-  uint8_t enc1A;      // ENCODER slot 0 pinA
-  uint8_t enc1B;      // ENCODER slot 0 pinB
-  uint8_t enc2A;      // ENCODER slot 1 pinA
-  uint8_t enc2B;      // ENCODER slot 1 pinB
   uint8_t ledStrip;   // LED_STRIP slot 0
-  uint8_t shiftH[6];  // H-pattern gear pins 1..6 (mode 1 mein)
-  uint8_t shifterMode;  // 0 sequential, 1 H-pattern
   uint8_t handbrakeButtonMode;  // F-15 (v4.0.2): 1 = handbrake pin digital
                                 // button hai (axis nahi) — inputs.cpp dekho
   // FW-01 (Round 3): I2C axes — pin 0xFF = I2C, is liye axis ka source
@@ -108,18 +101,7 @@ static inline void rsh_pinmap_defaults(RshPinMap *out) {
   out->gearUp = PIN_GEAR_UP;
   out->gearDown = PIN_GEAR_DOWN;
   out->horn = PIN_HORN_BTN;
-  out->enc1A = PIN_ENC1_A;
-  out->enc1B = PIN_ENC1_B;
-  out->enc2A = PIN_ENC2_A;
-  out->enc2B = PIN_ENC2_B;
   out->ledStrip = PIN_LED_STRIP;
-  out->shiftH[0] = PIN_SHIFT_H1;
-  out->shiftH[1] = PIN_SHIFT_H2;
-  out->shiftH[2] = PIN_SHIFT_H3;
-  out->shiftH[3] = PIN_SHIFT_H4;
-  out->shiftH[4] = PIN_SHIFT_H5;
-  out->shiftH[5] = PIN_SHIFT_H6;
-  out->shifterMode = RSH_SHIFTER_MODE;
   out->handbrakeButtonMode = 0;  // F-15: default axis mode
   // FW-01: defaults native ADC hain (factory blob ke barabar) — clutch
   // slot 3 ka axisType 0xFF rehta hai (memset se), adsCh bhi 0xFF.
@@ -134,21 +116,19 @@ static inline void rsh_pinmap_defaults(RshPinMap *out) {
 // Kya ye GPIO live pin table mein kisi function ko diya gaya hai?
 // Round 2 W3 (FIX-2): pedal button-mode ke fixed pins GPIO25/26
 // (PIN_ACCEL_BTN/PIN_BRAKE_BTN) blob ke kisi aur function ko bhi diye ja
-// sakte hain (misal full-rig preset mein encoder B pins 23/25, 26/27) —
+// sakte hain (misal full-rig preset mein pins 23/25, 26/27 kisi axis ko) —
 // inputs.cpp un pins ko fixed button ke tor par parhna band karta hai
-// jab wo yahan maujood hon, warna ek hi press do button bits deta
-// (encoder B LOW = accel-button bit). Factory/default map mein 25/26
-// kisi function ko nahi diye gaye, is liye default behaviour waisa hi.
+// jab wo yahan maujood hon, warna ek hi press do cheezein chalata
+// (pin 25 LOW = accel-button axis + us function ki reading).
+// Factory/default map mein 25/26 kisi function ko nahi diye gaye, is
+// liye default behaviour waisa hi.
 static inline uint8_t rsh_pinmap_uses_pin(const RshPinMap *map, uint8_t pin) {
   if (!map || pin == RSH_PINMAP_ABSENT) return 0;
   if (map->steer == pin || map->accel == pin || map->brake == pin ||
       map->clutch == pin || map->handbrake == pin || map->battery == pin ||
       map->gearUp == pin || map->gearDown == pin || map->horn == pin ||
-      map->enc1A == pin || map->enc1B == pin || map->enc2A == pin ||
-      map->enc2B == pin || map->ledStrip == pin)
+      map->ledStrip == pin)
     return 1;
-  for (int i = 0; i < 6; i++)
-    if (map->shiftH[i] == pin) return 1;
   return 0;
 }
 
@@ -191,23 +171,14 @@ static inline uint8_t rsh_pinmap_from_blob(const uint8_t *blob, size_t len,
   if (rsh_cfg_blob_validate(blob, len, NULL, NULL) != RSH_CTRL_OK) return 0;
   RshPinMap m;
   memset(&m, RSH_PINMAP_ABSENT, sizeof(m));
-  m.shifterMode = RSH_SHIFTER_MODE;  // SHIFTER record na ho to sequential
   m.handbrakeButtonMode = 0;  // F-15: default axis mode (memset 0xFF ke baad saaf karo)
   m.as5600Rotation = 0;  // FW-01: memset 0xFF ke baad saaf karo (default 360°)
   m.as5600Multiturn = 0;
-  // H-pattern gear pins bhi default rakho — sequential mode mein istemal
-  // nahi hote, lekin GET_CAPS/debug mein kabhi kachra na dikhe.
-  m.shiftH[0] = PIN_SHIFT_H1;
-  m.shiftH[1] = PIN_SHIFT_H2;
-  m.shiftH[2] = PIN_SHIFT_H3;
-  m.shiftH[3] = PIN_SHIFT_H4;
-  m.shiftH[4] = PIN_SHIFT_H5;
-  m.shiftH[5] = PIN_SHIFT_H6;
   uint8_t mc = blob[5];
   for (uint8_t i = 0; i < mc; i++) {
     const uint8_t *r = blob + RSH_CFG_HEADER_SIZE + (size_t)i * RSH_CFG_RECORD_SIZE;
     uint8_t type = r[0], slot = r[1];
-    uint8_t pinA = r[3], pinB = r[4];
+    uint8_t pinA = r[3];
     switch (type) {
       case RSH_CFG_TYPE_AXIS_ADC:
       case RSH_CFG_TYPE_AXIS_ADS1115:
@@ -273,50 +244,22 @@ static inline uint8_t rsh_pinmap_from_blob(const uint8_t *blob, size_t len,
         if (dst && *dst == RSH_PINMAP_ABSENT) *dst = pinA;
         break;
       }
-      case RSH_CFG_TYPE_ENCODER: {
-        uint8_t *dstA = NULL, *dstB = NULL;
-        if (slot == RSH_PINMAP_ENC_1) { dstA = &m.enc1A; dstB = &m.enc1B; }
-        else if (slot == RSH_PINMAP_ENC_2) { dstA = &m.enc2A; dstB = &m.enc2B; }
-        if (dstA && *dstA == RSH_PINMAP_ABSENT) *dstA = pinA;
-        if (dstB && *dstB == RSH_PINMAP_ABSENT) *dstB = pinB;
-        break;
-      }
       case RSH_CFG_TYPE_LED_STRIP:
         if (slot == 0 && pinA != RSH_PINMAP_ABSENT && m.ledStrip == RSH_PINMAP_ABSENT)
           m.ledStrip = pinA;
         break;
-      case RSH_CFG_TYPE_SHIFTER: {
-        // mode params[0] mein hai (record offset 6). Validator mode
-        // 0/1 + H-pattern mein 6 gear pins pehle hi check kar chuka hai.
-        uint8_t mode = r[6];
-        m.shifterMode = mode <= 1 ? mode : RSH_SHIFTER_MODE;
-        if (m.shifterMode == 1) {  // H-pattern (RSH_SHIFTER_HPATTERN, modules.h)
-          m.shiftH[0] = r[3];   // gear 1 (pinA)
-          m.shiftH[1] = r[4];   // gear 2 (pinB)
-          m.shiftH[2] = r[5];   // gear 3 (pinC)
-          m.shiftH[3] = r[7];   // gear 4 (params[1])
-          m.shiftH[4] = r[8];   // gear 5 (params[2])
-          m.shiftH[5] = r[9];   // gear 6 (params[3])
-        }
-        break;
-      }
       default:
         break;  // BUTTON_MATRIX (P1-3: COMMIT par reject) aur EXPANDER
                 // (v4.0.4: COMMIT par reject) ka koi consumer nahi —
                 // valid blob mein ye records aate hi nahi (from_blob
                 // pehle validate karta hai), is liye default ignore.
+                // ENCODER records (type 5) bhi yahin girte hain —
+                // v2.0.19 mein validator inhein reject karta hai.
+                // SHIFTER record (type 11) se pinmap kuch nahi leta —
+                // sensitivity rsh_cfg_shifter_sensitivity() blob se
+                // seedha parhta hai; gate mode DELETE hai (sequential
+                // hi hai, validator mode != 0 reject karta hai).
     }
-  }
-  // Quadrature decoder ko dono channels chahiye — ek channel akela ho
-  // to poora encoder absent (aadha encoder step nahi karta, count
-  // ghalat hota — fail closed).
-  if (m.enc1A == RSH_PINMAP_ABSENT || m.enc1B == RSH_PINMAP_ABSENT) {
-    m.enc1A = RSH_PINMAP_ABSENT;
-    m.enc1B = RSH_PINMAP_ABSENT;
-  }
-  if (m.enc2A == RSH_PINMAP_ABSENT || m.enc2B == RSH_PINMAP_ABSENT) {
-    m.enc2A = RSH_PINMAP_ABSENT;
-    m.enc2B = RSH_PINMAP_ABSENT;
   }
   *out = m;
   return 1;

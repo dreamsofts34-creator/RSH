@@ -115,6 +115,12 @@ encoders, 64 wire buttons — **wire ceilings, not implemented
 counts** (R3-FW-07): the firmware can ever emit at most **5 axes**
 (steering, accel, brake, clutch, handbrake — `stream_emit.h`)
 and **2 encoders** (`n_enc > 2` → stream builder returns 0).
+
+> **v2.0.19 (firmware 4.0.7): encoders are REMOVED — the board
+> sends `n_enc = 0` and no encoder counts, and the app no
+> longer reads them. The frame SHAPE is unchanged (protocol
+> v2.2 frozen): `encoders` stays a wire field of width 4 in
+> the decoder, always zero. Reserved-zero, never resized.
 `seq` is the stream's own u16
 sequence (unchanged from v2.1); stream frames have no HMAC in
 any version — an altered packet fails CRC16 and is dropped, and
@@ -132,22 +138,27 @@ horn on the wrong bit:
 | --- | --- |
 | 0 | shift-up (sequential) |
 | 1 | shift-down (sequential) |
-| 2 | accel pedal, button mode (digital pedal press) |
-| 3 | brake pedal, button mode (digital pedal press) |
+| 2 | accel pedal, button mode — REMOVED in v2.0.19, reserved 0 |
+| 3 | brake pedal, button mode — REMOVED in v2.0.19, reserved 0 |
 | 4 | horn |
-| 5–10 | H-pattern gears 1–6 (one bit per gear) |
-| 11–31 | wheel buttons (BUTTON slots) |
-| 32–63 | extended buttons (`btns_ex` in the 38 B status packet) |
+| 5–10 | H-pattern gears 1–6 — REMOVED in v2.0.19, reserved 0 (sequential-only) |
+| 11–31 | wheel buttons — REMOVED in v2.0.19, reserved 0 |
+| 32–63 | extended buttons (`btns_ex` in the 38 B status packet) — REMOVED in v2.0.19, reserved 0 |
 
-Canonical source: `firmware/modules.h` (`RSH_BTN2_HORN 4`,
-`RSH_BTN2_ACCEL 2`, `RSH_BTN2_BRAKE 3`) and
-`crates/rsh-engine/src/pipeline.rs` (`HORN_BIT`,
-`PEDAL_BUTTON_BITS`). The host pipeline strips bits 2/3 before
-debounce/output — they are NOT wheel buttons: in pedal
-button-mode the firmware drives the accel/brake axis from the
-debounced pedal bit (4095 pressed / 0 released) and the axis is
-what the game sees. A bit-2 press must never honk and a bit-4
-press must never reach the game as a pedal.
+> **v2.0.19:** only bits 0/1/4 survive (shifter up/down,
+> horn). Firmware 4.0.7 sends every other bit as 0, and the
+> app strips/ignores them before the output — a set bit
+> 2/3/5–63 is never delivered to a game. The `buttons u32`
+> word itself is unchanged on the wire (protocol v2.2 frozen).
+
+Canonical source: `firmware/modules.h` (`RSH_BTN2_HORN 4`) and
+`crates/rsh-engine/src/pipeline.rs` (`HORN_BIT`). The host
+pipeline keeps only bits 0/1/4 — every other bit is stripped
+before output. (Pre-v2.0.19 note, kept for history: bits 2/3
+were pedal button-mode bits the pipeline stripped before
+debounce/output; in pedal button-mode the firmware drove the
+accel/brake axis from the debounced pedal bit and the axis was
+what the game saw.)
 
 ### 1.4 Status packets (board → PC, 1 Hz) — `0xA6`
 
@@ -183,6 +194,10 @@ offset  field (base 34 B)
 extended 38 B form: btns_ex u32 LE (buttons 32–63, bit n−32)
 at 28..31; seq_gap at 32..33; tx_fail at 34..35; CRC16 at
 36..37 (over bytes 0..35).
+
+> **v2.0.19:** the extended form still parses (wire-frozen),
+> but firmware 4.0.7 never sends extended buttons and the app
+> no longer merges `btns_ex` — extended buttons are reserved 0.
 ```
 
 - **`overruns` is a wrap-aware u16 counter (R3-FW-09):** the

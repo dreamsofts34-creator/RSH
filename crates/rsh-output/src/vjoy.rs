@@ -57,23 +57,22 @@
 //! the 10-minute idle check in the game-compatibility matrix (Phase F,
 //! Windows PC).
 //!
-//! # Mapping (`ProcessedState` → `JOYSTICK_POSITION`)
+//! # Mapping (`ProcessedState` -> `JOYSTICK_POSITION`)
 //!
 //! Pure function [`build_position`], modelled on the C#
 //! `VJoyOutput.BuildPosition` (56-test `RSH.VJoy.Tests` suite):
-//! steering → X (+ V3 `wSteering`), accelerator → Y (+ V3
-//! `wAccelerator`), brake → Z (+ V3 `wBrake`), clutch → V3 `wClutch`
-//! AND Rx (FH4 fix, v2.0.14 — Rx is the `GameInput` clutch axis,
-//! `RawGameController` axis 3; the Rx write is caps-gated, the
-//! `wClutch` write stays caps-independent as before), handbrake →
-//! `wSlider` (HID usage `0x36`, caps-gated), POV/hats always neutral
-//! (`0xFFFF_FFFF` — this wheel has no hat input). Buttons 1–32 →
-//! `lButtons`; buttons 33–64 (`OutputState::buttons_ex`) →
-//! `lButtonsEx1`; encoder pulses 65–72 → `lButtonsEx2`;
-//! `lButtonsEx3` is always 0 (no wire source for 97–128). D9: a
-//! button above 32 is **never folded or clamped into** `lButtons` —
-//! each word maps to its own field; [`check_button_number`] rejects a
-//! single button number outside 1–32 for the `lButtons` word.
+//! steering -> X (+ V3 `wSteering`), accelerator -> Y (+ V3
+//! `wAccelerator`), brake -> Z (+ V3 `wBrake`), clutch -> V3 `wClutch`
+//! AND Rx (the feed writes the clutch to Rx as well as to `wClutch`; the
+//! Rx write is caps-gated, the `wClutch` write stays caps-independent
+//! as before), handbrake -> `wSlider` (HID usage `0x36`, caps-gated),
+//! POV/hats always neutral (`0xFFFF_FFFF` - this wheel has no hat
+//! input). Buttons 1-32 -> `lButtons`; `lButtonsEx1`/`lButtonsEx2`/
+//! `lButtonsEx3` are always 0 (v2.0.19: the buttons/encoders cleanup
+//! deleted every source for buttons 33-128). D9: a button above 32 is
+//! **never folded or clamped into** `lButtons` - each word maps to its
+//! own field; [`check_button_number`] rejects a single button number
+//! outside 1-32 for the `lButtons` word.
 //!
 //! # Windows-only (real-DLL verification, not done here)
 //!
@@ -91,7 +90,6 @@ use std::fmt::Write as _;
 use std::fs;
 use std::mem::{offset_of, size_of};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use libloading::{Library, Symbol};
 use rsh_engine::pipeline::{OutputState, PipelinePlan};
@@ -493,8 +491,7 @@ const _: () = assert!(offset_of!(JoystickPosition, w_axis_vbrz) == 120);
 // Capabilities (D11)
 // ---------------------------------------------------------------------
 
-/// The `EmuWheel` envelope shape of a vJoy device (FH4 fix batch,
-/// v2.0.14): the four axes [`VJoyCapabilities`] never measured
+/// The envelope shape of a vJoy device (v2.0.14): the four axes [`VJoyCapabilities`] never measured
 /// (Rx/Ry/Rz/Dial) and the POV counts (discrete 1, continuous 0 —
 /// `-s 1` is the discrete flag, `-p` would be continuous;
 /// verified against the upstream vJoyConfig source).
@@ -502,8 +499,7 @@ const _: () = assert!(offset_of!(JoystickPosition, w_axis_vbrz) == 120);
 /// A device without the envelope still feeds (see
 /// [`validate_envelope`]) — these fields only *report* the shape,
 /// they never gate feeding. FFB is deliberately NOT here: it is a
-/// wheel-check diagnostic only (FH4 does not send FFB to vJoy, so
-/// input works without it).
+/// input works without it (Forza does not send FFB to vJoy).
 // Four bools because the envelope IS four axes (Rx/Ry/Rz/Dial);
 // grouping them into a bitmask would hide which axis is missing
 // from the report, so the pedantic bool-count lint is allowed here.
@@ -614,24 +610,6 @@ impl VJoyCapabilities {
     pub fn button_mask(&self) -> u32 {
         block_mask(self.button_count, 1)
     }
-
-    /// Mask for vJoy buttons 33–64 (`lButtonsEx1`).
-    #[must_use]
-    pub fn ex1_mask(&self) -> u32 {
-        block_mask(self.button_count, 33)
-    }
-
-    /// Mask for vJoy buttons 65–96 (`lButtonsEx2`).
-    #[must_use]
-    pub fn ex2_mask(&self) -> u32 {
-        block_mask(self.button_count, 65)
-    }
-
-    /// Mask for vJoy buttons 97–128 (`lButtonsEx3`).
-    #[must_use]
-    pub fn ex3_mask(&self) -> u32 {
-        block_mask(self.button_count, 97)
-    }
 }
 
 /// Bitmask for the 32-button block starting at 1-based `first_button`
@@ -677,32 +655,38 @@ pub fn validate_capabilities(plan: &PipelinePlan, caps: &VJoyCapabilities) -> Ve
     if plan.handbrake.enabled && !caps.has_axis_slider {
         errors.push("Handbrake module is on but the vJoy device has no Slider axis.".to_string());
     }
-    if plan.buttons.enabled && caps.button_count < 1 {
-        errors.push("Buttons module is on but the vJoy device has no buttons.".to_string());
+    if plan.shifter.enabled && caps.button_count < 2 {
+        errors.push(
+            "Shifter module is on but the vJoy device has fewer than 2 buttons (shifter is buttons 1-2)."
+                .to_string(),
+        );
+    }
+    if plan.horn.enabled && caps.button_count < 5 {
+        errors.push(
+            "Horn module is on but the vJoy device has fewer than 5 buttons (horn is button 5)."
+                .to_string(),
+        );
     }
     errors
 }
 
-/// Validate a device's shape against the `EmuWheel` envelope
-/// (FH4 fix batch, v2.0.14): 128 buttons, all 8 axes, exactly one
+/// Validate a device's shape against the vJoy envelope (v2.0.14): 128 buttons, all 8 axes, exactly one
 /// discrete POV hat and no continuous POV.
 ///
 /// REPORTS ONLY — it never refuses a connect. A default-shape
 /// vJoy device (32 buttons, no FFB) connects and feeds silently
 /// today (ETS2 and friends depend on it), and that stays true:
 /// the caller stores the returned problems (see
-/// [`VJoyOutput::envelope_warnings`]) and the wheel check
-/// (`wheel_check::run_wheel_check`) re-measures the live shape —
-/// it does not fail `try_connect`. The old module docs claimed
+/// [`VJoyOutput::envelope_warnings`]); the envelope warnings
+/// are surfaced in diagnostics — it does not fail `try_connect`. The old module docs claimed
 /// the connect-time caps read "is the verification" for the
 /// envelope; that was false (the caps read never checked buttons
 /// beyond range, Rx/Ry/Rz/Dial, POVs, or FFB) — this function is
-/// the envelope verification, and the wheel check is the live
-/// reporter. Unmeasured fields never report: a POV count of `-1`
+/// the envelope verification. Unmeasured fields never report: a POV count of `-1`
 /// (not read) and extra axes from [`VJoyCapabilities::new`]
 /// (assumed present — the pre-envelope constructor cannot measure
 /// them) are skipped. FFB is deliberately NOT checked here: it is
-/// a wheel-check diagnostic only (FH4 does not send FFB to vJoy).
+/// not checked here: input works without it (Forza does not send FFB to vJoy).
 /// Returns the list of problems; empty means the envelope matches
 /// (or nothing measurable was missing).
 #[must_use]
@@ -815,11 +799,10 @@ pub fn pedal_to_axis(value: f32) -> i32 {
 /// The safe neutral position: wheel straight, pedals released,
 /// handbrake released, no buttons, hats neutral.
 ///
-/// Slider neutral is `AXIS_MIN`, not centre — centre would be half a
+/// Slider neutral is `AXIS_MIN`, not centre - centre would be half a
 /// handbrake. Pedals are `AXIS_MIN` for the same reason; only the
-/// steering-class axes sit at centre. Rx is the clutch axis (FH4
-/// fix, v2.0.14 — the feed writes the clutch to Rx as well as to
-/// `wClutch`, so `GameInput` can map it), so its neutral is
+/// steering-class axes sit at centre. Rx is the clutch axis (the feed
+/// writes the clutch to Rx as well as to `wClutch`), so its neutral is
 /// `AXIS_MIN` too: released clutch, not half clutch.
 #[must_use]
 pub fn neutral_position(device_id: u32) -> JoystickPosition {
@@ -875,13 +858,9 @@ const fn bits_to_i32(bits: u32) -> i32 {
 /// silently dropping when the plan needs them).
 ///
 /// Notes on fields with no source here:
-/// * `gear` (H-pattern decode) has no vJoy field — the pipeline
-///   strips gear bits 5–10 from the button word, so the game sees the
-///   gear through the buttons the pipeline emits, not through this
-///   struct. Same as the C# series.
-/// * `lButtonsEx3` (buttons 97–128) is always 0: the wire carries at
-///   most 64 buttons (`buttons` + `buttons_ex`) plus encoder pulses
-///   65–72, so there is no source for 97–128.
+/// * `lButtonsEx1`/`lButtonsEx2`/`lButtonsEx3` (buttons 33-128) are
+///   always 0: v2.0.19 deleted every source for them (buttons/encoders
+///   cleanup). Same as the C# series.
 #[must_use]
 pub fn build_position(
     state: &OutputState,
@@ -906,12 +885,11 @@ pub fn build_position(
     }
     // Clutch is caps-independent for `wClutch` (it has no HID usage
     // to query, and the driver ignores the field when the axis is
-    // absent) — but it ALSO feeds Rx (FH4 fix, v2.0.14): Rx is the
-    // `GameInput` clutch axis (RawGameController axis 3), so a wheel
-    // game can see the clutch. Rx is caps-gated (the driver ignores
-    // the field when the axis is absent, same as the other axes);
-    // `wClutch` keeps its old unconditional write for the games
-    // that read the V3 driving axis.
+    // absent) - but it ALSO feeds Rx: Rx is the clutch axis, so a
+    // wheel game can see the clutch. Rx is caps-gated (the driver
+    // ignores the field when the axis is absent, same as the other
+    // axes); `wClutch` keeps its old unconditional write for the
+    // games that read the V3 driving axis.
     p.w_clutch = pedal_to_axis(state.clutch);
     if caps.envelope.has_axis_rx {
         p.w_axis_x_rot = pedal_to_axis(state.clutch);
@@ -919,70 +897,24 @@ pub fn build_position(
     if caps.has_axis_slider {
         p.w_slider = pedal_to_axis(state.handbrake);
     }
-    // D9: the 1–32 word maps ONLY to `lButtons`. Buttons 33–64 live in
-    // `buttons_ex` → Ex1, encoder pulses 65–72 → Ex2. Nothing is ever
+    // D9: the 1-32 word maps ONLY to `lButtons`. Nothing is ever
     // folded or clamped from a higher word into `lButtons`.
+    // v2.0.19: Ex1/Ex2/Ex3 are always 0 - the buttons/encoders
+    // cleanup deleted every source for buttons 33-128.
     p.l_buttons = bits_to_i32(state.buttons & caps.button_mask());
-    p.l_buttons_ex1 = bits_to_i32(state.buttons_ex & caps.ex1_mask());
-    p.l_buttons_ex2 = bits_to_i32(u32::from(state.encoder_buttons.0) & caps.ex2_mask());
+    p.l_buttons_ex1 = 0;
+    p.l_buttons_ex2 = 0;
     p.l_buttons_ex3 = 0;
     p
 }
 
-/// Steam FH4 mode hysteresis (FH4 fix, v2.0.15): when no live axis
-/// moved by [`STEAM_FH4_NOISE_COUNTS`] or more since `last`, copy
-/// every live axis (plus its V3 mirror) back to its last sent value,
-/// so the resulting position dedupes to "unchanged". When any axis
-/// moved by the threshold or more, `new` is left untouched — all
-/// axes go out with new values. Buttons and hats are never touched.
-///
-/// The live axes are the ones [`build_position`] ever moves off
-/// neutral: X (+ `w_steering` mirror), Y (+ `w_accelerator`), Z (+
-/// `w_brake`), Rx/clutch (+ `w_clutch`), and Slider/handbrake.
-/// Everything else in the struct is a neutral constant, so it is
-/// already equal between `new` and `last` whenever the live axes
-/// are.
-fn apply_axis_hysteresis(new: &mut JoystickPosition, last: &JoystickPosition) {
-    let moved = [
-        new.w_axis_x,
-        new.w_axis_y,
-        new.w_axis_z,
-        new.w_axis_x_rot,
-        new.w_slider,
-        new.w_clutch,
-    ]
-    .iter()
-    .zip([
-        last.w_axis_x,
-        last.w_axis_y,
-        last.w_axis_z,
-        last.w_axis_x_rot,
-        last.w_slider,
-        last.w_clutch,
-    ])
-    .any(|(a, b)| (a - b).abs() >= STEAM_FH4_NOISE_COUNTS);
-    if !moved {
-        new.w_axis_x = last.w_axis_x;
-        new.w_steering = last.w_steering;
-        new.w_axis_y = last.w_axis_y;
-        new.w_accelerator = last.w_accelerator;
-        new.w_axis_z = last.w_axis_z;
-        new.w_brake = last.w_brake;
-        new.w_axis_x_rot = last.w_axis_x_rot;
-        new.w_clutch = last.w_clutch;
-        new.w_slider = last.w_slider;
-    }
-}
-
-/// D9: validate a single physical button number for the 1–32
+/// D9: validate a single physical button number for the 1-32
 /// `lButtons` word.
 ///
-/// Buttons 1–32 pass; anything else (0, 33, 128, …) is rejected with
-/// [`VJoyError::ButtonOutOfRange`] — never clamped onto 1–32.
-/// Buttons 33–64 and encoder pulses 65–72 are not "button 33 in the
-/// 1–32 word": they travel in their own words (`buttons_ex`,
-/// `EncoderButtons`) and map to `lButtonsEx1`/`lButtonsEx2` — see
-/// [`build_position`].
+/// Buttons 1-32 pass; anything else (0, 33, 128, ...) is rejected with
+/// [`VJoyError::ButtonOutOfRange`] - never clamped onto 1-32.
+/// Buttons above 32 have no word any more (v2.0.19 deleted every
+/// source for them) - see [`build_position`].
 ///
 /// # Errors
 ///
@@ -1454,45 +1386,7 @@ pub struct VJoyOutput {
     /// backend marks itself disconnected (status `Error`) instead of
     /// reporting success-then-failure forever on a lost device.
     consecutive_update_failures: u32,
-    /// Steam FH4 wheel mode (FH4 fix, v2.0.15 — see
-    /// [`IJoystickOutput::set_steam_fh4_mode`](crate::IJoystickOutput::set_steam_fh4_mode)):
-    /// when on, `update()` dedupes idle positions and hysteresis-filters
-    /// idle axis noise. Off by default; pushed in by `AppStateCore`
-    /// on connect and on toggle.
-    steam_fh4_mode: bool,
-    /// Last position actually sent to the driver (Steam FH4 mode
-    /// only): the dedupe / hysteresis reference. `None` until the
-    /// first sent update — reset on connect and disconnect, and
-    /// whenever the mode is (re-)enabled, so a stale reference can
-    /// never suppress a real move.
-    last_sent: Option<JoystickPosition>,
-    /// When `last_sent` was sent (Steam FH4 mode only): the
-    /// keepalive clock — an unchanged position is still re-sent
-    /// once the keepalive expires, so the device never looks idle
-    /// to a game.
-    last_sent_at: Instant,
 }
-
-/// Idle-update keepalive in Steam FH4 mode (FH4 fix, v2.0.15): an
-/// unchanged position is re-sent at most this often. 100 ms is 10 Hz
-/// of idle activity — the engine still ticks every 5 ms
-/// (`TICK_INTERVAL`, `rsh-engine`), and `send_engine_output` calls
-/// `update()` unconditionally on every tick, so the dedupe below is
-/// what turns 200 Hz of identical writes into a 10 Hz keepalive.
-/// The 250 ms board-frame watchdog (`STALE_THRESHOLD`,
-/// `rsh-engine::watchdog`) is a *board*-frame watchdog, not a
-/// vJoy/game watchdog — the keepalive is not claimed to satisfy it;
-/// it only keeps the game seeing a live device.
-pub const STEAM_FH4_KEEPALIVE: Duration = Duration::from_millis(100);
-
-/// Per-axis idle-noise hysteresis in Steam FH4 mode (FH4 fix,
-/// v2.0.15), in raw axis counts: a new axis value within this many
-/// counts of the last sent value keeps the old value. 32 counts is
-/// ~0.1% of the 32768-count range — above the ESP32 ADC's idle
-/// jitter (~±24 counts from ±3 LSB) and below any deliberate input,
-/// so idle noise is swallowed without dulling a real move. Buttons
-/// and hats never get hysteresis: a button press is never noise.
-pub const STEAM_FH4_NOISE_COUNTS: i32 = 32;
 
 /// Consecutive failed updates after which vJoy marks itself
 /// disconnected (M2). One or two failures are transient (the old
@@ -1517,9 +1411,6 @@ impl VJoyOutput {
             status: VJoyStatus::idle(),
             envelope_warnings: Vec::new(),
             consecutive_update_failures: 0,
-            steam_fh4_mode: false,
-            last_sent: None,
-            last_sent_at: Instant::now(),
         }
     }
 
@@ -1660,7 +1551,6 @@ impl VJoyOutput {
                 self.envelope_warnings = envelope_warnings;
                 self.connected = true;
                 self.consecutive_update_failures = 0;
-                self.last_sent = None;
                 self.status = VJoyStatus {
                     kind: VJoyStateKind::Ready,
                     message: format!(
@@ -1712,7 +1602,6 @@ impl VJoyOutput {
         }
         self.connected = false;
         self.consecutive_update_failures = 0;
-        self.last_sent = None;
         if let Some(dll) = self.dll.as_mut() {
             let neutral = neutral_position(self.device_id);
             let _ = dll.update_vjd(self.device_id, &neutral);
@@ -1835,15 +1724,6 @@ impl IJoystickOutput for VJoyOutput {
         self.status.driver_version.clone()
     }
 
-    /// Steam FH4 wheel mode (FH4 fix, v2.0.15): enabling resets
-    /// the dedupe reference, so the first update after the toggle
-    /// is always sent (a stale reference must never suppress a
-    /// real move the user made while the mode was off).
-    fn set_steam_fh4_mode(&mut self, enabled: bool) {
-        self.steam_fh4_mode = enabled;
-        self.last_sent = None;
-    }
-
     fn disconnect(&mut self) {
         self.disconnect_inner();
     }
@@ -1861,40 +1741,11 @@ impl IJoystickOutput for VJoyOutput {
         } else {
             VJoyCapabilities::unknown()
         };
-        let mut position = build_position(state, &caps, self.device_id);
-        if self.steam_fh4_mode {
-            // Fix 2 (FH4 fix, v2.0.15): idle-noise hysteresis — when
-            // NO live axis moved by STEAM_FH4_NOISE_COUNTS or more,
-            // keep every axis at its last sent value, so ADC jitter
-            // never reaches the driver. When ANY axis exceeds the
-            // threshold, ALL axes go out with their new values, so
-            // a real move loses no precision and gains no lag.
-            // Buttons and hats are never hysteresis-filtered.
-            if let Some(last) = self.last_sent {
-                apply_axis_hysteresis(&mut position, &last);
-            }
-            // Fix 1 (FH4 fix, v2.0.15): idle dedupe with keepalive
-            // — an unchanged position is not re-sent until the
-            // keepalive expires (10 Hz idle activity instead of
-            // 200 Hz of identical writes), so the game stops seeing
-            // a constantly-twitching controller in its menus.
-            if self
-                .last_sent
-                .as_ref()
-                .is_some_and(|last| last == &position)
-                && self.last_sent_at.elapsed() < STEAM_FH4_KEEPALIVE
-            {
-                return Ok(());
-            }
-        }
+        let position = build_position(state, &caps, self.device_id);
         let dll = self.dll.as_mut().expect("connected implies a DLL");
         let updated = dll.update_vjd(self.device_id, &position);
         if updated {
             self.consecutive_update_failures = 0;
-            if self.steam_fh4_mode {
-                self.last_sent = Some(position);
-                self.last_sent_at = Instant::now();
-            }
             Ok(())
         } else {
             // M2: N consecutive failures = the device is gone — mark
@@ -1936,13 +1787,6 @@ impl IJoystickOutput for VJoyOutput {
         // Best-effort by design (C# parity): a failed neutral send is
         // swallowed, never fatal — disconnect still relinquishes.
         let _ = dll.update_vjd(self.device_id, &neutral);
-        // Steam FH4 mode: the device IS neutral now, so the dedupe
-        // reference must be neutral too — otherwise the next real
-        // update compares against a stale pre-neutral position.
-        if self.steam_fh4_mode {
-            self.last_sent = Some(neutral);
-            self.last_sent_at = Instant::now();
-        }
         Ok(())
     }
 }
@@ -1971,8 +1815,6 @@ fn sha256_hex(path: &Path) -> Result<String, VJoyError> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use rsh_engine::encoder::EncoderButtons;
-
     use super::*;
     use crate::IJoystickOutput;
 
@@ -1997,14 +1839,17 @@ mod tests {
         accel: bool,
         brake: bool,
         handbrake: bool,
-        buttons: bool,
+        horn: bool,
     ) -> PipelinePlan {
         let mut plan = PipelinePlan::default();
         plan.steering.enabled = steering;
         plan.accelerator.enabled = accel;
         plan.brake.enabled = brake;
         plan.handbrake.enabled = handbrake;
-        plan.buttons.enabled = buttons;
+        plan.horn.enabled = horn;
+        // Shifter is not a plan_with parameter: keep it off so the
+        // shifter button check does not fire in unrelated tests.
+        plan.shifter.enabled = false;
         plan
     }
 
@@ -2376,54 +2221,6 @@ mod tests {
     }
 
     #[test]
-    fn mapping_buttons_ex_to_ex1_and_ex2() {
-        // buttons_ex is the 33–64 word (u32); Ex2 comes from encoder
-        // pulses only — the wire has no 65–96 source (C# parity: the
-        // upper half of the C# u64 mask was always 0 from the wire).
-        let s = OutputState {
-            buttons_ex: u32::MAX,
-            ..OutputState::default()
-        };
-        let caps = VJoyCapabilities::new(true, true, true, 128, true);
-        let p = build_position(&s, &caps, 1);
-        assert_eq!(p.l_buttons_ex1, -1); // buttons 33–64, all set
-        assert_eq!(p.l_buttons_ex2, 0); // no pulses
-        assert_eq!(p.l_buttons_ex3, 0); // buttons 97–128: no source
-        assert_eq!(p.l_buttons, 0);
-    }
-
-    #[test]
-    fn mapping_buttons_ex_single_bit() {
-        // 0-based button 37 (vJoy 38) -> Ex1 bit 5.
-        let s = OutputState {
-            buttons_ex: 0x20,
-            ..OutputState::default()
-        };
-        let caps = VJoyCapabilities::new(true, true, true, 64, true);
-        let p = build_position(&s, &caps, 1);
-        assert_eq!(p.l_buttons_ex1, 0x20);
-        assert_eq!(p.l_buttons_ex2, 0);
-        assert_eq!(p.l_buttons_ex3, 0);
-    }
-
-    #[test]
-    fn mapping_ex_masked_to_button_count() {
-        let s = OutputState {
-            buttons_ex: u32::MAX,
-            ..OutputState::default()
-        };
-        // 40 buttons: Ex1 only the first 8 bits (33–40).
-        let p40 = build_position(&s, &VJoyCapabilities::new(true, true, true, 40, true), 1);
-        assert_eq!(p40.l_buttons_ex1, 0xFF);
-        assert_eq!(p40.l_buttons_ex2, 0);
-        // 70 buttons: Ex1 full, Ex2 only the first 6 bits (65–70) —
-        // from pulses, tested below; wire Ex2 is 0 here.
-        let p70 = build_position(&s, &VJoyCapabilities::new(true, true, true, 70, true), 1);
-        assert_eq!(p70.l_buttons_ex1, -1);
-        assert_eq!(p70.l_buttons_ex2, 0);
-    }
-
-    #[test]
     fn mapping_unknown_caps_writes_everything() {
         let s = OutputState {
             steering: 1.0,
@@ -2455,21 +2252,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn d9_buttons_ex_never_leaks_into_lbuttons() {
-        // The D9 core: a >32 button must never be folded into the
-        // 1–32 word, even when the device has few buttons.
-        let s = OutputState {
-            buttons: 0,
-            buttons_ex: u32::MAX,
-            ..OutputState::default()
-        };
-        let p = build_position(&s, &VJoyCapabilities::new(true, true, true, 34, true), 1);
-        assert_eq!(p.l_buttons, 0);
-        assert_eq!(p.l_buttons_ex1, 0b11);
-    }
-
-    // ---- mapping: clutch / handbrake / encoders ----------------------
+    // ---- mapping: clutch / handbrake --------------------------------
 
     #[test]
     fn mapping_clutch_to_wclutch() {
@@ -2547,58 +2330,6 @@ mod tests {
     }
 
     #[test]
-    fn mapping_encoder_pulses_to_ex2() {
-        // enc0 CW (button 65 -> Ex2 bit 0) + enc1 CCW (button 68 -> bit 3).
-        let s = OutputState {
-            encoder_buttons: EncoderButtons(0b1001),
-            ..OutputState::default()
-        };
-        let caps = VJoyCapabilities::new(true, true, true, 128, true);
-        let p = build_position(&s, &caps, 1);
-        assert_eq!(p.l_buttons_ex2, 0b1001);
-        assert_eq!(p.l_buttons_ex1, 0);
-        assert_eq!(p.l_buttons_ex3, 0);
-        assert_eq!(p.l_buttons, 0);
-
-        // All 4 encoders, both directions -> bits 0..7 (buttons 65–72).
-        let all = OutputState {
-            encoder_buttons: EncoderButtons(0xFF),
-            ..OutputState::default()
-        };
-        assert_eq!(build_position(&all, &caps, 1).l_buttons_ex2, 0xFF);
-    }
-
-    #[test]
-    fn mapping_encoder_pulses_or_with_wire_ex() {
-        // Wire Ex1 bits and encoder pulses coexist in their own fields.
-        let s = OutputState {
-            buttons_ex: 0x20,                        // vJoy 38 -> Ex1 bit 5
-            encoder_buttons: EncoderButtons(0b0001), // vJoy 65 -> Ex2 bit 0
-            ..OutputState::default()
-        };
-        let caps = VJoyCapabilities::new(true, true, true, 128, true);
-        let p = build_position(&s, &caps, 1);
-        assert_eq!(p.l_buttons_ex1, 0x20);
-        assert_eq!(p.l_buttons_ex2, 0b0001);
-    }
-
-    #[test]
-    fn mapping_encoder_pulses_masked_to_button_count() {
-        let s = OutputState {
-            encoder_buttons: EncoderButtons(0xFF),
-            ..OutputState::default()
-        };
-        // 70 buttons: only 65–70 (Ex2 bits 0..5).
-        let p70 = build_position(&s, &VJoyCapabilities::new(true, true, true, 70, true), 1);
-        assert_eq!(p70.l_buttons_ex2, 0x3F);
-        // 64 or fewer buttons: Ex2 fully masked — pulses go nowhere.
-        let p64 = build_position(&s, &VJoyCapabilities::new(true, true, true, 64, true), 1);
-        assert_eq!(p64.l_buttons_ex2, 0);
-        let p32 = build_position(&s, &VJoyCapabilities::new(true, true, true, 32, true), 1);
-        assert_eq!(p32.l_buttons_ex2, 0);
-    }
-
-    #[test]
     fn mapping_hats_always_neutral() {
         let s = state(1.0, 1.0, 1.0);
         let p = build_position(&s, &full_caps(), 1);
@@ -2608,52 +2339,7 @@ mod tests {
         assert_eq!(p.b_hats_ex3, HAT_NEUTRAL);
     }
 
-    #[test]
-    fn mapping_gear_has_no_vjoy_field() {
-        // H-pattern gear has no dedicated vJoy field; the position is
-        // identical with and without a gear engaged.
-        let with_gear = OutputState {
-            gear: 3,
-            ..OutputState::default()
-        };
-        let without_gear = OutputState {
-            gear: 0,
-            ..OutputState::default()
-        };
-        assert_eq!(
-            build_position(&with_gear, &full_caps(), 1),
-            build_position(&without_gear, &full_caps(), 1)
-        );
-    }
-
     // ---- capabilities masks ------------------------------------------
-
-    #[test]
-    fn capability_masks_by_button_count() {
-        let masks = |count: i32| {
-            let caps = VJoyCapabilities::new(true, true, true, count, true);
-            (
-                caps.button_mask(),
-                caps.ex1_mask(),
-                caps.ex2_mask(),
-                caps.ex3_mask(),
-            )
-        };
-        assert_eq!(masks(0), (0, 0, 0, 0));
-        assert_eq!(masks(-1), (0, 0, 0, 0));
-        assert_eq!(masks(1), (0x1, 0, 0, 0));
-        assert_eq!(masks(2), (0b11, 0, 0, 0));
-        assert_eq!(masks(32), (u32::MAX, 0, 0, 0));
-        assert_eq!(masks(33), (u32::MAX, 0x1, 0, 0));
-        assert_eq!(masks(40), (u32::MAX, 0xFF, 0, 0));
-        assert_eq!(masks(64), (u32::MAX, u32::MAX, 0, 0));
-        assert_eq!(masks(65), (u32::MAX, u32::MAX, 0x1, 0));
-        assert_eq!(masks(70), (u32::MAX, u32::MAX, 0x3F, 0));
-        assert_eq!(masks(96), (u32::MAX, u32::MAX, u32::MAX, 0));
-        assert_eq!(masks(97), (u32::MAX, u32::MAX, u32::MAX, 0x1));
-        assert_eq!(masks(128), (u32::MAX, u32::MAX, u32::MAX, u32::MAX));
-        assert_eq!(masks(129), (u32::MAX, u32::MAX, u32::MAX, u32::MAX));
-    }
 
     // ---- validation (D11) --------------------------------------------
 
@@ -2710,11 +2396,11 @@ mod tests {
                 .any(|e| e.contains("Handbrake") && e.contains("Slider"))
         );
         assert!(!errors.iter().any(|e| e.contains("Steering")));
-        assert!(!errors.iter().any(|e| e.contains("Buttons")));
+        assert!(!errors.iter().any(|e| e.contains("Horn")));
     }
 
     #[test]
-    fn validation_buttons_disabled_no_buttons_valid() {
+    fn validation_horn_disabled_no_buttons_valid() {
         let plan = plan_with(true, true, true, false, false);
         let errors =
             validate_capabilities(&plan, &VJoyCapabilities::new(true, true, true, 0, false));
@@ -2722,11 +2408,11 @@ mod tests {
     }
 
     #[test]
-    fn validation_buttons_enabled_no_buttons_invalid() {
+    fn validation_horn_enabled_no_buttons_invalid() {
         let plan = plan_with(true, false, false, false, true);
         let errors =
             validate_capabilities(&plan, &VJoyCapabilities::new(true, true, true, 0, false));
-        assert!(errors.iter().any(|e| e.contains("Buttons")));
+        assert!(errors.iter().any(|e| e.contains("Horn")));
     }
 
     #[test]
@@ -2752,10 +2438,19 @@ mod tests {
     }
 
     #[test]
-    fn validation_button_count_one_with_buttons_valid() {
+    fn validation_button_count_one_with_horn_invalid() {
+        // Horn is button 5: one button is not enough.
         let plan = plan_with(true, false, false, false, true);
         let errors =
             validate_capabilities(&plan, &VJoyCapabilities::new(true, false, false, 1, false));
+        assert!(errors.iter().any(|e| e.contains("Horn")));
+    }
+
+    #[test]
+    fn validation_button_count_five_with_horn_valid() {
+        let plan = plan_with(true, false, false, false, true);
+        let errors =
+            validate_capabilities(&plan, &VJoyCapabilities::new(true, false, false, 5, false));
         assert!(errors.is_empty(), "{errors:?}");
     }
 
@@ -2765,8 +2460,9 @@ mod tests {
         plan.steering.enabled = false;
         plan.accelerator.enabled = false;
         plan.brake.enabled = false;
-        plan.buttons.enabled = false;
+        plan.horn.enabled = false;
         plan.handbrake.enabled = false;
+        plan.shifter.enabled = false;
         plan.clutch.enabled = true;
         let errors =
             validate_capabilities(&plan, &VJoyCapabilities::new(false, false, false, 0, false));
@@ -2819,7 +2515,7 @@ mod tests {
         assert!(ok.is_empty(), "{ok:?}");
     }
 
-    // ---- envelope validation (FH4 fix, v2.0.14) ---------------------
+    // ---- envelope validation (v2.0.14) --------------------------------
 
     /// Caps with a measured full envelope (128 buttons, all extra
     /// axes, 1 discrete POV, 0 continuous).
@@ -3257,146 +2953,6 @@ mod tests {
         assert_eq!(p.w_axis_y, 32768);
         assert_eq!(p.w_axis_z, 32768);
         assert_eq!(p.w_steering, 32768);
-    }
-
-    // ---- Steam FH4 mode (FH4 fix, v2.0.15) -------------------------
-
-    fn update_calls(handle: &MockHandle) -> usize {
-        handle
-            .calls()
-            .iter()
-            .filter(|call| matches!(call, MockCall::Update(_)))
-            .count()
-    }
-
-    fn steam_mode_output() -> (VJoyOutput, MockHandle) {
-        let (mut out, handle) = connected_output();
-        out.set_steam_fh4_mode(true);
-        (out, handle)
-    }
-
-    #[test]
-    fn steam_fh4_constants_are_32_counts_and_100_ms() {
-        assert_eq!(STEAM_FH4_NOISE_COUNTS, 32);
-        assert_eq!(STEAM_FH4_KEEPALIVE, Duration::from_millis(100));
-    }
-
-    #[test]
-    fn steam_fh4_mode_off_sends_every_update() {
-        // Default (mode off): the old behaviour — every update is sent.
-        let (mut out, handle) = connected_output();
-        let same = state(0.0, 0.0, 0.0);
-        out.update(&same).expect("update succeeds");
-        out.update(&same).expect("update succeeds");
-        assert_eq!(update_calls(&handle), 3); // connect neutral + 2 updates
-    }
-
-    #[test]
-    fn steam_fh4_mode_dedupes_unchanged_position() {
-        let (mut out, handle) = steam_mode_output();
-        let same = state(0.0, 0.0, 0.0);
-        out.update(&same).expect("first update sends");
-        assert_eq!(update_calls(&handle), 2); // connect neutral + first
-        out.update(&same).expect("dedupe is still Ok");
-        assert_eq!(
-            update_calls(&handle),
-            2,
-            "second identical update must not reach the driver"
-        );
-    }
-
-    #[test]
-    fn steam_fh4_mode_keepalive_resends_after_100_ms() {
-        let (mut out, handle) = steam_mode_output();
-        let same = state(0.0, 0.0, 0.0);
-        out.update(&same).expect("first update sends");
-        out.update(&same).expect("immediate repeat deduped");
-        assert_eq!(update_calls(&handle), 2);
-        std::thread::sleep(Duration::from_millis(110));
-        out.update(&same).expect("keepalive update sends");
-        assert_eq!(
-            update_calls(&handle),
-            3,
-            "same position after the keepalive must be re-sent"
-        );
-    }
-
-    #[test]
-    fn steam_fh4_mode_hysteresis_suppresses_sub_threshold_change() {
-        let (mut out, handle) = steam_mode_output();
-        out.update(&state(0.0, 0.0, 0.0))
-            .expect("first update sends");
-        // +10 counts of steering (16384 -> 16394): below the 32-count
-        // noise band, so the driver must never see it.
-        out.update(&state(10.0 / 16384.0, 0.0, 0.0))
-            .expect("suppressed update is still Ok");
-        assert_eq!(
-            update_calls(&handle),
-            2,
-            "sub-threshold change must not reach the driver"
-        );
-        assert_eq!(
-            handle
-                .positions()
-                .last()
-                .expect("a position was sent")
-                .w_axis_x,
-            16384,
-            "the last sent position still carries the old axis value"
-        );
-    }
-
-    #[test]
-    fn steam_fh4_mode_hysteresis_sends_over_threshold_change() {
-        let (mut out, handle) = steam_mode_output();
-        out.update(&state(0.0, 0.0, 0.0))
-            .expect("first update sends");
-        // +100 counts of steering (16384 -> 16484): over the threshold,
-        // so all axes go out with their new values.
-        out.update(&state(100.0 / 16384.0, 0.0, 0.0))
-            .expect("over-threshold update sends");
-        assert_eq!(update_calls(&handle), 3);
-        assert_eq!(
-            handle
-                .positions()
-                .last()
-                .expect("a position was sent")
-                .w_axis_x,
-            16484
-        );
-    }
-
-    #[test]
-    fn steam_fh4_mode_button_change_still_sends() {
-        // Buttons never get hysteresis or dedupe: a press is never noise.
-        let (mut out, handle) = steam_mode_output();
-        out.update(&state(0.0, 0.0, 0.0))
-            .expect("first update sends");
-        let mut pressed = state(0.0, 0.0, 0.0);
-        pressed.buttons = 1;
-        out.update(&pressed).expect("button press sends");
-        assert_eq!(update_calls(&handle), 3);
-        assert_eq!(
-            handle
-                .positions()
-                .last()
-                .expect("a position was sent")
-                .l_buttons,
-            1
-        );
-    }
-
-    #[test]
-    fn steam_fh4_mode_dedupe_resets_on_disconnect() {
-        let (mut out, handle) = steam_mode_output();
-        let same = state(0.0, 0.0, 0.0);
-        out.update(&same).expect("first update sends");
-        out.disconnect();
-        out.try_connect().expect("mock reconnect succeeds");
-        out.update(&same).expect("update after reconnect sends");
-        // Connect neutral + first update + disconnect neutral +
-        // reconnect neutral + post-reconnect update = 5 UpdateVJD calls.
-        assert_eq!(update_calls(&handle), 5);
     }
 
     #[test]

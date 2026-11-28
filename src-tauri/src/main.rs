@@ -77,7 +77,7 @@
 //! (`src-tauri/src/app_state.rs`, loop in `rsh_app_core::state`).
 //! Startup activates the persisted output backend first (Phase G:
 //! `AppStateCore::activate_startup_backend` in `build_app_state` —
-//! default `HIDMaestro`, fallback vJoy, reason recorded on failure),
+//! default `vJoy`, fallback Xbox (ViGEmBus), reason recorded on failure),
 //! and `setup` starts the engine task (idle + best-effort UDP).
 
 mod app_state;
@@ -620,13 +620,12 @@ fn set_output_state(state: tauri::State<'_, AppState>, enabled: bool) -> OutputS
     state.core().set_output_enabled(enabled)
 }
 
-/// Selects the output backend by name (`"HIDMaestro"`, `"vJoy"`,
+/// Selects the output backend by name (`"vJoy"`, `"Xbox"`,
 /// `"none"`; case-insensitive) and switches the live slot at runtime —
 /// no restart. Thin wrapper over
 /// `rsh_app_core::state::AppStateCore::set_output_backend`: the choice
-/// is persisted in settings, the default is `HIDMaestro`, a failed
-/// `HIDMaestro` connect falls back to vJoy with the reason in the
-/// returned state's detail, and a failed connect leaves the previous
+/// is persisted in settings, the default is `vJoy`, a failed
+/// connect never falls back, and a failed connect leaves the previous
 /// backend exactly as it was. Errors honestly on an unknown name or a
 /// failed switch instead of pretending the switch happened.
 #[tauri::command]
@@ -640,9 +639,8 @@ fn set_output_backend(
 
 /// Every selectable backend with honest per-backend status for the
 /// Output page picker: which is selected, which is live, whether each
-/// is connected, whether its driver/sidecar file was found, whether it
-/// needs elevation (with the UAC note), and the vJoy install link when
-/// vJoy is missing. Thin wrapper over
+/// is connected, whether its driver file was found, and the vJoy
+/// install link when vJoy is missing. Thin wrapper over
 /// `rsh_app_core::state::AppStateCore::list_output_backends`.
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
@@ -957,8 +955,8 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<tauri::tray::TrayIcon> {
 /// with no profiles at all.
 ///
 /// Startup backend activation (Phase G) runs here too: the persisted
-/// `output_backend` choice (default `HIDMaestro`) is activated
-/// through the selector, with fallback (vJoy, then the `NullSink`)
+/// `output_backend` choice (default `vJoy`) is activated
+/// through the selector, with fallback (Xbox, then the `NullSink`)
 /// and the reason recorded — a failed activation is logged loudly and
 /// the app keeps running with output disabled, never silently on the
 /// `NullSink` and never crashed at startup.
@@ -996,15 +994,7 @@ fn build_app_state() -> AppState {
                 log_startup(&line);
             } else {
                 let reason = outcome.reason.as_deref().unwrap_or("unknown reason");
-                // A deliberate deferral (HIDMaestro needs elevation)
-                // is not a failure — say so in the log.
-                let line = if reason.contains("deferred") {
-                    format!(
-                        "[RSH] startup output backend: {} deferred at startup: {}; output disabled (NullSink)",
-                        outcome.requested.display_name(),
-                        reason
-                    )
-                } else {
+                let line = {
                     format!(
                         "[RSH] startup output backend: {} activation failed: {}; output disabled (NullSink)",
                         outcome.requested.display_name(),

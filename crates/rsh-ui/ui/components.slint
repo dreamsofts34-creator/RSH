@@ -896,10 +896,14 @@ export component SliderRow inherits VerticalLayout {
     if edit-invalid : Text { text: "Enter a number."; font-size: Theme.fs-hint; color: Theme.bad; }
 }
 
-// ---------------------------------------------------------------- preset chips (§6: Soft / Balanced / Sharp / Custom)
+// ---------------------------------------------------------------- preset chips (§6: Soft / Normal / Firm / Custom)
+// v2.0.19 (F4): `disabled` dims the chip and blocks click/keys,
+// like the Switch — used by the shifter presets while the board
+// sensitivity read is still pending.
 export component PresetChip inherits Rectangle {
     in property <string> label;
     in property <bool> active;
+    in property <bool> disabled: false;
     callback clicked();
     accessible-label: label;
     accessible-role: button;
@@ -908,6 +912,7 @@ export component PresetChip inherits Rectangle {
     border-width: 1px;
     border-color: fs.has-focus ? Theme.accent-text : (active ? Theme.accent : (ta.has-hover ? Theme.faint : Theme.line));
     background: active ? Theme.acc-bg : (ta.pressed ? Theme.pressed-bg : ta.has-hover ? Theme.hover-bg : Theme.panel2);
+    opacity: disabled ? 0.45 : 1;
     // D4: 120ms background transition on hover/active.
     animate background { duration: 120ms; easing: ease-out; }
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
@@ -916,7 +921,7 @@ export component PresetChip inherits Rectangle {
         height: 100%;
         key-pressed(event) => {
             if (event.text == Key.Return || event.text == Key.Space) {
-                clicked();
+                if (!disabled) { clicked(); }
                 return accept;
             }
             return reject;
@@ -942,7 +947,7 @@ export component PresetChip inherits Rectangle {
         font-weight: 600;
         color: active ? Theme.sel-text : (ta.has-hover ? Theme.text : Theme.mute);
     }
-    ta := TouchArea { mouse-cursor: pointer; clicked => { clicked(); } }
+    ta := TouchArea { mouse-cursor: disabled ? MouseCursor.default : MouseCursor.pointer; clicked => { if (!disabled) { clicked(); } } }
 }
 
 // ---------------------------------------------------------------- curve graph (§6: grid + dashed straight line + accent curve + live marker)

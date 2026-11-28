@@ -1,10 +1,55 @@
 # Changelog — RSH (Real Sim Hub)
 
 All notable changes to the RSH app and firmware. Current versions:
-**app v2.0.18 · firmware v4.0.6 · protocol v2.2 (frozen)**.
+**app v2.0.19 · firmware v4.0.7 · protocol v2.2 (frozen)**.
 Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
+
+## [2.0.19] — 2026-11-28 (cleanup + ViGEmBus Xbox backend: only 7 inputs remain)
+
+App 2.0.19 + firmware 4.0.7 (protocol v2.2 frozen — no wire-format
+change: firmware sends the removed inputs as zero, the frame shape
+is unchanged).
+
+**Cleanup — everything the FH4/G29 experiments left behind is
+deleted.** Steam FH4 wheel mode + the OEMData code (toggle,
+registry writes, installer section, marker); the G29 spoof (mode,
+pedal layout, handbrake button, G29 mapping, `logitech-g29`
+profile); the GameInput RacingWheel mappings + `wheel_check`;
+the whole HIDMaestro backend + sidecar (crate,
+`tools/rsh-hm-sidecar/`, UAC flow, installer files). The installer
+deletes the stale HKLM `OEMData` value on the vJoy key on every
+install (unconditional); the daemon deletes the HKCU half on first
+start. A persisted `"HIDMaestro"` backend setting falls back to
+vJoy.
+
+**Only 7 inputs remain — steering, accel, brake, clutch,
+handbrake, shifter, horn.** All other buttons (except horn) +
+encoders are deleted from software and firmware, in vJoy mode and
+Xbox mode; the Buttons module, Encoders module and H-pattern
+(sequential-only now) are gone. vJoy mapping for the 7 inputs:
+steering→X, accel→Y, brake→Z, clutch→`wClutch`+Rx,
+handbrake→`wSlider`, shifter up→button 1, down→button 2,
+horn→button 5.
+
+**New: ViGEmBus Xbox 360 backend (fallback).** vJoy stays the
+default; Settings → Output can switch to Xbox (ViGEmBus) for
+games that do not accept the vJoy wheel. Mapping: steering→left
+stick X, accel→right trigger, brake→left trigger, clutch→right
+stick Y (analog), handbrake→A, horn→X, shifter up/down→D-pad
+Up/Down. The installer ships `ViGEmClient.dll` beside the daemon
+and the official ViGEmBus 1.22.0 setup for interactive install
+(no silent switch documented — the setup runs interactively).
+Tuning (deadzone, curve, smoothing, lock, saturation) applies
+identically on both backends — it runs before the backend.
+Attribution: `THIRD-PARTY-LICENSES.md` §3.
+
+**Tuning is simple now.** Every tuning section has
+Soft/Normal/Firm presets, % sliders, a one-line plain-English
+explanation per control, a live graph (pedals graph live like
+steering), advanced settings behind an Advanced toggle, and a
+1-tap reset to defaults.
 
 ## [2.0.18] — 2026-11-28 (deep scan + polish: dead-button audit, false job timeouts, connect/disconnect timeout, tray popup game list)
 

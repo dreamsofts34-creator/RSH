@@ -15,7 +15,9 @@
 //!   the four analog modules a typical wheel reports. Clutch (slot 3)
 //!   is absent, matching the factory default plan (clutch disabled).
 //! * Encoders: 2 cumulative `i16` counts stepping `+2` / `-1` per tick
-//!   (wrapping), so the wrap-aware delta path is exercised every tick.
+//!   (wrapping) — still sent in the frame (frozen wire shape), but
+//!   the pipeline ignores them since v2.0.19; the words only
+//!   exercise the parser.
 //! * Buttons: wheel buttons plus the horn bit on every 7th tick.
 //! * `seq` increments `+1` per frame from 0; `timestamp_us` advances
 //!   5000 µs per frame (the 200 Hz tick).
@@ -52,8 +54,9 @@ pub struct TickInput {
 /// Build the fixed 1024-frame representative input set.
 ///
 /// Steering sweeps `1100..=2500` mV, accelerator / brake / handbrake
-/// sweep the full `300..=3300` mV range, encoders step `+2` / `-1`
-/// per tick, and the horn bit (button 2) is set on every 7th frame.
+/// sweep the full `300..=3300` mV range, encoder words step `+2` / `-1`
+/// per tick (sent, ignored by the pipeline since v2.0.19), and the horn
+/// bit (button 2) is set on every 7th frame.
 /// All arithmetic is wrapping integer arithmetic on the frame index.
 ///
 /// # Panics

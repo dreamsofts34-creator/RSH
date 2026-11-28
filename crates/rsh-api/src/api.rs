@@ -117,7 +117,7 @@ pub struct SnapshotInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clutch: Option<f64>,
     /// Live button bitmask (H10, v2.0.2): bit `n - 1` is wheel
-    /// button `n` (buttons 1–64, combined low + extended mask).
+    /// button `n` (buttons 1–32).
     /// `0` = no button pressed (or no live data).
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub button_mask: u64,
@@ -125,8 +125,9 @@ pub struct SnapshotInfo {
     /// handbrake axis. `0.0` = released (or no live data).
     #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub handbrake: f64,
-    /// Decoded H-pattern gear (M-3, v2.0.2): `0` = neutral, `1..=6`
-    /// = gear. `0` in sequential mode or with no live data.
+    /// Always `0` (v2.0.19: H-pattern is deleted — the field stays
+    /// so the wire shape is unchanged; the frontend's diagnostics
+    /// grid never reads it).
     #[serde(default)]
     pub gear: u8,
     /// Monotonic engine snapshot sequence (L-4, v2.0.2): the `seq`
@@ -393,9 +394,8 @@ pub struct RawMv {
 }
 
 /// One persisted button→action binding, as the API reports it
-/// (v2.0.2). `button` is a physical wheel button (1–32) or an
-/// encoder virtual button (65–72); `action` is a game input
-/// (`horn`, `shifter_up`, `shifter_down`, `gear_1`…`gear_6`,
+/// (v2.0.2). `button` is a physical wheel button (1–32); `action`
+/// is a game input (`horn`, `shifter_up`, `shifter_down`,
 /// `handbrake`) or an app action (`profile_next`,
 /// `profile_previous`).
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -406,83 +406,6 @@ pub struct ButtonBinding {
     /// Action id.
     pub action: String,
 }
-
-/// Wheel-game readiness check for the vJoy device (FH4 fix,
-/// v2.0.14): whether Windows sees the vJoy device as a racing
-/// wheel — the `GameInput` `RacingWheel` mappings plus the `EmuWheel`
-/// device-1 envelope (128 buttons, 8 axes, 1 discrete POV, FFB)
-/// plus the feeder state. All of mapping / envelope / feeding
-/// must be true for a wheel game (for example Forza Horizon 4)
-/// to offer a Wheel tab; `next_step` is the one-line plain-words
-/// repair for the user ("" when everything is OK) and names any
-/// missing piece (for example "mapping incomplete — Labels
-/// missing"). `button_count` is the vJoy device-1 button count
-/// as reported (-1 when unknown). The daemon reports this on
-/// Windows only; the UI renders a missing check as "not checked
-/// yet", never as OK.
-//
-// The five bools are the contract's independent checks (mapping ×2,
-// envelope, FFB, feeding); grouping them would break the wire shape
-// the daemon reports field-by-field, so the pedantic bool-count
-// lint is allowed here.
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WheelCheck {
-    /// Complete `GameInput` `RacingWheel` mapping for vJoy: the
-    /// required subkeys plus `Labels`, `DPad`, and `Button1–8` as
-    /// applicable — a bare `RacingWheel` key alone does not
-    /// enumerate, so it does not count.
-    pub vjoy_mapping_ok: bool,
-    /// `GameInput` `RacingWheel` mapping for HID present.
-    pub hid_mapping_ok: bool,
-    /// vJoy device 1 has the `EmuWheel` envelope.
-    pub envelope_ok: bool,
-    /// vJoy device-1 button count as reported (-1 when unknown).
-    pub button_count: i32,
-    /// Force feedback present on vJoy device 1 — reported, not
-    /// a blocking item: FH4 does not send FFB data to vJoy, so
-    /// input works without it.
-    pub ffb_present: bool,
-    /// True when the vJoy backend is currently feeding vJoy
-    /// device 1. The daemon acquires + feeds the device from
-    /// backend start even with no board connected, so the wheel
-    /// is alive before any game launches.
-    pub feeding: bool,
-    /// One-line plain-words next step ("" when everything is OK).
-    pub next_step: String,
-}
-
-impl WheelCheck {
-    /// `ok` / `fail` flag for one check item, for log lines.
-    const fn flag(ok: bool) -> &'static str {
-        if ok { "ok" } else { "FAIL" }
-    }
-
-    /// One-line log summary, e.g.
-    /// `wheel check: vjoy_mapping=ok hid_mapping=ok envelope=ok
-    /// buttons=128 ffb=yes feeding=yes` plus ` — next step: ...`
-    /// when [`Self::next_step`] is non-empty. Used by the daemon
-    /// log at startup and on backend switch (FH4 fix, v2.0.14).
-    #[must_use]
-    pub fn summary_line(&self) -> String {
-        let line = format!(
-            "wheel check: vjoy_mapping={} hid_mapping={} envelope={} buttons={} ffb={} feeding={}",
-            Self::flag(self.vjoy_mapping_ok),
-            Self::flag(self.hid_mapping_ok),
-            Self::flag(self.envelope_ok),
-            self.button_count,
-            if self.ffb_present { "yes" } else { "no" },
-            if self.feeding { "yes" } else { "no" },
-        );
-        if self.next_step.is_empty() {
-            line
-        } else {
-            format!("{line} — next step: {}", self.next_step)
-        }
-    }
-}
-
 /// vJoy driver status, as the API reports it (v2.0.1 hotfix
 /// BACKEND-2). Detection is a file probe
 /// (`vJoyInterface.dll` resolvable); `version` is [`None`] until a
@@ -505,10 +428,6 @@ pub struct VjoyStatus {
     /// Installed driver version, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// FH4 wheel check (v2.0.14): [`None`] on non-Windows or
-    /// before the first check — never a fake OK.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wheel_check: Option<WheelCheck>,
 }
 
 /// Live engine / link diagnostics, as the API reports it (v2.0.1
@@ -864,105 +783,6 @@ pub trait AppApi: Send + Sync {
         ))
     }
 
-    /// Whether Steam FH4 wheel mode is on (FH4 fix, v2.0.15):
-    /// the vJoy device-1 `OEMData` flag is written so Steam Forza
-    /// Horizon 4 shows the Wheel tab. Default: false — only the
-    /// daemon overrides it.
-    fn steam_fh4_mode(&self) -> bool {
-        false
-    }
-
-    /// Set Steam FH4 wheel mode on/off; returns the new state.
-    /// Enabling is vJoy-only: on the `HIDMaestro` backend the daemon
-    /// refuses with code `steam_fh4_vjoy_only`. Disabling always
-    /// succeeds (cleanup is never blocked by the backend).
-    ///
-    /// # Errors
-    ///
-    /// [`UserError`] when the setting cannot be persisted, when the
-    /// registry write fails, or when enabling on a non-vJoy backend.
-    fn set_steam_fh4_mode(&self, _enabled: bool) -> Result<bool, UserError> {
-        Err(UserError::from_connection(
-            ConnectionError::Unknown,
-            "Steam FH4 wheel mode is not supported by this API",
-        ))
-    }
-
-    /// Whether `G29` spoof mode is on (v2.0.16): the `HIDMaestro`
-    /// backend presents the built-in `logitech-g29` catalog profile
-    /// (VID `0x046D` / PID `0xC24F`) instead of the custom no-brand
-    /// wheel. Default: false — only the daemon overrides it.
-    fn g29_spoof_mode(&self) -> bool {
-        false
-    }
-
-    /// Set G29 spoof mode on/off; returns the new state. Enabling
-    /// is HIDMaestro-only: on any other backend the daemon refuses
-    /// with code `g29_spoof_hid_only`. Disabling always succeeds
-    /// (cleanup is never blocked by the backend). Enabling on a
-    /// connected `HIDMaestro` backend disposes and recreates the
-    /// controller with the G29 profile (a backend restart — it can
-    /// take as long as a backend switch, UAC dwell included); a
-    /// failed recreate rolls the persisted flag back and errors.
-    ///
-    /// # Errors
-    ///
-    /// [`UserError`] when the setting cannot be persisted, when the
-    /// controller recreate fails, or when enabling on a non-`HIDMaestro`
-    /// backend.
-    fn set_g29_spoof_mode(&self, _enabled: bool) -> Result<bool, UserError> {
-        Err(UserError::from_connection(
-            ConnectionError::Unknown,
-            "G29 spoof mode is not supported by this API",
-        ))
-    }
-
-    /// G29 pedal layout (v2.0.17): `"hidmaestro"` (default; Z =
-    /// accelerator, Rz = brake, Y = clutch) or `"pcgamingwiki"` (Y
-    /// = accelerator, Rz = brake, Z = clutch). Default:
-    /// `"hidmaestro"` — only the daemon overrides it.
-    fn g29_pedal_layout(&self) -> String {
-        "hidmaestro".to_string()
-    }
-
-    /// Set the G29 pedal layout; returns the stored value. Applied
-    /// live to a connected `HIDMaestro` backend (next tick) and at
-    /// connect/recreate time from the persisted setting.
-    ///
-    /// # Errors
-    ///
-    /// [`UserError`] when the layout is unknown or the setting
-    /// cannot be persisted.
-    fn set_g29_pedal_layout(&self, _layout: &str) -> Result<String, UserError> {
-        Err(UserError::from_connection(
-            ConnectionError::Unknown,
-            "G29 pedal layout is not supported by this API",
-        ))
-    }
-
-    /// G29 handbrake button (v2.0.17): which G29 button (1–25)
-    /// the handbrake drives. Default: 8 — only the daemon
-    /// overrides it.
-    fn g29_handbrake_button(&self) -> u32 {
-        8
-    }
-
-    /// Set the G29 handbrake button; returns the stored value.
-    /// Applied live to a connected `HIDMaestro` backend (next
-    /// tick) and at connect/recreate time from the persisted
-    /// setting.
-    ///
-    /// # Errors
-    ///
-    /// [`UserError`] when the button is outside 1–25 or the
-    /// setting cannot be persisted.
-    fn set_g29_handbrake_button(&self, _button: u32) -> Result<u32, UserError> {
-        Err(UserError::from_connection(
-            ConnectionError::Unknown,
-            "G29 handbrake button is not supported by this API",
-        ))
-    }
-
     /// Current tuning for one module (stored value, or the neutral
     /// default when nothing is stored).
     fn get_tuning(&self, module: &str) -> TuningSettings;
@@ -1117,7 +937,7 @@ pub trait AppApi: Send + Sync {
         FirmwareUpdateStatus::default()
     }
 
-    /// Live output backend name (`"HIDMaestro"` / `"vJoy"`).
+    /// Live output backend name (`"vJoy"` / `"Xbox"`).
     /// Default: `"Unknown"` — only the daemon and the sim override it.
     fn output_backend(&self) -> String {
         "Unknown".to_string()
@@ -1557,9 +1377,9 @@ pub trait AppApi: Send + Sync {
         Vec::new()
     }
 
-    /// Bind `button` (physical 1–32, encoder virtual 65–72) to
+    /// Bind `button` (physical 1–32) to
     /// `action` — a game input (`horn`, `shifter_up`, `shifter_down`,
-    /// `gear_1`…`gear_6`, `handbrake`) or an app action
+    /// `handbrake`) or an app action
     /// (`profile_next`, `profile_previous`) — and persist it. The
     /// daemon applies the binding to every engine tick from the next
     /// one on. Default: error — only the daemon binds.
@@ -1674,9 +1494,9 @@ pub trait AppApi: Send + Sync {
     /// immediately (`"started"`); progress and failure surface
     /// through [`AppApi::vjoy_status`] polling — never by blocking
     /// the caller. The installer needs admin once (its own manifest
-    /// triggers the UAC prompt); that is expected and unlike
-    /// `HIDMaestro`, which prompts on every launch. Default: error —
-    /// only the daemon installs.
+    /// triggers the UAC prompt); that is expected (the deleted
+    /// `HIDMaestro` backend prompted on every launch). Default:
+    /// error — only the daemon installs.
     ///
     /// # Errors
     ///
@@ -1725,7 +1545,7 @@ mod tests {
     /// Slint default copy too.
     #[test]
     fn app_version_matches_release_tag() {
-        assert_eq!(app_version(), "2.0.18");
+        assert_eq!(app_version(), "2.0.19");
     }
 
     /// L-4: a stub whose state flips between two reads — the
@@ -1979,83 +1799,5 @@ mod tests {
         assert!(json.contains("\"closeToTray\":true"), "{json}");
         let back: SlowPollState = serde_json::from_str(&json).expect("slow_poll round-trips");
         assert_eq!(back, slow);
-    }
-
-    /// FH4 wheel check (v2.0.14): `VjoyStatus` carries the check
-    /// under the exact contract names (`wheelCheck`,
-    /// `vjoyMappingOk`, `nextStep`, …), and JSON from an older
-    /// daemon without `wheelCheck` still reads as `None` — the UI
-    /// must keep working against a daemon that predates the check.
-    #[test]
-    fn vjoy_status_wheel_check_wire_shape() {
-        let status = VjoyStatus {
-            installed: true,
-            installing: false,
-            install_error: None,
-            dll_path: None,
-            version: Some("2.2.2".to_string()),
-            wheel_check: Some(WheelCheck {
-                vjoy_mapping_ok: true,
-                hid_mapping_ok: false,
-                envelope_ok: true,
-                button_count: 128,
-                ffb_present: true,
-                feeding: true,
-                next_step: "Re-run the RSH installer.".to_string(),
-            }),
-        };
-        let json = serde_json::to_string(&status).expect("vjoy_status serializes");
-        assert!(json.contains("\"wheelCheck\":"), "{json}");
-        assert!(json.contains("\"vjoyMappingOk\":true"), "{json}");
-        assert!(json.contains("\"hidMappingOk\":false"), "{json}");
-        assert!(json.contains("\"buttonCount\":128"), "{json}");
-        assert!(json.contains("\"feeding\":true"), "{json}");
-        assert!(
-            json.contains("\"nextStep\":\"Re-run the RSH installer.\""),
-            "{json}"
-        );
-        let back: VjoyStatus = serde_json::from_str(&json).expect("vjoy_status round-trips");
-        assert_eq!(back, status);
-        // Older daemon: no `wheelCheck` key at all.
-        let old = r#"{"installed":true,"installing":false,"version":"2.2.2"}"#;
-        let back: VjoyStatus = serde_json::from_str(old).expect("old vjoy_status reads");
-        assert!(back.wheel_check.is_none());
-        // A check that measured nothing yet (-1) still round-trips.
-        let unknown = serde_json::from_str::<VjoyStatus>(
-            r#"{"installed":true,"installing":false,"wheelCheck":{"vjoyMappingOk":false,"hidMappingOk":false,"envelopeOk":false,"buttonCount":-1,"ffbPresent":false,"feeding":false,"nextStep":""}}"#,
-        )
-        .expect("unknown-count check reads");
-        assert_eq!(unknown.wheel_check.as_ref().unwrap().button_count, -1);
-    }
-
-    /// FH4 wheel check (v2.0.14): the daemon-log summary line.
-    #[test]
-    fn wheel_check_summary_line() {
-        let ok = WheelCheck {
-            vjoy_mapping_ok: true,
-            hid_mapping_ok: true,
-            envelope_ok: true,
-            button_count: 128,
-            ffb_present: true,
-            feeding: true,
-            next_step: String::new(),
-        };
-        assert_eq!(
-            ok.summary_line(),
-            "wheel check: vjoy_mapping=ok hid_mapping=ok envelope=ok buttons=128 ffb=yes feeding=yes"
-        );
-        let bad = WheelCheck {
-            vjoy_mapping_ok: false,
-            hid_mapping_ok: true,
-            envelope_ok: false,
-            button_count: 32,
-            ffb_present: false,
-            feeding: false,
-            next_step: "mapping incomplete — Labels missing".to_string(),
-        };
-        assert_eq!(
-            bad.summary_line(),
-            "wheel check: vjoy_mapping=FAIL hid_mapping=ok envelope=FAIL buttons=32 ffb=no feeding=no — next step: mapping incomplete — Labels missing"
-        );
     }
 }
