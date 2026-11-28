@@ -12,7 +12,7 @@
 
 #define RSH_FW_VERSION_MAJOR 4
 #define RSH_FW_VERSION_MINOR 0
-#define RSH_FW_VERSION_PATCH 8
+#define RSH_FW_VERSION_PATCH 9
 
 // Stringize helpers (do-step, taake macro pehle expand ho).
 #define RSH_FW_STR_(x) #x
