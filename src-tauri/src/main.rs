@@ -77,7 +77,7 @@
 //! (`src-tauri/src/app_state.rs`, loop in `rsh_app_core::state`).
 //! Startup activates the persisted output backend first (Phase G:
 //! `AppStateCore::activate_startup_backend` in `build_app_state` —
-//! default `vJoy`, fallback Xbox (ViGEmBus), reason recorded on failure),
+//! default `vJoy`, fallback Xbox (`ViGEmBus`), reason recorded on failure),
 //! and `setup` starts the engine task (idle + best-effort UDP).
 
 mod app_state;

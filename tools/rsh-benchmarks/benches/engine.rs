@@ -69,7 +69,7 @@ fn run_pipeline_ticks(
         checksum = checksum
             .wrapping_add(u64::from(out.steering.to_bits()))
             .wrapping_add(u64::from(out.accelerator.to_bits()))
-            .wrapping_add(u64::from(out.buttons))
+            .wrapping_add(u64::from(out.buttons));
     }
     checksum
 }
