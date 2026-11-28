@@ -75,7 +75,6 @@ pub struct EngineStats {
     pub e2e_ms: Option<f64>,
 }
 
-
 /// Pedal positions in a snapshot, 0..1 (`clutch` is `None` when the
 /// clutch module is not present).
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -236,8 +235,6 @@ impl LoopRateTracker {
         }
     }
 }
-
-
 
 /// Map [`EngineMetrics`] to the frontend [`EngineStats`] contract.
 ///

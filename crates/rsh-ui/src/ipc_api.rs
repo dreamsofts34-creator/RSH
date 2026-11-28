@@ -3288,10 +3288,7 @@ mod tests {
             "live query must read the daemon's backend"
         );
         assert_eq!(client.output_backend(), "vJoy");
-        assert_eq!(
-            client.set_output_backend("Xbox").expect("Xbox"),
-            "Xbox"
-        );
+        assert_eq!(client.set_output_backend("Xbox").expect("Xbox"), "Xbox");
         assert_eq!(
             client.query_output_backend().as_deref(),
             Some("Xbox"),

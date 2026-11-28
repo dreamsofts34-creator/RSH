@@ -610,7 +610,6 @@ impl VJoyCapabilities {
     pub fn button_mask(&self) -> u32 {
         block_mask(self.button_count, 1)
     }
-
 }
 
 /// Bitmask for the 32-button block starting at 1-based `first_button`
@@ -1389,8 +1388,6 @@ pub struct VJoyOutput {
     consecutive_update_failures: u32,
 }
 
-
-
 /// Consecutive failed updates after which vJoy marks itself
 /// disconnected (M2). One or two failures are transient (the old
 /// behaviour: stay connected, report the error); three in a row means
@@ -1726,7 +1723,6 @@ impl IJoystickOutput for VJoyOutput {
     fn vjoy_driver_version(&self) -> Option<String> {
         self.status.driver_version.clone()
     }
-
 
     fn disconnect(&mut self) {
         self.disconnect_inner();
@@ -2966,7 +2962,6 @@ mod tests {
             .filter(|call| matches!(call, MockCall::Update(_)))
             .count()
     }
-
 
     #[test]
     fn update_failure_returns_error_and_stays_connected() {

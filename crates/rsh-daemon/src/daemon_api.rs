@@ -362,8 +362,6 @@ impl DaemonApi {
     }
 }
 
-
-
 impl AppApi for DaemonApi {
     fn version(&self) -> String {
         app_version().to_string()
@@ -856,14 +854,6 @@ impl AppApi for DaemonApi {
             .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
     }
 
-
-
-
-
-
-
-
-
     fn output_backend(&self) -> String {
         self.state.backend_name()
     }
@@ -872,9 +862,10 @@ impl AppApi for DaemonApi {
         // v2.0.19: no backend needs elevation any more (the
         // elevated sidecar backend is gone), so there is no UAC-decline
         // branch — a switch failure is a plain typed error.
-        let outcome = self.state.set_output_backend(name).map_err(|detail| {
-            UserError::from_connection(ConnectionError::Unknown, detail)
-        });
+        let outcome = self
+            .state
+            .set_output_backend(name)
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail));
         // H4 (v2.0.8 retest Bug 1): preserve the switch outcome in
         // the daemon log (rsh-YYYYMMDD.log) — a connect failure used
         // to leave no trace there, so the next failure is
@@ -1320,10 +1311,7 @@ pub fn capture_user_error(detail: String) -> UserError {
 #[must_use]
 pub fn binding_user_error(code: &str, message: String) -> UserError {
     let (title, what_to_do) = match code {
-        "InvalidButton" => (
-            "Button cannot be bound",
-            "Bind a physical button (1-32).",
-        ),
+        "InvalidButton" => ("Button cannot be bound", "Bind a physical button (1-32)."),
         "UnknownAction" => (
             "Unknown action",
             "Pick a game input (horn, shifter_up, shifter_down, gear_1-6, handbrake) or an app action (profile_next, profile_previous).",
@@ -1426,11 +1414,6 @@ mod tests {
             .expect("activate default profile");
         (DaemonApi::new(state), dir)
     }
-
-
-
-
-
 
     /// R2-46: `diag_stats` exports the per-method IPC latency —
     /// the method that is slow must be visible, not just the global
@@ -1646,9 +1629,7 @@ mod tests {
         let bound = api.set_binding(5, "horn").expect("bind button 5");
         assert_eq!(bound.button, 5);
         assert_eq!(bound.action, "horn");
-        let bound = api
-            .set_binding(6, "profile_next")
-            .expect("bind button 6");
+        let bound = api.set_binding(6, "profile_next").expect("bind button 6");
         assert_eq!(bound.button, 6);
         let listed = api.list_bindings();
         assert_eq!(listed.len(), 2);

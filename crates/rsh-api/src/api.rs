@@ -1800,7 +1800,4 @@ mod tests {
         let back: SlowPollState = serde_json::from_str(&json).expect("slow_poll round-trips");
         assert_eq!(back, slow);
     }
-
-
-
 }

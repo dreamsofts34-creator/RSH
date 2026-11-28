@@ -695,10 +695,10 @@ fn ui_wizard_gating() -> Outcome {
         ("step0-open", &[("connect-done", true)]),
         (
             "step1-blocked",
-            &[("vjoy-installed", false), ("vjoy-fallback", false)],
+            &[("vjoy-installed", false), ("xbox-fallback", false)],
         ),
         ("step1-vjoy", &[("vjoy-installed", true)]),
-        ("step1-fallback", &[("vjoy-fallback", true)]),
+        ("step1-fallback", &[("xbox-fallback", true)]),
         ("step2-no-calib", &[("calibration-available", false)]),
         (
             "step2-blocked",
@@ -728,7 +728,7 @@ fn ui_wizard_gating() -> Outcome {
         for prop in [
             "connect-done",
             "vjoy-installed",
-            "vjoy-fallback",
+            "xbox-fallback",
             "calibration-available",
             "centre-done",
             "pedals-done",

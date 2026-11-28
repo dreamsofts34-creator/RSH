@@ -116,13 +116,6 @@ impl AppApi for StubApi {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = enabled;
     }
 
-
-
-
-
-
-
-
     fn get_tuning(&self, module: &str) -> TuningSettings {
         self.tunings
             .lock()
@@ -300,9 +293,6 @@ async fn assert_shifter_sensitivity_round_trip(client: &IpcClient) {
         "unexpected error: {err:?}"
     );
 }
-
-
-
 
 /// v2.0.11: Wi-Fi scan + rejoin round-trip over the same socket —
 /// these three methods had no dispatch arm, so every call failed

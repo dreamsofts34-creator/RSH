@@ -662,7 +662,6 @@ mod tests {
         assert!(errors.iter().any(|e| e.contains("horn_button")));
     }
 
-
     /// LED/horn per-module tuning (L1/HO1/HO2): period, minimum
     /// honk duration and latch mode round-trip through JSON,
     /// validate in range, and are absent for other modules (old
@@ -711,7 +710,6 @@ mod tests {
         assert_eq!(errors.len(), 1, "errors: {errors:?}");
         assert!(errors[0].contains("horn_min_ms"), "{}", errors[0]);
     }
-
 
     #[test]
     fn shifter_lockout_round_trips_and_validates() {

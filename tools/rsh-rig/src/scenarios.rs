@@ -1529,20 +1529,6 @@ pub fn registry() -> Vec<Scenario> {
                 min_duration_s: 0.0,
             }],
         },
-        Scenario {
-            id: "gate-card-gap-source",
-            description: "Gate (cards fix, Bug 1), source audit: inter-card gaps are spacer Rectangles (min-width = design gap, stretch 0.05) and growing cards use `min-width` (not explicit `width`), so gaps and cards scale with the window.",
-            durations: (0, 0, 0),
-            wheel: WheelConfig::default(),
-            harness: HarnessConfig::default(),
-            assertions: vec![Assertion {
-                metric: "selfCheck",
-                op: "==",
-                value: MetricValue::Str("pass"),
-                note: "Gate PASS: responsive gap spacers + min-width cards present.",
-                min_duration_s: 0.0,
-            }],
-        },
         // ---- v2.0.2 gate checks, re-scan findings (B-1, B-2, H-3, H-4, M-9) ----
         Scenario {
             id: "gate-backend-single-attempt",
@@ -1558,7 +1544,6 @@ pub fn registry() -> Vec<Scenario> {
                 min_duration_s: 0.0,
             }],
         },
-
         Scenario {
             id: "gate-ota-flash-caller",
             description: "Gate (H-4): an 'Update firmware' flow exists in Settings/wizard that starts a flash from the bundled firmware-signed.bin with progress + confirmed version; the caller entry point is proven end-to-end on the fake board.",

@@ -95,7 +95,6 @@ pub enum OutputError {
     SwitchFailed(String),
 }
 
-
 impl fmt::Display for OutputError {
     // One arm per variant (20 variants) is longer than clippy's
     // 100-line default for a function; splitting the Display impl
@@ -228,5 +227,4 @@ mod tests {
             }
         );
     }
-
 }

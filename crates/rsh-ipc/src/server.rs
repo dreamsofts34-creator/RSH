@@ -842,8 +842,7 @@ mod tests {
                     code: "InvalidButton".to_string(),
                     title: "Button cannot be bound".to_string(),
                     what_happened: format!("button {button} cannot be bound"),
-                    what_to_do: "Bind a physical button (1-32)."
-                        .to_string(),
+                    what_to_do: "Bind a physical button (1-32).".to_string(),
                     detail: Some(format!("button {button} cannot be bound")),
                 });
             }

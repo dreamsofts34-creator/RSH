@@ -434,10 +434,10 @@ pub struct AppSettings {
     /// vJoy device id, clamped to 1..=16 on parse.
     #[serde(default = "default_vjoy_device_id")]
     pub vjoy_device_id: u32,
-    /// Output backend: `VJoy` (default), `Xbox` (ViGEmBus
+    /// Output backend: `VJoy` (default), `Xbox` (`ViGEmBus`
     /// fallback), or `None` (no output device). A persisted
     /// `"HIDMaestro"` value sanitizes to the vJoy default (see
-    /// [`sanitize_settings`]) — the HIDMaestro backend is gone.
+    /// [`sanitize_settings`]) — the `HIDMaestro` backend is gone.
     #[serde(default = "default_output_backend")]
     pub output_backend: String,
     /// Log level: `Debug`, `Information`, `Warning`, or `Error`.
@@ -698,7 +698,6 @@ pub fn canonical_theme(value: &str) -> Option<&'static str> {
     }
 }
 
-
 /// A partial settings update (C-SET-1, PATCH semantics): only the
 /// fields that are `Some` overwrite the stored settings; absent fields
 /// keep their existing values. This is what the `set_settings` Tauri
@@ -919,10 +918,7 @@ pub fn sanitize_settings(settings: &mut AppSettings) {
     // v2.0.19: the HIDMaestro backend is gone — a persisted
     // "HIDMaestro" value falls back to the vJoy default, same as
     // any other unknown value.
-    if !matches!(
-        settings.output_backend.as_str(),
-        "VJoy" | "Xbox" | "None"
-    ) {
+    if !matches!(settings.output_backend.as_str(), "VJoy" | "Xbox" | "None") {
         settings.output_backend = default_output_backend();
     }
     if !matches!(

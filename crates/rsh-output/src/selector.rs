@@ -633,14 +633,8 @@ mod tests {
 
     #[test]
     fn backend_kind_parses_user_and_settings_names() {
-        assert_eq!(
-            BackendKind::parse("Xbox"),
-            Some(BackendKind::Xbox)
-        );
-        assert_eq!(
-            BackendKind::parse("xbox"),
-            Some(BackendKind::Xbox)
-        );
+        assert_eq!(BackendKind::parse("Xbox"), Some(BackendKind::Xbox));
+        assert_eq!(BackendKind::parse("xbox"), Some(BackendKind::Xbox));
         assert_eq!(BackendKind::parse("vJoy"), Some(BackendKind::VJoy));
         assert_eq!(BackendKind::parse("VJOY"), Some(BackendKind::VJoy));
         assert_eq!(BackendKind::parse("none"), Some(BackendKind::None));
@@ -666,14 +660,8 @@ mod tests {
         let factories = factories_with(&hm, &vjoy);
         let mut current = MockBackend::new("NullSink").0.boxed();
 
-        let outcome = switch_backend(
-            &mut current,
-            BackendKind::Xbox,
-            &factories,
-            None,
-            true,
-        )
-        .expect("Xbox switch succeeds");
+        let outcome = switch_backend(&mut current, BackendKind::Xbox, &factories, None, true)
+            .expect("Xbox switch succeeds");
         assert_eq!(outcome.active, BackendKind::Xbox);
         assert!(outcome.switched);
         assert!(!outcome.fell_back);
@@ -696,14 +684,8 @@ mod tests {
         let factories = factories_with(&hm, &vjoy);
         let mut current = MockBackend::new("NullSink").0.boxed();
 
-        let outcome = switch_backend(
-            &mut current,
-            BackendKind::Xbox,
-            &factories,
-            None,
-            true,
-        )
-        .expect("Xbox switch succeeds");
+        let outcome = switch_backend(&mut current, BackendKind::Xbox, &factories, None, true)
+            .expect("Xbox switch succeeds");
         assert_eq!(outcome.active, BackendKind::Xbox);
 
         // Xbox -> vJoy: the Xbox instance is disconnected,
@@ -719,14 +701,8 @@ mod tests {
         assert!(current.is_connected());
         assert_eq!(current.name(), "vJoy");
 
-        let outcome = switch_backend(
-            &mut current,
-            BackendKind::Xbox,
-            &factories,
-            None,
-            true,
-        )
-        .expect("switch back to Xbox succeeds");
+        let outcome = switch_backend(&mut current, BackendKind::Xbox, &factories, None, true)
+            .expect("switch back to Xbox succeeds");
         assert_eq!(outcome.active, BackendKind::Xbox);
         assert!(current.is_connected());
         assert_eq!(hm.builds.load(Ordering::SeqCst), 2);
@@ -766,14 +742,8 @@ mod tests {
         let factories = factories_with(&hm, &vjoy);
         let mut current = MockBackend::new("NullSink").0.boxed();
 
-        let outcome = switch_backend(
-            &mut current,
-            BackendKind::Xbox,
-            &factories,
-            None,
-            true,
-        )
-        .expect("fallback to vJoy succeeds");
+        let outcome = switch_backend(&mut current, BackendKind::Xbox, &factories, None, true)
+            .expect("fallback to vJoy succeeds");
         assert_eq!(outcome.requested, BackendKind::Xbox);
         assert_eq!(outcome.active, BackendKind::VJoy);
         assert!(outcome.fell_back);
@@ -824,14 +794,8 @@ mod tests {
         let factories = factories_with(&hm, &vjoy);
         let mut current = MockBackend::new("NullSink").0.boxed();
 
-        let error = switch_backend(
-            &mut current,
-            BackendKind::Xbox,
-            &factories,
-            None,
-            true,
-        )
-        .expect_err("both backends failing must error");
+        let error = switch_backend(&mut current, BackendKind::Xbox, &factories, None, true)
+            .expect_err("both backends failing must error");
         let message = error.to_string();
         assert!(message.contains("driver not found"), "{message}");
         assert!(message.contains("vJoy not found"), "{message}");
@@ -853,14 +817,8 @@ mod tests {
         let mut current = old.boxed();
         current.try_connect().expect("old vJoy connects");
 
-        let outcome = switch_backend(
-            &mut current,
-            BackendKind::Xbox,
-            &factories,
-            None,
-            true,
-        )
-        .expect("fallback reconnects the live vJoy backend");
+        let outcome = switch_backend(&mut current, BackendKind::Xbox, &factories, None, true)
+            .expect("fallback reconnects the live vJoy backend");
         assert_eq!(outcome.active, BackendKind::VJoy);
         assert!(outcome.fell_back);
         assert!(!outcome.switched, "same backend instance stays installed");
@@ -882,14 +840,8 @@ mod tests {
         let (backend, backend_state) = MockBackend::new("Xbox");
         let mut current = backend.boxed();
 
-        let outcome = switch_backend(
-            &mut current,
-            BackendKind::Xbox,
-            &factories,
-            None,
-            true,
-        )
-        .expect("same-kind reconnect succeeds");
+        let outcome = switch_backend(&mut current, BackendKind::Xbox, &factories, None, true)
+            .expect("same-kind reconnect succeeds");
         assert_eq!(outcome.active, BackendKind::Xbox);
         assert!(!outcome.switched, "same backend instance stays installed");
         assert_eq!(
@@ -911,14 +863,8 @@ mod tests {
         let mut current = backend.boxed();
         current.try_connect().expect("backend connects");
 
-        let outcome = switch_backend(
-            &mut current,
-            BackendKind::Xbox,
-            &factories,
-            None,
-            true,
-        )
-        .expect("no-op switch succeeds");
+        let outcome = switch_backend(&mut current, BackendKind::Xbox, &factories, None, true)
+            .expect("no-op switch succeeds");
         assert!(!outcome.switched);
         assert!(!outcome.fell_back);
         let (_, connect_calls, disconnect_calls) = state_of(&backend_state);
@@ -956,14 +902,8 @@ mod tests {
         let mut current = old.boxed();
         current.try_connect().expect("old vJoy connects");
 
-        let error = switch_backend(
-            &mut current,
-            BackendKind::Xbox,
-            &factories,
-            None,
-            false,
-        )
-        .expect_err("explicit Xbox failure must error, not fall back");
+        let error = switch_backend(&mut current, BackendKind::Xbox, &factories, None, false)
+            .expect_err("explicit Xbox failure must error, not fall back");
         let message = error.to_string();
         assert!(message.contains("failed to plug in"), "{message}");
         assert!(!message.contains("fell back"), "{message}");
@@ -988,14 +928,8 @@ mod tests {
         let factories = factories_with(&hm, &vjoy);
         let mut current = MockBackend::new("NullSink").0.boxed();
 
-        let error = switch_backend(
-            &mut current,
-            BackendKind::Xbox,
-            &factories,
-            None,
-            false,
-        )
-        .expect_err("explicit Xbox failure must error");
+        let error = switch_backend(&mut current, BackendKind::Xbox, &factories, None, false)
+            .expect_err("explicit Xbox failure must error");
         assert!(error.to_string().contains("driver install failed"));
         assert_eq!(current.name(), "NullSink");
         assert!(!current.is_connected());
@@ -1013,14 +947,8 @@ mod tests {
             MockBackend::with_failures("Xbox", 2, "ViGEmBus target failed to plug in.");
         let mut current = backend.boxed();
 
-        let error = switch_backend(
-            &mut current,
-            BackendKind::Xbox,
-            &factories,
-            None,
-            false,
-        )
-        .expect_err("explicit reconnect failure must error");
+        let error = switch_backend(&mut current, BackendKind::Xbox, &factories, None, false)
+            .expect_err("explicit reconnect failure must error");
         assert!(error.to_string().contains("failed to plug in"));
         assert_eq!(current.name(), "Xbox");
         let (connected, _, disconnects) = state_of(&backend_state);
@@ -1028,14 +956,8 @@ mod tests {
         assert_eq!(disconnects, 0, "failed instance is not disconnected");
         // …while the automatic path still falls back, for the same
         // installed backend.
-        let outcome = switch_backend(
-            &mut current,
-            BackendKind::Xbox,
-            &factories,
-            None,
-            true,
-        )
-        .expect("automatic reconnect falls back to vJoy");
+        let outcome = switch_backend(&mut current, BackendKind::Xbox, &factories, None, true)
+            .expect("automatic reconnect falls back to vJoy");
         assert!(outcome.fell_back);
         assert_eq!(outcome.active, BackendKind::VJoy);
     }

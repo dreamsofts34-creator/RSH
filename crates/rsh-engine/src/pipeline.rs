@@ -707,7 +707,6 @@ impl ProcessingPipeline {
         &self.plan
     }
 
-
     /// Replace the plan. All filter and ramp state is reset:
     /// a new plan must never inherit stale smoothing.
     pub fn set_plan(&mut self, plan: PipelinePlan) {
@@ -961,7 +960,6 @@ impl ProcessingPipeline {
         out.buttons = buttons & (SHIFTER_SEQ_BITS | HORN_BIT);
     }
 
-
     /// SH2, sequential side: a shift is a rising edge on bit 0/1.
     /// An edge inside the lockout window is rejected — and the
     /// rejected press stays suppressed while held (a held bit would
@@ -986,10 +984,6 @@ impl ProcessingPipeline {
         }
         buttons & !self.shift_suppressed_seq
     }
-
-
-
-
 
     // --- Handbrake/clutch per-module tuning ---
     /// H1/H3: handbrake latch + auto-release on throttle.
@@ -1045,7 +1039,6 @@ impl ProcessingPipeline {
     }
 }
 
-
 /// Shift-lockout window in ticks (SH2): one tick is 5 ms at
 /// 200 Hz, so the 0–200 ms range is 0–40 ticks (`0` = off). The
 /// clamp to `0..=40` makes both casts safe.
@@ -1054,10 +1047,6 @@ impl ProcessingPipeline {
 pub fn shift_lockout_ticks(lockout_ms: f32) -> u8 {
     ((lockout_ms / 5.0).round().clamp(0.0, 40.0)) as u8
 }
-
-
-
-
 
 /// Horn minimum-honk hold in ticks for a `horn_min_ms` setting
 /// (HO1): one tick is 5 ms at 200 Hz, so the 100–1000 ms range is
@@ -1205,7 +1194,6 @@ pub fn apply_steering_scale(value: f32, scale: f32) -> f32 {
     let s = clamp_finite(scale, 0.2, 1.0, 1.0);
     (value / s).clamp(-1.0, 1.0)
 }
-
 
 /// Apply One Euro smoothing for one tick. `smoothing <= 0` bypasses
 /// the filter (state reset, value passes through); otherwise the
@@ -1381,8 +1369,8 @@ fn clamp_finite(value: f32, lo: f32, hi: f32, default: f32) -> f32 {
 mod tests {
     use super::{
         DT_S, INPUT_FREQ_HZ, OneEuroFilter, OutputState, PipelinePlan, ProcessingPipeline,
-        apply_curve, apply_deadzone_bipolar, apply_deadzone_unipolar,
-        apply_steering_scale, map_pedal_mv, map_steering_mv, shift_lockout_ticks,
+        apply_curve, apply_deadzone_bipolar, apply_deadzone_unipolar, apply_steering_scale,
+        map_pedal_mv, map_steering_mv, shift_lockout_ticks,
     };
     use rsh_protocol::{StreamFlags, StreamFrame};
 

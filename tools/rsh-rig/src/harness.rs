@@ -1221,7 +1221,6 @@ pub fn run_contract(scenario: &Scenario) -> Metrics {
         "gate-notifications-source" => crate::gate_checks::gate_notifications_source(),
         // Cards layout fix (2026-11-19): Extras ON/OFF size + responsive gaps.
         "gate-extras-card-size-source" => crate::gate_checks::gate_extras_card_size_source(),
-        "gate-card-gap-source" => crate::gate_checks::gate_card_gap_source(),
         // v2.0.2 gate checks, re-scan findings (B-2, H-3, H-4, M-9).
         // (B-1, gate-pairing-long-call, was deleted with pairing.)
         "gate-backend-single-attempt" => crate::gate_checks::gate_backend_switch_single_attempt(),

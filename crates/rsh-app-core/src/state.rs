@@ -169,13 +169,13 @@ use rsh_engine::engine::{
 use rsh_engine::metrics::EngineMetrics;
 use rsh_engine::pipeline::OutputState as PipelineOutputState;
 use rsh_engine::pipeline::{PipelinePlan, ProcessingPipeline};
+use rsh_output::VigemOutput;
 use rsh_output::selector::{BackendFactories, BackendKind, SwitchOutcome, switch_backend};
 #[cfg(windows)]
 use rsh_output::vjoy::{RealVJoyDll, VJoyInterface};
 use rsh_output::vjoy::{VJOY_DOWNLOAD_URL, VJoyOutput, resolve_dll_path};
 #[cfg(windows)]
 use rsh_output::vjoy_config::configure_device_1_envelope;
-use rsh_output::VigemOutput;
 use rsh_output::{IJoystickOutput, ProcessedState, VJoyError};
 use rsh_profiles::bindings::{BindingError, BindingStore, is_app_action};
 use rsh_profiles::csharp_import::{
@@ -224,8 +224,8 @@ use crate::firmware_image;
 use crate::launcher::{GameLauncher, SystemSpawner};
 use crate::manual_games::ManualGameStore;
 use crate::snapshot::{
-    ConnectionState, EngineSnapshot, EngineStats, LoopRateTracker, PedalSnapshot,
-    SnapshotInput, build_engine_stats_cached,
+    ConnectionState, EngineSnapshot, EngineStats, LoopRateTracker, PedalSnapshot, SnapshotInput,
+    build_engine_stats_cached,
 };
 use crate::system::{NullSink, ShutdownOutcome};
 use crate::telemetry_adapter::TelemetryCarSource;
@@ -423,7 +423,6 @@ struct VjoyDllCache {
 /// long enough that the ~1 Hz slow poll never probes, short enough
 /// that a hand-installed driver shows up without a restart.
 const VJOY_DLL_CACHE_TTL: Duration = Duration::from_secs(60);
-
 
 /// Cached Wi-Fi password-set flag (R3-D-08): [`AppStateCore::wifi_status`]
 /// did one Credential Manager read per call, and the daemon's slow
@@ -5158,7 +5157,10 @@ impl AppStateCore {
     /// switch fails, or the rate limit bites.
     fn try_mid_session_fallback(&self, output: &PipelineOutputState) -> Result<(), SinkError> {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
-        self.try_mid_session_fallback_with_factories(output, &real_backend_factories(vjoy_device_id))
+        self.try_mid_session_fallback_with_factories(
+            output,
+            &real_backend_factories(vjoy_device_id),
+        )
     }
 
     /// [`try_mid_session_fallback`](Self::try_mid_session_fallback)
@@ -9941,10 +9943,6 @@ mod tests {
         fn is_latched(&self) -> bool {
             *self.latched.lock().expect("latched lock poisoned")
         }
-
-
-
-
     }
 
     impl IJoystickOutput for RecordingBackend {
@@ -10015,10 +10013,6 @@ mod tests {
                 .push(PipelineOutputState::neutral());
             Ok(())
         }
-
-
-
-
     }
 
     /// One side of the `BlockingBackend` handshake: a bool flag
@@ -10222,11 +10216,6 @@ mod tests {
         );
     }
 
-
-
-
-
-
     #[test]
     fn recording_backend_actuation_is_real() {
         let (state, sent, fail) = test_state_with_recording();
@@ -10388,7 +10377,6 @@ mod tests {
         );
     }
 
-
     /// Mock factories for the P2 tests where the test keeps a handle
     /// to the `Xbox` mock, so it can flip `fail_connect` on the
     /// INSTALLED instance: a same-kind re-select reconnects the
@@ -10413,9 +10401,6 @@ mod tests {
             xb,
         )
     }
-
-
-
 
     /// P1-5 (update4-fix): an AUTOMATIC re-attempt must NOT clear
     /// the manager's 2-failure latch — the latched instance fails
@@ -10494,7 +10479,6 @@ mod tests {
         );
     }
 
-
     /// The fallback survives ONLY on automatic paths: enabling
     /// output with a persisted `Xbox` choice whose driver fails
     /// still falls back to vJoy, and the persisted choice stays
@@ -10515,7 +10499,6 @@ mod tests {
             "the automatic path does not rewrite the persisted choice"
         );
     }
-
 
     #[test]
     fn list_output_backends_reports_honest_status_on_linux() {
@@ -10555,8 +10538,6 @@ mod tests {
         assert!(!none.elevation_required);
     }
 
-
-
     // -- v2.0.1 hotfix BACKEND-2: default backend vJoy ----------------
 
     #[test]
@@ -10589,7 +10570,6 @@ mod tests {
         assert_eq!(status.dll_path, None);
         assert_eq!(status.version, None, "version is never invented");
     }
-
 
     /// P3-9 (v2.0.12 scan): the last measured driver version is
     /// reported (and survives a backend that measures nothing) —
@@ -10729,7 +10709,6 @@ mod tests {
         assert_eq!(third.steering_deg, 15.0);
         assert_eq!(state.snapshot(), third);
     }
-
 
     #[test]
     fn button_press_edges_come_from_pipeline_diffs() {
@@ -11066,7 +11045,6 @@ mod tests {
             "draft only: disk is untouched before Save"
         );
     }
-
 
     #[test]
     fn shifter_lockout_round_trips_and_old_profiles_get_default() {
@@ -11661,7 +11639,6 @@ mod tests {
         assert_eq!(state.take_learned_button(), None);
     }
 
-
     // -- Button→action bindings (v2.0.2, Round 2B) --------------------
 
     /// Drive one engine tick through the sink path (ingest +
@@ -11716,10 +11693,6 @@ mod tests {
         assert_eq!(received.handbrake, 0.0);
     }
 
-
-
-
-
     #[test]
     fn bindings_app_action_queues_once_per_press_edge() {
         let (state, _dir) = test_state();
@@ -11760,8 +11733,6 @@ mod tests {
             "raw edge survives for the UI highlight: {events:?}"
         );
     }
-
-
 
     /// R2-05: a failed control op (LED test, config) records on its
     /// own channel and never knocks the live session into Error —
@@ -13095,7 +13066,6 @@ mod tests {
         assert_eq!(state.settings().output_backend, "Xbox");
     }
 
-
     #[test]
     fn startup_activation_activates_vjoy_when_selected() {
         // A non-elevated choice IS activated at startup: vJoy needs
@@ -13154,14 +13124,17 @@ mod tests {
         let (state, _dir) = test_state_with_backend_setting("Xbox");
         let factories = mock_factories(false, false);
         let started = state.activate_startup_backend_with_factories(&factories);
-        assert_eq!(started.active, Some(BackendKind::Xbox), "startup activates Xbox");
+        assert_eq!(
+            started.active,
+            Some(BackendKind::Xbox),
+            "startup activates Xbox"
+        );
         let enabled = state.set_output_enabled_with_factories(true, &factories);
         assert!(enabled.connected, "backend connected after enable");
         assert_eq!(state.backend_name(), "RecordingBackend");
         assert_eq!(state.selected_backend(), BackendKind::Xbox);
         assert_eq!(state.settings().output_backend, "Xbox");
     }
-
 
     #[test]
     fn enabling_output_with_failing_backends_reports_failure_honestly() {
@@ -13189,7 +13162,6 @@ mod tests {
         );
     }
 
-
     #[test]
     #[cfg(not(windows))]
     fn startup_activation_without_drivers_fails_honestly() {
@@ -13211,7 +13183,6 @@ mod tests {
         assert_eq!(state.backend_name(), "NullSink");
         assert!(!state.output_state().connected);
     }
-
 
     #[test]
     fn stop_engine_without_start_is_a_noop() {

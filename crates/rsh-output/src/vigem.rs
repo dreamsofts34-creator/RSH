@@ -224,14 +224,12 @@ impl fmt::Display for VigemError {
                 f,
                 "could not connect to the ViGEmBus driver (0x{code:08X}) - install the ViGEmBus driver and retry."
             ),
-            Self::ClientAllocFailed => write!(
-                f,
-                "could not allocate the ViGEmBus client (out of memory)."
-            ),
-            Self::TargetAllocFailed => write!(
-                f,
-                "could not allocate the Xbox 360 target (out of memory)."
-            ),
+            Self::ClientAllocFailed => {
+                write!(f, "could not allocate the ViGEmBus client (out of memory).")
+            }
+            Self::TargetAllocFailed => {
+                write!(f, "could not allocate the Xbox 360 target (out of memory).")
+            }
             Self::TargetAddFailed(code) => write!(
                 f,
                 "could not plug in the Xbox 360 controller (0x{code:08X}) - install the ViGEmBus driver and retry."
@@ -280,8 +278,7 @@ type VigemTargetRemoveFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32
 type VigemTargetFreeFn = unsafe extern "C" fn(*mut c_void);
 /// NOTE: the report is passed BY VALUE, not by pointer — the FFI
 /// signature must match (`XUSB_REPORT`, 12 bytes, by value).
-type VigemTargetX360UpdateFn =
-    unsafe extern "C" fn(*mut c_void, *mut c_void, XusbReport) -> u32;
+type VigemTargetX360UpdateFn = unsafe extern "C" fn(*mut c_void, *mut c_void, XusbReport) -> u32;
 
 /// The ViGEmBus client calls RSH needs, behind a trait so the
 /// whole backend (except the literal `Library::new`) runs on a
@@ -502,7 +499,9 @@ impl VigemOutput {
     fn lock_inner(&self) -> std::sync::MutexGuard<'_, VigemInner> {
         // A poisoned lock means a previous holder panicked mid-FFI
         // — recover the state instead of crashing the daemon.
-        self.inner.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Teardown, best-effort, never panics. Called by
@@ -861,7 +860,10 @@ mod tests {
 
     #[test]
     fn build_report_neutral_is_all_zero() {
-        assert_eq!(build_report(&ProcessedState::default()), XusbReport::default());
+        assert_eq!(
+            build_report(&ProcessedState::default()),
+            XusbReport::default()
+        );
     }
 
     #[test]
@@ -944,10 +946,15 @@ mod tests {
     #[test]
     fn send_neutral_while_disconnected_is_a_noop() {
         let (mut out, shared) = output_with(MockVigemApi::new());
-        out.send_neutral().expect("neutral while disconnected is Ok");
-        assert!(!shared.lock().unwrap().calls.contains(&MockCall::Update(
-            XusbReport::default()
-        )));
+        out.send_neutral()
+            .expect("neutral while disconnected is Ok");
+        assert!(
+            !shared
+                .lock()
+                .unwrap()
+                .calls
+                .contains(&MockCall::Update(XusbReport::default()))
+        );
     }
 
     #[test]
@@ -955,11 +962,13 @@ mod tests {
         let (mut out, shared) = output_with(MockVigemApi::new());
         out.try_connect().expect("mock connect succeeds");
         out.send_neutral().expect("neutral send succeeds");
-        assert!(shared
-            .lock()
-            .unwrap()
-            .calls
-            .contains(&MockCall::Update(XusbReport::default())));
+        assert!(
+            shared
+                .lock()
+                .unwrap()
+                .calls
+                .contains(&MockCall::Update(XusbReport::default()))
+        );
     }
 
     #[test]
@@ -982,7 +991,9 @@ mod tests {
                 .contains("install the ViGEmBus driver")
         );
         assert!(
-            VigemError::DllNotFound.to_string().contains("ViGEmClient.dll")
+            VigemError::DllNotFound
+                .to_string()
+                .contains("ViGEmClient.dll")
         );
         assert_eq!(
             VJoyError::from(VigemError::BusNotFound).to_string(),

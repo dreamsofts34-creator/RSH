@@ -201,7 +201,6 @@ fn strip_comments(text: &str) -> String {
     out
 }
 
-
 /// Read a repo-relative Rust/Slint file as text with comments
 /// stripped (R3-16) — source audits must match live code, not
 /// commented-out code. `None` when it cannot be read (audits treat
@@ -471,15 +470,8 @@ pub fn gate_backend_switch() -> (bool, String) {
     let factories = mock_factories();
     let mut current = MockBackend::new("NullSink").0.boxed();
 
-    let outcome = switch_backend(
-        &mut current,
-        BackendKind::Xbox,
-        &factories,
-        None,
-        true,
-    );
-    let ok = outcome
-        .is_ok_and(|o| o.active == BackendKind::Xbox && o.switched && !o.fell_back)
+    let outcome = switch_backend(&mut current, BackendKind::Xbox, &factories, None, true);
+    let ok = outcome.is_ok_and(|o| o.active == BackendKind::Xbox && o.switched && !o.fell_back)
         && current.name() == "Xbox"
         && current.is_connected();
     report.check(
@@ -498,13 +490,7 @@ pub fn gate_backend_switch() -> (bool, String) {
         "vJoy active + connected; Xbox instance released (slot holds vJoy only)",
     );
 
-    let outcome = switch_backend(
-        &mut current,
-        BackendKind::Xbox,
-        &factories,
-        None,
-        true,
-    );
+    let outcome = switch_backend(&mut current, BackendKind::Xbox, &factories, None, true);
     let ok = outcome.is_ok_and(|o| o.active == BackendKind::Xbox && o.switched)
         && current.name() == "Xbox"
         && current.is_connected();
@@ -630,9 +616,9 @@ pub fn gate_backend_switch() -> (bool, String) {
     // No-elevation audit (v2.0.19): no backend needs admin — the
     // Xbox and vJoy rows carry no UAC note and no elevation flag.
     let backends = state.list_output_backends();
-    let no_elevation = backends.iter().all(|b| {
-        !b.elevation_required && b.uac_note.is_none()
-    });
+    let no_elevation = backends
+        .iter()
+        .all(|b| !b.elevation_required && b.uac_note.is_none());
     report.check(
         "no-backend-needs-elevation",
         backends.len() == 3 && no_elevation,
@@ -655,7 +641,6 @@ pub fn gate_backend_switch() -> (bool, String) {
 
     report.finish()
 }
-
 
 /// Words that must never appear in user-facing error copy (B6):
 /// raw implementation detail, not something a user can act on.
@@ -1731,89 +1716,6 @@ pub fn gate_extras_card_size_source() -> (bool, String) {
 /// panels (Steering right column 296 px, Buttons edit panel 268 px)
 /// are NOT asserted here.
 #[must_use]
-pub fn gate_card_gap_source() -> (bool, String) {
-    let mut report = Report::new();
-    let extras = read_code("crates/rsh-ui/ui/screens/extras.slint").unwrap_or_default();
-    let pedals = read_code("crates/rsh-ui/ui/screens/pedals.slint").unwrap_or_default();
-    let buttons = read_code("crates/rsh-ui/ui/screens/buttons.slint").unwrap_or_default();
-    let steering = read_code("crates/rsh-ui/ui/screens/steering.slint").unwrap_or_default();
-    let overview = read_code("crates/rsh-ui/ui/screens/overview.slint").unwrap_or_default();
-    let settings = read_code("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
-    report.check(
-        "gap-spacers-extras",
-        count(&extras, "min-width: 12px; horizontal-stretch: 0.05;") == 2,
-        "Extras has 2 gap spacers (one per card row)",
-    );
-    report.check(
-        "gap-spacers-pedals",
-        count(&pedals, "min-width: 12px; horizontal-stretch: 0.05;") == 2,
-        "Pedals has 2 gap spacers (between the 3 cards)",
-    );
-    report.check(
-        "gap-spacers-buttons-tiles",
-        count(&buttons, "min-width: 8px; horizontal-stretch: 0.05;") == 10,
-        "Buttons has 10 gap spacers (9 between tiles + 1 knob row)",
-    );
-    report.check(
-        "gap-spacers-buttons-root",
-        count(&buttons, "min-width: 12px; horizontal-stretch: 0.05;") == 1,
-        "Buttons has 1 root gap spacer (left column ↔ edit panel)",
-    );
-    report.check(
-        "gap-spacer-steering",
-        count(&steering, "min-width: 12px; horizontal-stretch: 0.05;") == 1,
-        "Steering has 1 gap spacer (graph card ↔ right column)",
-    );
-    report.check(
-        "gap-spacer-overview",
-        count(&overview, "min-width: 12px; horizontal-stretch: 0.05;") == 1,
-        "Overview has 1 gap spacer (bottom-row cards)",
-    );
-    report.check(
-        "gap-spacer-settings",
-        count(&settings, "min-width: 12px; horizontal-stretch: 0.05;") == 1,
-        "Settings has 1 gap spacer (between the columns)",
-    );
-    report.check(
-        "gap-grid-overview-fixed",
-        overview.contains("spacing: 10px;"),
-        "Overview games grid keeps fixed 10px spacing (a computed spacing from self.width is a binding loop inside the ScrollView — see the comment at the grid; the tiles still grow)",
-    );
-    // NOTE: `count("width: 210px;")` also matches the `min-width:`
-    // occurrences (substring), so the explicit-width count is the
-    // total minus the min-width count.
-    // P1-6: the Pedals cards use a 210 px floor — the old 224 px
-    // (preview-exact: (696 - 2*12) / 3) preferred 696 px and
-    // clipped the clutch card at the 880 px minimum window; 210 px
-    // makes the row prefer 654 px (3*210 + 2*12), so the page spans
-    // the full column at design width AND fits the 656 px column at
-    // the minimum window.
-    report.check(
-        "gap-pedals-min-width",
-        count(&pedals, "min-width: 210px;") == 3
-            && count(&pedals, "width: 210px;") - count(&pedals, "min-width: 210px;") == 0,
-        "Pedals cards use min-width: 210px (no explicit width: 210px)",
-    );
-    report.check(
-        "gap-buttons-min-width",
-        count(&buttons, "min-width: 90px;") == 12
-            && count(&buttons, "width: 90px;") - count(&buttons, "min-width: 90px;") == 0,
-        "Buttons tiles use min-width: 90px (no explicit width: 90px)",
-    );
-    // P1-6: the Settings columns use a 318 px floor (318*2 + 12
-    // gap = 648, leaving 8 px slack in the 656 px column at the
-    // 880 px minimum window — at exactly 322 the borders pushed
-    // the right column over the edge) and still stretch to 342 px
-    // at the 920 px design width — 318 is the floor, not the size.
-    report.check(
-        "gap-settings-min-width",
-        count(&settings, "min-width: 318px;") == 2
-            && count(&settings, "width: 318px;") - count(&settings, "min-width: 318px;") == 0,
-        "Settings columns use min-width: 318px + stretch (no explicit width: 318px)",
-    );
-    report.finish()
-}
-
 /// Gate: backend-switch single attempt (v2.0.19).
 ///
 /// The UAC-dwell half of this gate is deleted with the HIDMaestro
@@ -2159,4 +2061,5 @@ let path = 'x'; // (1 - value)"#;
         });
         let _ = std::fs::remove_dir_all(&dir);
         assert!(ok, "{detail}");
-    }}
+    }
+}

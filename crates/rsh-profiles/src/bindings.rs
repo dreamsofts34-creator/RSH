@@ -56,12 +56,7 @@ pub const BINDINGS_FILE_NAME: &str = "bindings.json";
 /// Game-input actions a button can trigger (what the output
 /// backend understands). Must stay in sync with
 /// `rsh_app_core::commands::ASSIGNABLE_ACTIONS`.
-pub const GAME_ACTIONS: &[&str] = &[
-    "horn",
-    "shifter_up",
-    "shifter_down",
-    "handbrake",
-];
+pub const GAME_ACTIONS: &[&str] = &["horn", "shifter_up", "shifter_down", "handbrake"];
 
 /// App actions a button can trigger (the daemon runs these itself
 /// on a press edge — they never reach the output backend).
@@ -625,7 +620,9 @@ mod tests {
         assert_eq!(error.code, "InvalidButton");
         let error = store.set(64, "horn").expect_err("button 64");
         assert_eq!(error.code, "InvalidButton");
-        let error = store.set(65, "horn").expect_err("button 65 (encoder, deleted)");
+        let error = store
+            .set(65, "horn")
+            .expect_err("button 65 (encoder, deleted)");
         assert_eq!(error.code, "InvalidButton");
         let error = store.set(5, "warp_drive").expect_err("unknown action");
         assert_eq!(error.code, "UnknownAction");

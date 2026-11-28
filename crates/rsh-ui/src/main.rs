@@ -67,8 +67,8 @@ use rsh_api::connection::ConnectionState;
 use rsh_api::tuning::snap_steering_lock_deg;
 use rsh_api::{
     app_version, ApiTransport, AppApi, AppEvent, CalibrationInfo, ConnectionError, ConnectionInfo,
-    FirmwareCheck, FirmwareUpdateStatus, GameSummary, LedPattern, ProfileSummary,
-    SnapshotInfo, TuningSettings, UserError,
+    FirmwareCheck, FirmwareUpdateStatus, GameSummary, LedPattern, ProfileSummary, SnapshotInfo,
+    TuningSettings, UserError,
 };
 use slint::{Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
@@ -119,7 +119,6 @@ const VY1: f32 = 190.0;
 
 /// Live chart history (20 Hz × 10 s, "Last 10 s").
 const CHART_SAMPLES: usize = 200;
-
 
 /// Pedal feel exponents: Linear 1.0, Soft 0.7, Sharp 1.5 (the curve
 /// field of the pedal's stored tuning record).
@@ -248,10 +247,6 @@ pub fn game_code(name: &str) -> String {
         name.chars().take(2).collect::<String>()
     }
 }
-
-
-
-
 
 /// A game slug ("`assetto_corsa`") as a display name ("Assetto Corsa").
 #[must_use]
@@ -1313,10 +1308,6 @@ fn set_if_changed<T: PartialEq>(current: T, next: T, set: impl FnOnce(T)) {
     }
 }
 
-
-
-
-
 /// Background-job completions (A9/B5): a job thread sends exactly one
 /// of these on `job_tx`; the frame timer drains them on the UI thread
 /// and applies the result (notify / revert / re-sync). The payloads
@@ -1788,8 +1779,6 @@ impl FrameCmdCache {
         ));
         built
     }
-
-
 
     /// Diagnostics pedals readout, rebuilt only when a value moved.
     #[allow(clippy::float_cmp)]
@@ -3960,14 +3949,6 @@ impl Ctx {
         });
     }
 
-
-
-
-
-
-
-
-
     /// Start a background job (A9/B5): the work runs on its own
     /// thread — the UI thread never blocks on IPC, a spawn, or a
     /// flash. The busy label is recorded immediately (feedback in
@@ -5380,10 +5361,6 @@ impl Ctx {
         win.set_confirm_open(true);
     }
 
-
-
-
-
     /// Seed everything the daemon owns on (re)connect (B1 wiring):
     /// auto-pause + module on/off + the firmware check cache + the
     /// keep-in-tray switch (FC2: the switch is a `MainWindow`
@@ -5495,14 +5472,6 @@ impl Ctx {
             },
         );
     }
-
-
-
-
-
-
-
-
 
     /// Open the setup wizard at Step 0 (Connect, D16): the user
     /// joins the wheel's Wi-Fi or plugs in USB there — no Begin,
@@ -6789,8 +6758,6 @@ impl Ctx {
         );
     }
 
-
-
     /// Write the Extras page's shifter props from a tuning record +
     /// the cached board sensitivity (SH1/SH2, R2-10): the lockout
     /// slider + text from the record, the sensitivity slider + text
@@ -6869,12 +6836,6 @@ impl Ctx {
             }
         }
     }
-
-
-
-
-
-
 
     /// Echo a handbrake deadzone drag locally (R2-10): same pattern
     /// as [`Self::apply_pedal_deadzone_local`].
@@ -8125,8 +8086,6 @@ impl Ctx {
             win.set_diag_events(ModelRc::new(Rc::new(VecModel::from(lines))));
         }
     }
-
-
 
     /// Sync the wizard Drivers step (vJoy) from `vjoy_status()`:
     /// installed / installing / version / last install error are all
@@ -10052,8 +10011,6 @@ fn wire_pedals_set(win: &MainWindow, ctx: &Rc<Ctx>) {
         });
     }
 }
-
-
 
 /// Wire the Extras page callbacks (A6): LED pattern/brightness/colour
 /// and handbrake feel/deadzone push through `set_tuning`; horn Learn
@@ -12470,7 +12427,8 @@ fn start_frame_timer(
                                 code: "vjoy_install_failed".to_string(),
                                 title: "vJoy install failed".to_string(),
                                 what_happened: w.get_setup_vjoy_error().to_string(),
-                                what_to_do: "Try again, or use Xbox (ViGEmBus) instead.".to_string(),
+                                what_to_do: "Try again, or use Xbox (ViGEmBus) instead."
+                                    .to_string(),
                                 detail: None,
                             },
                         );
@@ -12932,8 +12890,6 @@ mod tests {
         assert_eq!(t.exponent, 1.0);
     }
 
-
-
     #[test]
     fn preset_round_trips_through_settings() {
         let mut t = Tuning::from_settings(&TuningSettings::neutral("steering"));
@@ -13089,8 +13045,6 @@ mod tests {
         assert_eq!(game_code("Dirt Rally 2.0"), "DR");
     }
 
-
-
     #[test]
     fn pretty_game_slug_reads_as_name() {
         assert_eq!(pretty_game_slug("assetto_corsa"), "Assetto Corsa");
@@ -13175,10 +13129,6 @@ mod tests {
         );
         assert!(!user_text("Daemon x daemon y").contains("aemon"));
     }
-
-
-
-
 
     #[test]
     fn mv_text_dash_for_no_reading() {
@@ -15866,10 +15816,7 @@ mod tests {
         // Leg 2: the daemon HAS switched to Xbox by the time
         // the re-query runs — the timeout reports the success, not
         // the timeout.
-        assert_eq!(
-            live_api.set_output_backend("Xbox").expect("switch"),
-            "Xbox"
-        );
+        assert_eq!(live_api.set_output_backend("Xbox").expect("switch"), "Xbox");
         stale_backend_job();
         let before = unread();
         ctx.check_job_timeouts(&win);

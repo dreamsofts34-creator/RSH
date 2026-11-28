@@ -591,10 +591,7 @@ fn parse_binding_button(params: &serde_json::Value) -> Result<u8, IpcError> {
         .and_then(serde_json::Value::as_u64)
         .and_then(|n| u8::try_from(n).ok())
         .ok_or_else(|| {
-            IpcError::Api(
-                "InvalidButton|button must be a number (physical 1-32)"
-                    .to_string(),
-            )
+            IpcError::Api("InvalidButton|button must be a number (physical 1-32)".to_string())
         })
 }
 

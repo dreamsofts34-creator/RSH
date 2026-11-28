@@ -1056,12 +1056,7 @@ pub use rsh_api::tuning::{LedPattern, ShifterGate, TuningSettings, validate_tuni
 
 /// Actions a button can trigger (mirrors `ASSIGNABLE_ACTIONS` in
 /// `frontend/src/screens/Buttons/bindings.ts`).
-pub const ASSIGNABLE_ACTIONS: &[&str] = &[
-    "horn",
-    "shifter_up",
-    "shifter_down",
-    "handbrake",
-];
+pub const ASSIGNABLE_ACTIONS: &[&str] = &["horn", "shifter_up", "shifter_down", "handbrake"];
 
 /// Button number → action id. Absent = unbound. Serializes as a JSON
 /// object with string keys (`{"1": "horn"}`), exactly the shape the
@@ -1822,9 +1817,8 @@ mod tests {
         assert!(errors.iter().any(|e| e.contains("button 3")));
         // Encoder virtual buttons and H-pattern gears are deleted
         // in v2.0.19 — both fail validation now.
-        let deleted = parse_button_bindings(
-            &serde_json::json!({"buttons": {"65": "gear_1", "70": "horn"}}),
-        );
+        let deleted =
+            parse_button_bindings(&serde_json::json!({"buttons": {"65": "gear_1", "70": "horn"}}));
         let errors = validate_button_bindings(&deleted);
         assert_eq!(errors.len(), 3, "errors: {errors:?}");
         assert!(parse_button_bindings(&serde_json::json!({})).is_empty());

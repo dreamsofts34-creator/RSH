@@ -26,13 +26,13 @@ use rsh_engine::pipeline::{OutputState, PipelinePlan};
 
 pub use error::OutputError;
 pub use selector::{BackendFactories, BackendKind, SwitchOutcome, switch_backend};
+pub use vigem::{VigemError, VigemOutput};
 pub use vjoy::{EnvelopeCaps, VJoyError, VJoyOutput, VJoyStateKind, VJoyStatus, validate_envelope};
 pub use vjoy_config::{
     STALE_OEMDATA_SUBKEY, STALE_OEMDATA_VALUE_NAME, VJOY_DEVICE_ID, VJOY_ENVELOPE_AXES,
-    VJOY_ENVELOPE_BUTTONS, VJOY_ENVELOPE_DISCRETE_POVS, VJOY_ENVELOPE_FFB_EFFECTS,
-    VJoyConfigError, delete_stale_oemdata_hkcu, vjoy_config_argv,
+    VJOY_ENVELOPE_BUTTONS, VJOY_ENVELOPE_DISCRETE_POVS, VJOY_ENVELOPE_FFB_EFFECTS, VJoyConfigError,
+    delete_stale_oemdata_hkcu, vjoy_config_argv,
 };
-pub use vigem::{VigemError, VigemOutput};
 
 /// The processed state the engine hands to an output backend.
 ///
