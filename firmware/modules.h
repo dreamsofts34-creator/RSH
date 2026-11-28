@@ -2,16 +2,17 @@
 // RSH modules: Handbrake / Shifter / Horn — FW-11 (Plan v2.3 §4, F7).
 // Authority: PROTOCOL-V2.1.md §3.4 (GET_CAPS reply body + kind/module
 // codes), PIN-RULES.md (pin budget + presets), RSH-PLAN-v2.3.md §4
-// (10 modules: Steering, Accelerator, Brake, Clutch, Handbrake, Shifter,
-// Horn, Buttons, Encoders, LED).
+// (v2.0.19: 7 inputs — Steering, Accelerator, Brake, Clutch, Handbrake,
+// Shifter, Horn; Buttons + Encoders modules v2.0.19 mein DELETE hue,
+// H-pattern bhi — sequential-only shifter).
 //
 // Ye file Arduino se free hai taake host par test ho sake.
 //
 // Pin map note: neeche wala DEFAULT table compile hua v3.3 map hai
-// (config.h: steering 34, accel 35, brake 36, gear 27/33, buttons 25/26)
-// + naye modules (handbrake ADC 32, horn button 4, encoders 23/19 + 16/17,
-// LED strip 21). Ye board-esp32-devkitv1.json ke full-rig PRESET se
-// mukhtalif hai (preset: steering 32, throttle 33, brake 34, clutch 35,
+// (config.h: steering 34, accel 35, brake 36, gear 27/33, horn 4)
+// + naye modules (handbrake ADC 32, horn button 4, LED strip 21).
+// Ye board-esp32-devkitv1.json ke full-rig PRESET se mukhtalif hai
+// (preset: steering 32, throttle 33, brake 34, clutch 35,
 // handbrake 36) — preset ek alternate config hai, factory default nahi.
 // GET_CAPS hamesha board ki CURRENT table batata hai, preset ki nahi;
 // preset par switch karna FW-4 config transaction ka kaam hai.
@@ -35,6 +36,9 @@
 #include "pinmap.h"  // RshPinMap + slot semantics (Phase G, C3)
 
 // ---- Module codes (PROTOCOL §3.4.1) — wire values, kabhi mat badlo ----
+// v2.0.19: RSH_MOD_BUTTONS (8) + RSH_MOD_ENCODERS (9) DELETE hue —
+// Buttons/Encoders modules khatam, GET_CAPS mein ye codes kabhi nahi
+// aate. Baqi codes ki values waisi ki waisi hain (gap rehta hai).
 #define RSH_MOD_NONE        0
 #define RSH_MOD_STEERING    1
 #define RSH_MOD_ACCELERATOR 2
@@ -43,8 +47,6 @@
 #define RSH_MOD_HANDBRAKE   5
 #define RSH_MOD_SHIFTER     6
 #define RSH_MOD_HORN        7
-#define RSH_MOD_BUTTONS     8
-#define RSH_MOD_ENCODERS    9
 #define RSH_MOD_LED         10
 #define RSH_MOD_BATTERY     11
 
@@ -93,25 +95,24 @@
 // Core (ProcessingPipeline ClutchSlot/HandbrakeSlot) aur host tests §23
 // isi map par hain; purana slot-3 handbrake packet ab valid nahi.
 // Button bit (v2 stream buttons u32, §1.1): 0 shift-up, 1 shift-down,
-// 2 accel-btn, 3 brake-btn, 4 horn. H-pattern mode mein gear 1..6
-// bits 5..10 par aate hain (rsh_stream_button_bits) — D1 absolute
-// numbering barqarar (bits 2/3/4 dono modes mein wahi hain).
+// 4 horn. v2.0.19: bits 2/3 (accel/brake pedal buttons) + bits 5..10
+// (H-pattern gears) DELETE hue — wire par hamesha 0 (reserved).
+// D1 absolute numbering barqarar (horn bit dono taraf wahi hai).
 #define RSH_AXIS_SLOT_STEERING  0
 #define RSH_AXIS_SLOT_ACCEL     1
 #define RSH_AXIS_SLOT_BRAKE     2
 #define RSH_AXIS_SLOT_CLUTCH    3
 #define RSH_AXIS_SLOT_HANDBRAKE 4
 // Button bit (v2 stream buttons u32, §1.1): 0 shift-up, 1 shift-down,
-// 2 accel-btn, 3 brake-btn, 4 horn.
+// 4 horn. Bits 2/3/5..10 reserved-zero hain (v2.0.19).
 #define RSH_BTN2_SHIFT_UP   0
 #define RSH_BTN2_SHIFT_DOWN 1
-#define RSH_BTN2_ACCEL      2
-#define RSH_BTN2_BRAKE      3
 #define RSH_BTN2_HORN       4
 
 // ---- Shifter modes ----
-#define RSH_SHIFTER_SEQUENTIAL 0  // 2 buttons: up/down (default)
-#define RSH_SHIFTER_HPATTERN   1  // 6 digital pins: gears 1..6
+// v2.0.19: sequential-only — H-pattern DELETE hua (RSH_SHIFTER_HPATTERN
+// + gear pins + rsh_shifter_hpattern_gear khatam). Shifter hamesha
+// 2 buttons (up/down) hai; koi mode field nahi rehta.
 
 // GET_CAPS pin table entry (§3.4, 8 B).
 typedef struct {
@@ -135,7 +136,8 @@ static inline RshCapsEntry rsh_caps_entry(uint8_t pin, uint8_t kind,
 
 // Board ki current pin table (compiled map + naye modules). out mein
 // likhta hai, entries ki tadaad return karta hai (0 = out NULL/chhota).
-// Order: axes, battery, shifter, horn, buttons, encoders, LED.
+// Order: axes, shifter, horn, LED. v2.0.19: 8 rows (buttons 25/26 +
+// encoders 23/19/16/17 ke rows DELETE — wo inputs ab parhe hi nahi jate).
 static inline uint8_t rsh_caps_default_table(RshCapsEntry *out, uint8_t maxEntries) {
   static const RshCapsEntry kTable[] = {
       // pin, kind, module, caps
@@ -149,12 +151,6 @@ static inline uint8_t rsh_caps_default_table(RshCapsEntry *out, uint8_t maxEntri
       {PIN_GEAR_DOWN, RSH_KIND_DIGITAL_IN, RSH_MOD_SHIFTER,
        RSH_CAP_INPUT | RSH_CAP_ADC | RSH_CAP_PULLUP, {0, 0, 0, 0}},
       {PIN_HORN_BTN, RSH_KIND_DIGITAL_IN, RSH_MOD_HORN, RSH_CAP_INPUT | RSH_CAP_PULLUP, {0, 0, 0, 0}},
-      {PIN_ACCEL_BTN, RSH_KIND_DIGITAL_IN, RSH_MOD_BUTTONS, RSH_CAP_INPUT | RSH_CAP_PULLUP, {0, 0, 0, 0}},
-      {PIN_BRAKE_BTN, RSH_KIND_DIGITAL_IN, RSH_MOD_BUTTONS, RSH_CAP_INPUT | RSH_CAP_PULLUP, {0, 0, 0, 0}},
-      {PIN_ENC1_A, RSH_KIND_DIGITAL_IN, RSH_MOD_ENCODERS, RSH_CAP_INPUT | RSH_CAP_PULLUP, {0, 0, 0, 0}},
-      {PIN_ENC1_B, RSH_KIND_DIGITAL_IN, RSH_MOD_ENCODERS, RSH_CAP_INPUT | RSH_CAP_PULLUP, {0, 0, 0, 0}},
-      {PIN_ENC2_A, RSH_KIND_DIGITAL_IN, RSH_MOD_ENCODERS, RSH_CAP_INPUT | RSH_CAP_PULLUP, {0, 0, 0, 0}},
-      {PIN_ENC2_B, RSH_KIND_DIGITAL_IN, RSH_MOD_ENCODERS, RSH_CAP_INPUT | RSH_CAP_PULLUP, {0, 0, 0, 0}},
       {PIN_LED_STRIP, RSH_KIND_LED_STRIP, RSH_MOD_LED, RSH_CAP_OUTPUT, {0, 0, 0, 0}},
   };
   uint8_t n = (uint8_t)(sizeof(kTable) / sizeof(kTable[0]));
@@ -179,19 +175,17 @@ static inline uint8_t rsh_caps_pin_caps_(uint8_t pin, uint8_t isAnalog) {
 
 // Board ki CURRENT pin table — pinmap (blob) se (Phase G, C3: "board ki
 // table hi jeet-ti hai"). Order default table jaisa hai: axes, shifter,
-// horn, buttons, encoders, LED (F-12: battery row nahi). Factory blob se bani table
-// default table ke barabar hoti hai (host test § pinmap mein compare
-// hoti hai). Accel/brake BUTTON rows (25/26) hamesha shamil hain — wo
-// fixed pedal button-mode pins hain, blob mein nahi aate (pinmap.h).
-// H-pattern mode mein gear-up/down + encoder rows ki jagah 6 H-gear
-// rows aati hain. Return entries ki tadaad (0 = map/out NULL ya out chhota).
+// horn, LED (F-12: battery row nahi; v2.0.19: buttons/encoders rows
+// nahi). Factory blob se bani table default table ke barabar hoti hai
+// (host test § pinmap mein compare hoti hai). Shifter hamesha
+// sequential hai (H-pattern v2.0.19 mein DELETE — koi mode branch nahi).
+// Return entries ki tadaad (0 = map/out NULL ya out chhota).
 static inline uint8_t rsh_caps_table_from_pinmap(const RshPinMap *map,
                                                  RshCapsEntry *out,
                                                  uint8_t maxEntries) {
   if (!map || !out) return 0;
-  RshCapsEntry tmp[19];  // zyada se zyada rows 16 hain (5 axes + battery
-                         // + 6 H-gear ya 2 gear + horn + 2 fixed buttons
-                         // + 4 enc + LED); 19 mein headroom hai
+  RshCapsEntry tmp[12];  // zyada se zyada rows 9 hain (5 axes + 2 gear
+                         // + horn + LED); 12 mein headroom hai
   uint8_t n = 0;
 #define RSH_CAPS_ADD(pin_, kind_, module_, caps_) do { \
     if (n < (uint8_t)(sizeof(tmp) / sizeof(tmp[0]))) { \
@@ -239,42 +233,15 @@ static inline uint8_t rsh_caps_table_from_pinmap(const RshPinMap *map,
   // GPIO39 sampling implement ho (divider ratio ke saath), row wapas
   // aayegi. Pinmap slot (blob compatibility) waisa hi rehta hai.
   (void)map;
-  if (map->shifterMode == RSH_SHIFTER_HPATTERN) {
-    for (int i = 0; i < 6; i++) {
-      if (map->shiftH[i] != RSH_PINMAP_ABSENT)
-        RSH_CAPS_ADD(map->shiftH[i], RSH_KIND_DIGITAL_IN, RSH_MOD_SHIFTER,
-                     rsh_caps_pin_caps_(map->shiftH[i], 0));
-    }
-  } else {
-    if (map->gearUp != RSH_PINMAP_ABSENT)
-      RSH_CAPS_ADD(map->gearUp, RSH_KIND_DIGITAL_IN, RSH_MOD_SHIFTER,
-                   rsh_caps_pin_caps_(map->gearUp, 0));
-    if (map->gearDown != RSH_PINMAP_ABSENT)
-      RSH_CAPS_ADD(map->gearDown, RSH_KIND_DIGITAL_IN, RSH_MOD_SHIFTER,
-                   rsh_caps_pin_caps_(map->gearDown, 0));
-  }
+  if (map->gearUp != RSH_PINMAP_ABSENT)
+    RSH_CAPS_ADD(map->gearUp, RSH_KIND_DIGITAL_IN, RSH_MOD_SHIFTER,
+                 rsh_caps_pin_caps_(map->gearUp, 0));
+  if (map->gearDown != RSH_PINMAP_ABSENT)
+    RSH_CAPS_ADD(map->gearDown, RSH_KIND_DIGITAL_IN, RSH_MOD_SHIFTER,
+                 rsh_caps_pin_caps_(map->gearDown, 0));
   if (map->horn != RSH_PINMAP_ABSENT)
     RSH_CAPS_ADD(map->horn, RSH_KIND_DIGITAL_IN, RSH_MOD_HORN,
                  rsh_caps_pin_caps_(map->horn, 0));
-  // Fixed pedal button-mode pins (blob mein nahi — pinmap.h).
-  RSH_CAPS_ADD(PIN_ACCEL_BTN, RSH_KIND_DIGITAL_IN, RSH_MOD_BUTTONS,
-               RSH_CAP_INPUT | RSH_CAP_PULLUP);
-  RSH_CAPS_ADD(PIN_BRAKE_BTN, RSH_KIND_DIGITAL_IN, RSH_MOD_BUTTONS,
-               RSH_CAP_INPUT | RSH_CAP_PULLUP);
-  if (map->shifterMode != RSH_SHIFTER_HPATTERN) {
-    if (map->enc1A != RSH_PINMAP_ABSENT)
-      RSH_CAPS_ADD(map->enc1A, RSH_KIND_DIGITAL_IN, RSH_MOD_ENCODERS,
-                   rsh_caps_pin_caps_(map->enc1A, 0));
-    if (map->enc1B != RSH_PINMAP_ABSENT)
-      RSH_CAPS_ADD(map->enc1B, RSH_KIND_DIGITAL_IN, RSH_MOD_ENCODERS,
-                   rsh_caps_pin_caps_(map->enc1B, 0));
-    if (map->enc2A != RSH_PINMAP_ABSENT)
-      RSH_CAPS_ADD(map->enc2A, RSH_KIND_DIGITAL_IN, RSH_MOD_ENCODERS,
-                   rsh_caps_pin_caps_(map->enc2A, 0));
-    if (map->enc2B != RSH_PINMAP_ABSENT)
-      RSH_CAPS_ADD(map->enc2B, RSH_KIND_DIGITAL_IN, RSH_MOD_ENCODERS,
-                   rsh_caps_pin_caps_(map->enc2B, 0));
-  }
   if (map->ledStrip != RSH_PINMAP_ABSENT)
     RSH_CAPS_ADD(map->ledStrip, RSH_KIND_LED_STRIP, RSH_MOD_LED, RSH_CAP_OUTPUT);
 #undef RSH_CAPS_AXIS_ROW
@@ -323,23 +290,19 @@ static inline size_t rsh_caps_build_body(uint8_t *buf, size_t bufLen,
 // ---- Module enable/disable (F7) ----
 typedef struct {
   uint8_t handbrake;  // 1 = on (analog read + axis bit)
-  uint8_t shifter;    // 1 = on (sequential buttons ya H-pattern)
+  uint8_t shifter;    // 1 = on (sequential buttons up/down)
   uint8_t horn;       // 1 = on (button bit)
-  uint8_t encoders;   // 1 = on (quadrature reads + enc values)
   uint8_t led;        // 1 = on (strip present, LED_TEST allowed)
   uint8_t clutch;     // Phase F WS5: 1 = on (analog read PIN_CLUTCH_ADC + axis slot 3)
                       // Default 0 — factory blob mein clutch record nahi;
                       // sirf config blob se on hota hai (apply_config_blob).
-  uint8_t shifterMode;  // Phase F WS5: runtime gate mode (0 sequential,
-                        // 1 H-pattern) — default RSH_SHIFTER_MODE (config.h).
-                        // SET_CFG blob type-11 record se aata hai.
 } RshModuleEnable;
 
 static inline RshModuleEnable &rsh_modules_state_(void) {
   // Function-local static: inline function ki wajah se poore program mein
   // EK hi instance (har TU mein alag copy wala `static` global nahi —
   // warna .ino se set kiya gaya state inputs.cpp ko nazar na aata).
-  static RshModuleEnable state = {1, 1, 1, 1, 1, 0, RSH_SHIFTER_MODE};  // default: sab on, clutch off
+  static RshModuleEnable state = {1, 1, 1, 1, 0};  // default: sab on, clutch off
   return state;
 }
 
@@ -350,10 +313,8 @@ static inline const RshModuleEnable *rsh_modules_enabled(void) { return &rsh_mod
 static inline uint8_t rsh_modules_handbrake_enabled(void) { return rsh_modules_state_().handbrake; }
 static inline uint8_t rsh_modules_shifter_enabled(void) { return rsh_modules_state_().shifter; }
 static inline uint8_t rsh_modules_horn_enabled(void) { return rsh_modules_state_().horn; }
-static inline uint8_t rsh_modules_encoders_enabled(void) { return rsh_modules_state_().encoders; }
 static inline uint8_t rsh_modules_led_enabled(void) { return rsh_modules_state_().led; }
 static inline uint8_t rsh_modules_clutch_enabled(void) { return rsh_modules_state_().clutch; }
-static inline uint8_t rsh_modules_shifter_mode(void) { return rsh_modules_state_().shifterMode; }
 
 // Config blob (SET_CFG, §3.6) se module state lagao — presence-driven
 // (Phase G, C3 — pinmap.h replace semantics): blob mein jis function ka
@@ -369,8 +330,8 @@ static inline void rsh_modules_apply_config_blob(const uint8_t *blob, size_t len
   if (!blob || len == 0) return;
   RshPinMap map;
   // Kharab blob (bad magic/schema/CRC/validation) state nahi badalta —
-  // warna ek corrupt blob modules band ya gate mode reset kar deta (host
-  // test §25 ne pakda: CRC-toda blob shifterMode 1 -> 0 kar raha tha).
+  // warna ek corrupt blob modules band kar deta (host test §25 ne
+  // pakda: CRC-toda blob shifter band kar raha tha).
   if (!rsh_pinmap_from_blob(blob, len, &map)) return;
   // FW-01: clutch/handbrake I2C axis (ADS1115/AS5600) par bhi on hote
   // hain — un ka pin 0xFF hota hai, is liye axis_present (pin ya I2C
@@ -379,14 +340,10 @@ static inline void rsh_modules_apply_config_blob(const uint8_t *blob, size_t len
       rsh_pinmap_axis_present(&map, RSH_AXIS_SLOT_CLUTCH) ? 1 : 0;
   rsh_modules_state_().handbrake =
       rsh_pinmap_axis_present(&map, RSH_AXIS_SLOT_HANDBRAKE) ? 1 : 0;
-  rsh_modules_state_().encoders =
-      (map.enc1A != RSH_PINMAP_ABSENT || map.enc2A != RSH_PINMAP_ABSENT) ? 1 : 0;
   rsh_modules_state_().led = (map.ledStrip != RSH_PINMAP_ABSENT) ? 1 : 0;
   rsh_modules_state_().horn = (map.horn != RSH_PINMAP_ABSENT) ? 1 : 0;
   rsh_modules_state_().shifter =
-      (map.gearUp != RSH_PINMAP_ABSENT || map.gearDown != RSH_PINMAP_ABSENT ||
-       map.shifterMode == RSH_SHIFTER_HPATTERN) ? 1 : 0;
-  rsh_modules_state_().shifterMode = map.shifterMode;
+      (map.gearUp != RSH_PINMAP_ABSENT || map.gearDown != RSH_PINMAP_ABSENT) ? 1 : 0;
 }
 
 // v2 stream axisMask (§1.1): band module ka axis bit clear -> us ka data
@@ -402,47 +359,18 @@ static inline uint8_t rsh_stream_axis_mask(const RshModuleEnable *en) {
 
 // v2 stream buttons u32 (§1.1, bit n = button n): band module ke bits
 // clear. shifter band ho to up/down dono clear; horn band ho to horn clear.
-// H-pattern mode (shifterMode==1): gear 1..6 bits 5..10 par (bit 5 = gear 1
-// ... bit 10 = gear 6); up/down bits clear (sequential switches maujood
-// nahi — un ke pins H-pattern gear pins hain). Gear 0 (neutral) ya
-// invalid (>6) ho to koi gear bit nahi. D1 absolute numbering barqarar:
-// accel/brake/horn bits dono modes mein wahi hain.
+// v2.0.19: SIRF bits 0/1/4 kabhi set hote hain — bits 2/3 (pedal buttons)
+// + bits 5..10 (H-pattern gears) DELETE hue, wire par hamesha 0. Is liye
+// function ke sirf 4 arguments hain — koi caller dobara bit 2/3/5..10
+// set nahi kar sakta.
 static inline uint32_t rsh_stream_button_bits(const RshModuleEnable *en,
                                               uint8_t shiftUp, uint8_t shiftDown,
-                                              uint8_t accelBtn, uint8_t brakeBtn,
-                                              uint8_t horn, uint8_t shifterGear) {
+                                              uint8_t horn) {
   uint32_t b = 0;
   if (en && en->shifter) {
-    if (en->shifterMode == RSH_SHIFTER_HPATTERN) {
-      if (shifterGear >= 1 && shifterGear <= 6)
-        b |= (1u << (4u + shifterGear));   // gear 1 -> bit 5 ... gear 6 -> bit 10
-    } else {
-      if (shiftUp) b |= (1u << RSH_BTN2_SHIFT_UP);
-      if (shiftDown) b |= (1u << RSH_BTN2_SHIFT_DOWN);
-    }
+    if (shiftUp) b |= (1u << RSH_BTN2_SHIFT_UP);
+    if (shiftDown) b |= (1u << RSH_BTN2_SHIFT_DOWN);
   }
-  if (accelBtn) b |= (1u << RSH_BTN2_ACCEL);
-  if (brakeBtn) b |= (1u << RSH_BTN2_BRAKE);
   if (en && en->horn && horn) b |= (1u << RSH_BTN2_HORN);
   return b;
-}
-
-// H-pattern shifter decode: bits6 bit i = gear i+1 daba hua (active-HIGH,
-// caller digitalRead LOW ko invert karke deta hai). 0 = neutral / koi gear
-// nahi; ek se zyada bits = invalid -> 0 (neutral, kabhi ghalat gear nahi).
-static inline uint8_t rsh_shifter_hpattern_gear(uint8_t bits6) {
-  bits6 &= 0x3F;
-  if (bits6 == 0) return 0;
-  if (bits6 & (uint8_t)(bits6 - 1)) return 0;   // 2+ bits — invalid
-  uint8_t gear = 0;
-  while (bits6 >>= 1) gear++;
-  return (uint8_t)(gear + 1);   // bit 0 -> gear 1 ... bit 5 -> gear 6
-}
-
-// H-pattern mode encoders se takrata hai: H-pattern pins (13,14,16,17,18,19)
-// mein se 16/17/19 encoder pins bhi hain. 1 = conflict (FW-4 config
-// validation is mode + encoders ko ek saath reject kare).
-static inline uint8_t rsh_modules_hpattern_encoder_conflict(uint8_t shifterMode,
-                                                            uint8_t encodersEnabled) {
-  return (shifterMode == RSH_SHIFTER_HPATTERN) && encodersEnabled;
 }

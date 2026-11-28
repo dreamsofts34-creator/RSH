@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include "config.h"
 #include "protocol.h"   // InputSample.enc[RSH_V2_MAX_ENC] (FW-12) ke liye
-#include "encoders.h"   // RshEncoder (quadrature decoder, FW-12)
 #include "modules.h"    // RshModuleEnable, axis mask / button gating (FW-11)
 #include "pinmap.h"     // RshPinMap — live pin table (Phase G, C3)
 
@@ -248,11 +247,9 @@ struct InputSample {
                            // (band module ka ADC read hi nahi hota — F7)
   uint16_t handbrake;      // FW-11: raw counts 0-4095; module band ho to 0
                            // (band module ka ADC read hi nahi hota — F7)
-  int16_t enc[RSH_V2_MAX_ENC];  // FW-12: cumulative i16 counts (C3 fix);
-                                 // enc[0..1] istemal hote hain (2 encoders),
-                                 // enc[2..3] hamesha 0
-  uint8_t shifterGear;     // FW-11: H-pattern gear 0=neutral, 1..6
-                           // (sequential mode mein hamesha 0)
+  int16_t enc[RSH_V2_MAX_ENC];  // v2.0.19: hamesha 0 — encoders DELETE
+                                 // hue; wire slots barqarar hain (protocol
+                                 // v2.2 frozen), values reserved-zero hain
   uint8_t buttons;         // RSH_BTN_* bits (protocol.h)
 };
 
@@ -267,7 +264,7 @@ bool inputs_axis_is_mv(uint8_t slot);
 // Config blob (SET_CFG, §3.6) se live pin table lagao — COMMIT / boot /
 // rollback par .ino bulata hai (Phase G, C3). Blob invalid ho to 0 aur
 // pin table waisi ki waisi (fail closed); valid ho to 1. Pin badle hon
-// to pinMode dobara + debouncers/encoders/health reset hote hain (purane
+// to pinMode dobara + debouncers/health reset hote hain (purane
 // pin ki state naye pin par ghalat trigger na kare); map waisa hi ho to
 // kuch nahi hota (stream mein glitch nahi).
 uint8_t inputs_apply_config_blob(const uint8_t *blob, size_t len);

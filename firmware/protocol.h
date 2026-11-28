@@ -12,6 +12,10 @@
 // buttons byte (offset 14)
 #define RSH_BTN_GEAR_UP    0x01
 #define RSH_BTN_GEAR_DOWN  0x02
+// v2.0.19: bits 0x04/0x08 (accel/brake pedal buttons) reserved-zero —
+// firmware inhein kabhi set nahi karta (buttons module DELETE).
+// Defines bit positions ki documentation ke liye rehte hain (v1 packet
+// layout frozen hai); inhein set karna mana hai.
 #define RSH_BTN_ACCEL      0x04
 #define RSH_BTN_BRAKE      0x08
 #define RSH_BTN_HORN       0x10   // FW-11: horn button (PIN_HORN_BTN, GPIO4)

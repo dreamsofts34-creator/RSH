@@ -8,17 +8,10 @@
 
 static Debouncer dbGearUp, dbGearDown, dbAccel, dbBrake, dbHorn;  // FW-11: horn
 static Debouncer dbHandbrake;  // F-15 (v4.0.2): handbrake button mode
-static RshEncoder enc1, enc2;   // FW-12: quadrature decoders (cumulative i16)
 static uint16_t lastHandbrakeDiag = 0;   // FW-11: handbrake trimmed-mean state
 static uint16_t lastClutchDiag = 0;      // Phase F WS5: clutch trimmed-mean state
 // D-4 (v4.0.2): shifter sensitivity (0..100, default 50) — sequential
-// gear debounce aur H-pattern stability dono isi se chalte hain.
-static uint8_t shifterSensitivity = RSH_CFG_SHIFTER_SENSITIVITY_DEFAULT;
-static uint8_t shifterDebounceMs =
-    13;  // rsh_shifter_debounce_ms(50) = 20 - 50*15/100 = 13 (formula se)
-static uint8_t lastRawGear = 0;         // H-pattern: aakhri raw gear
-static uint8_t reportedGear = 0;        // H-pattern: stable gear (report hota hai)
-static uint32_t gearStableSinceMs = 0;  // H-pattern: raw gear kab se stable hai
+// gear debounce isi se chalta hai.
 static bool useMv = (STEER_USE_MILLIVOLTS != 0);
 static SampleGovernor governor;   // .ino window ke hisaab se update karta hai
 static uint32_t lastMvCheckMs = 0;
@@ -161,12 +154,6 @@ static void pinmap_apply_pinmodes_(void) {
   if (pinMap.gearUp != RSH_PINMAP_ABSENT) pinMode(pinMap.gearUp, INPUT_PULLUP);
   if (pinMap.gearDown != RSH_PINMAP_ABSENT) pinMode(pinMap.gearDown, INPUT_PULLUP);
   if (pinMap.horn != RSH_PINMAP_ABSENT) pinMode(pinMap.horn, INPUT_PULLUP);
-  for (int i = 0; i < 6; i++)
-    if (pinMap.shiftH[i] != RSH_PINMAP_ABSENT) pinMode(pinMap.shiftH[i], INPUT_PULLUP);
-  if (pinMap.enc1A != RSH_PINMAP_ABSENT) pinMode(pinMap.enc1A, INPUT_PULLUP);
-  if (pinMap.enc1B != RSH_PINMAP_ABSENT) pinMode(pinMap.enc1B, INPUT_PULLUP);
-  if (pinMap.enc2A != RSH_PINMAP_ABSENT) pinMode(pinMap.enc2A, INPUT_PULLUP);
-  if (pinMap.enc2B != RSH_PINMAP_ABSENT) pinMode(pinMap.enc2B, INPUT_PULLUP);
 }
 
 uint8_t inputs_apply_config_blob(const uint8_t *blob, size_t len) {
@@ -181,8 +168,7 @@ uint8_t inputs_apply_config_blob(const uint8_t *blob, size_t len) {
   // F-09 (polish round): handbrake debounce FIXED 10 ms (DEBOUNCE_MS,
   // Debouncer default) — shifter sensitivity se nahi chalta. Pehle
   // sensitivity 100 par handbrake 5 ms debounce leta tha (bounce-prone
-  // switch flicker karta tha) aur 0 par 20 ms (sluggish). H-pattern
-  // stability timer shifterDebounceMs par hi rehta hai (wo shifter ka hai).
+  // switch flicker karta tha) aur 0 par 20 ms (sluggish).
   dbHandbrake.debounceMs = DEBOUNCE_MS;
   pinmap_ensure_defaults_();
   if (memcmp(&next, &pinMap, sizeof(next)) == 0) return 1;  // wahi map — re-init nahi
@@ -198,7 +184,7 @@ uint8_t inputs_apply_config_blob(const uint8_t *blob, size_t len) {
   inputs_set_pedal_analog(
       rsh_pinmap_axis_present(&pinMap, RSH_PINMAP_AXIS_ACCEL),
       rsh_pinmap_axis_present(&pinMap, RSH_PINMAP_AXIS_BRAKE));
-  // Naye pins = nayi state: purane pin ki debouncer/encoder/health state
+  // Naye pins = nayi state: purane pin ki debouncer/health state
   // naye pin par ghalat trigger na kare (e.g. purana gear-up daba hua
   // tha, naya pin HIGH hai — release ka intezar kiye baghair saaf karo).
   dbGearUp = Debouncer{};
@@ -210,11 +196,6 @@ uint8_t inputs_apply_config_blob(const uint8_t *blob, size_t len) {
   dbGearUp.debounceMs = shifterDebounceMs;
   dbGearDown.debounceMs = shifterDebounceMs;
   dbHandbrake.debounceMs = DEBOUNCE_MS;  // F-09: fixed 10 ms (upar dekho)
-  lastRawGear = 0;
-  reportedGear = 0;
-  gearStableSinceMs = 0;
-  rsh_encoder_init(&enc1);
-  rsh_encoder_init(&enc2);
   healthSteer = AxisHealth{};
   healthAccel = AxisHealth{};
   healthBrake = AxisHealth{};
@@ -353,18 +334,10 @@ void inputs_begin() {
   analogReadResolution(12);              // board ka native size
   analogSetAttenuation(ADC_11db);        // default bhi yehi hai; wazeh likh diya
   pinmap_ensure_defaults_();   // pehle compiled defaults, phir .ino blob lagata hai
-  // FW-11: horn button. FW-12: encoder A/B pins.
-  // Phase F WS5: H-pattern pins + encoder pins HAMESHA pinMode hote
-  // hain — gate mode runtime par badal sakta hai (SET_CFG blob), is
-  // liye compile-time #if se sirf ek set configure karna ghalat hota.
-  // H-pattern pins 16/17/19 encoder pins se overlap karte hain — dono
-  // set INPUT_PULLUP hain, dobara pinMode karna be-zarar hai; inputs_read
-  // mein runtime mode check tay karta hai kya parha jata hai.
+  // FW-11: horn button.
   // Phase G (C3): pinMode ab live pin table se hota hai (pinmap_apply_
   // pinmodes_ — defaults yahan, blob ke pins COMMIT par dobara).
   pinmap_apply_pinmodes_();
-  rsh_encoder_init(&enc1);
-  rsh_encoder_init(&enc2);
   // FW-01: I2C sampler init + bus (defaults mein I2C nahi — sirf state
   // saaf hoti hai; blob apply par i2c_bus_ensure_ dobara chalta hai).
   rsh_i2c_axes_init(&i2cAxes);
@@ -450,8 +423,9 @@ InputSample inputs_read() {
   }
 
   InputSample s{};   // value-init: band module ki values 0 rehti hain
-                     // (clutch/handbrake/enc/gear sirf enabled hone par
-                     // bhari jati hain — F7), garbage kabhi nahi jata
+                     // (clutch/handbrake sirf enabled hone par bhari
+                     // jati hain — F7; enc hamesha 0 — v2.0.19),
+                     // garbage kabhi nahi jata
   // FW-01: I2C steering (AS5600/ADS1115) ki value sampler se aati hai
   // (mV); native steering trimmed-mean ADC path se; unassigned 0.
   if (pinMap.steer == RSH_PINMAP_ABSENT &&
@@ -460,10 +434,12 @@ InputSample inputs_read() {
   else
     s.steering = avg_steering();
   // HID P1-2: pedal button debouncers EK dafa yahan update karo — axis
-  // drive (button mode) aur button bits dono isi state se aate hain.
-  // Dobara update karna debounce counting bigarta (ek cycle mein 2
-  // observations). Round 2 W3 guard: pin 25/26 kisi aur function ko
-  // diye hon to button hi nahi (axis 0 rehta hai).
+  // drive (button mode) isi state se aata hai. Dobara update karna
+  // debounce counting bigarta (ek cycle mein 2 observations).
+  // Round 2 W3 guard: pin 25/26 kisi aur function ko diye hon to
+  // button hi nahi (axis 0 rehta hai). v2.0.19: pedal button BITS
+  // (2/3) khatam — debounced state sirf axis chalati hai, button
+  // word mein nahi jati (neeche dekho).
   bool accelBtnPressed = false, brakeBtnPressed = false;
   if (!rsh_pinmap_uses_pin(&pinMap, PIN_ACCEL_BTN))
     accelBtnPressed =
@@ -521,78 +497,12 @@ InputSample inputs_read() {
       : 0;
   pedalCycle++;
 
-  // FW-12: quadrature encoders — band module ke counts freeze (step nahi
-  // hota) aur report 0 hoti hai; chalu module cumulative i16 count deta hai.
-  // Phase F WS5: H-pattern runtime mode mein encoder pins shifter ke
-  // hain — no read (decoders freeze, prev state mehfooz hai). P3-2:
-  // H-pattern mein AAKHRI count report hoti hai, 0 nahi — 0 report
-  // karne se engine baseline 0 par re-sync ho jata aur sequential par
-  // wapas aate hi ek glitch-drop hoti (decoders wahi se continue karte
-  // hain jahan ruke the — baseline bhi wahi rehni chahiye).
-  // Phase G (C3): har encoder alag — sirf wohi step hota hai jis ke dono
-  // pins blob mein hain (ek channel akela ho to pinmap use absent karta hai).
+  // v2.0.19: encoders DELETE — wire slots barqarar hain (protocol v2.2
+  // frozen), values hamesha 0. Koi quadrature read nahi hota.
+  s.enc[0] = 0;
+  s.enc[1] = 0;
   s.enc[2] = 0;
   s.enc[3] = 0;
-  if (rsh_modules_encoders_enabled() &&
-      rsh_modules_shifter_mode() != RSH_SHIFTER_HPATTERN) {
-    if (pinMap.enc1A != RSH_PINMAP_ABSENT && pinMap.enc1B != RSH_PINMAP_ABSENT) {
-      rsh_encoder_step(&enc1, (uint8_t)digitalRead(pinMap.enc1A),
-                       (uint8_t)digitalRead(pinMap.enc1B));
-      s.enc[0] = enc1.count;
-    } else {
-      s.enc[0] = 0;
-    }
-    if (pinMap.enc2A != RSH_PINMAP_ABSENT && pinMap.enc2B != RSH_PINMAP_ABSENT) {
-      rsh_encoder_step(&enc2, (uint8_t)digitalRead(pinMap.enc2A),
-                       (uint8_t)digitalRead(pinMap.enc2B));
-      s.enc[1] = enc2.count;
-    } else {
-      s.enc[1] = 0;
-    }
-  } else if (rsh_modules_encoders_enabled() &&
-             rsh_modules_shifter_mode() == RSH_SHIFTER_HPATTERN) {
-    // H-pattern: decoders frozen — aakhri count report karo (P3-2).
-    s.enc[0] = enc1.count;
-    s.enc[1] = enc2.count;
-  } else {
-    s.enc[0] = 0;
-    s.enc[1] = 0;
-  }
-
-  // FW-11: H-pattern shifter gear (sequential mode mein 0).
-  // Phase F WS5: runtime mode check (compile-time #if nahi) — SET_CFG
-  // blob se mode badalne par agle hi cycle se gear decode badal jata hai.
-  // Phase G (C3): gear pins blob se; 0xFF pin daba hua nahi mana jata.
-  // D-4 (v4.0.2): gear tab report hota hai jab raw gear debounce waqt
-  // (sensitivity) tak stable rahe — bounce se ghalat gear nahi jata.
-  s.shifterGear = 0;
-  if (rsh_modules_shifter_mode() == RSH_SHIFTER_HPATTERN &&
-      rsh_modules_shifter_enabled()) {
-    uint8_t bits6 = 0;
-    if (pinMap.shiftH[0] != RSH_PINMAP_ABSENT &&
-        digitalRead(pinMap.shiftH[0]) == LOW) bits6 |= 0x01;
-    if (pinMap.shiftH[1] != RSH_PINMAP_ABSENT &&
-        digitalRead(pinMap.shiftH[1]) == LOW) bits6 |= 0x02;
-    if (pinMap.shiftH[2] != RSH_PINMAP_ABSENT &&
-        digitalRead(pinMap.shiftH[2]) == LOW) bits6 |= 0x04;
-    if (pinMap.shiftH[3] != RSH_PINMAP_ABSENT &&
-        digitalRead(pinMap.shiftH[3]) == LOW) bits6 |= 0x08;
-    if (pinMap.shiftH[4] != RSH_PINMAP_ABSENT &&
-        digitalRead(pinMap.shiftH[4]) == LOW) bits6 |= 0x10;
-    if (pinMap.shiftH[5] != RSH_PINMAP_ABSENT &&
-        digitalRead(pinMap.shiftH[5]) == LOW) bits6 |= 0x20;
-    uint8_t rawGear = rsh_shifter_hpattern_gear(bits6);
-    if (rawGear != lastRawGear) {
-      lastRawGear = rawGear;
-      gearStableSinceMs = nowMs;
-    } else if ((uint32_t)(nowMs - gearStableSinceMs) >= shifterDebounceMs) {
-      reportedGear = rawGear;
-    }
-    s.shifterGear = reportedGear;
-  } else {
-    lastRawGear = 0;
-    reportedGear = 0;
-  }
 
   // Floating/disconnected detection (F2/D12): rail-stuck + doosre axes
   // move, ya high jitter. Still wheel (variance≈0) kabhi invalid nahi.
@@ -715,6 +625,10 @@ InputSample inputs_read() {
   // FW-11: band module ka button bit NAHI jata — shifter band ho to
   // gear up/down bits clear, horn band ho to horn bit clear (read bhi
   // nahi hota, F7 ki tarah).
+  // v2.0.19: button word mein SIRF bits 0/1/4 (shifter up/down, horn)
+  // aate hain — accel/brake pedal button bits (2/3) DELETE hue, wire
+  // par hamesha 0. accelBtnPressed/brakeBtnPressed sirf pedal AXIS
+  // button-mode chalate hain (upar), button word mein nahi jate.
   uint8_t b = 0;
   if (rsh_modules_shifter_enabled()) {
     // Phase G (C3): gear pins live table se; unassigned button ka
@@ -724,16 +638,6 @@ InputSample inputs_read() {
     if (pinMap.gearDown != RSH_PINMAP_ABSENT &&
         dbGearDown.update(digitalRead(pinMap.gearDown) == LOW, nowMs)) b |= RSH_BTN_GEAR_DOWN;
   }
-  // Round 2 W3 (FIX-2): fixed pedal button pins (25/26) sirf tab parho
-  // jab blob ne unhein kisi aur function ko na diya ho — warna ek hi
-  // physical pin do button bits deta (misal encoder B pin 25 LOW hone
-  // par accel-button bit bhi lag jata). rsh_pinmap_uses_pin pure hai,
-  // host tests mein covered hai.
-  // HID P1-2: pedal bits upar precomputed state se (debouncer dobara
-  // update nahi hota). Bits stream mein jate hain; host pipeline inhein
-  // strip karta hai (PROTOCOL-V2.2 §1.3.1) — game ko sirf axis dikhta hai.
-  if (accelBtnPressed) b |= RSH_BTN_ACCEL;
-  if (brakeBtnPressed) b |= RSH_BTN_BRAKE;
   if (rsh_modules_horn_enabled() && pinMap.horn != RSH_PINMAP_ABSENT &&
       dbHorn.update(digitalRead(pinMap.horn) == LOW, nowMs))    b |= RSH_BTN_HORN;
   s.buttons = b;

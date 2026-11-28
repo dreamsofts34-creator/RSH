@@ -511,7 +511,7 @@ static uint8_t sample_once_(RshSampleMailbox *frame, uint32_t nowMs,
   if (emitKind == RSH_EMIT_NONE && serialEmitKind == RSH_EMIT_NONE) return 0;
 
   // Phase E WS5 — v2.1 stream emission (§1.1): v2 peer ko v2 stream
-  // packet (axes mV, cumulative encoders), legacy v1 peer ko v1 packet.
+  // packet (axes mV, encoders hamesha 0 — v2.0.19), legacy v1 peer ko v1 packet.
   if (emitKind == RSH_EMIT_V2 || serialEmitKind == RSH_EMIT_V2) {
     uint8_t flags2 = 0;
     if (inputs_axis_invalid()) flags2 |= RSH_V2_FLAG_AXIS_INVALID;  // F2
@@ -524,8 +524,8 @@ static uint8_t sample_once_(RshSampleMailbox *frame, uint32_t nowMs,
     size_t n2 = rsh_build_v2_stream_packet(
         frame->v2pkt, sizeof(frame->v2pkt), seq, tsUs, flags2, s.steering,
         axes_mv, s.accelAnalog, s.brakeAnalog,
-        s.handbrake, s.enc, rsh_modules_encoders_enabled() ? 2 : 0,
-        s.buttons, rsh_modules_enabled(), s.clutch, s.shifterGear);
+        s.handbrake, s.enc, 2,  // n_enc hamesha 2, enc hamesha {0,0} (v2.0.19)
+        s.buttons, rsh_modules_enabled(), s.clutch);
     if (n2 > 0) frame->v2len = (uint8_t)n2;
     lastSentSeqGap = seqGap;
   }
