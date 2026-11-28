@@ -94,15 +94,8 @@ export component DiagnosticsDrawer inherits FocusScope {
     in property <bool> daemon-live: false;
     in property <string> app-version: "—";
     in property <string> firmware: "—";
-    // FH4 wheel check (v2.0.14): the plain-words summary line
-    // ("Wheel setup: mapping OK · envelope OK · feed active");
-    // "—" until a check exists.
-    in property <string> wheel-text: "—";
-    in property <bool> wheel-ok: false;
     in property <[string]> events;
     in property <[bool]> buttons-pressed;
-    in property <string> knob-1-text: "Knob 1 · —";
-    in property <string> knob-2-text: "Knob 2 · —";
     in property <float> throttle-pct: 0;
     in property <float> brake-pct: 0;
     in property <float> clutch-pct: 0;
@@ -174,10 +167,6 @@ export component DiagnosticsDrawer inherits FocusScope {
                         Text { text: "Status: " + conn-label; font-family: Theme.font-mono; font-size: Theme.fs-value; color: Theme.mute; }
                         Text { text: "RSH: " + (daemon-live ? "running" : "not running"); font-family: Theme.font-mono; font-size: Theme.fs-value; color: Theme.mute; }
                         Text { text: "App: " + app-version + " · Firmware: " + firmware; font-family: Theme.font-mono; font-size: Theme.fs-value; color: Theme.mute; wrap: word-wrap; }
-                        // FH4 wheel check (v2.0.14): bad (red) only
-                        // once a check has reported a problem —
-                        // "—" and OK stay muted like the lines above.
-                        Text { text: wheel-text; font-family: Theme.font-mono; font-size: Theme.fs-value; color: wheel-text == "—" || wheel-ok ? Theme.mute : Theme.bad; wrap: word-wrap; }
                     }
                     // live charts (§8.3)
                     LiveChart { title: "Steering"; chart-commands: steer-chart; readout: steer-readout; }
@@ -241,8 +230,7 @@ export component DiagnosticsDrawer inherits FocusScope {
                     // H10 (v2.0.2): the live button grid hides when
                     // there is nothing to show — Rust sets
                     // buttons-pressed to an empty list while not live,
-                    // so 12 dead tiles never render. (The encoders
-                    // line below stays: it reads "—" while not live.)
+                    // so 12 dead tiles never render.
                     if buttons-pressed.length > 0 : Text { text: "Buttons — live"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                     if buttons-pressed.length > 0 : VerticalLayout {
                         spacing: 6px;
@@ -268,13 +256,6 @@ export component DiagnosticsDrawer inherits FocusScope {
                                 }
                             }
                         }
-                    }
-                    // encoders live (§8.3)
-                    Text { text: "Encoders — live"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        Text { horizontal-stretch: 1; text: knob-1-text; font-family: Theme.font-mono; font-size: Theme.fs-value; color: Theme.text; }
-                        Text { horizontal-stretch: 1; text: knob-2-text; font-family: Theme.font-mono; font-size: Theme.fs-value; color: Theme.text; }
                     }
                 }
             }

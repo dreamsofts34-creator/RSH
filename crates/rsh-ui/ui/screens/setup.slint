@@ -105,7 +105,7 @@ export component SetupWizard inherits Rectangle {
     // P2 (v2.0.10 HID retest, Bug 1 retry storm): seconds left on
     // the post-failure backend-selector cooldown, 0 = idle. Rust
     // arms it for 30 s on ANY backend-switch failure and ticks it
-    // on the 1 Hz timer; the HIDMaestro fallback button disables
+    // on the 1 Hz timer; the Xbox fallback button disables
     // while it is > 0.
     in property <int> backend-cooldown-secs: 0;
     // A3 (v2.0.2): daemon state drives the display — while the
@@ -122,17 +122,7 @@ export component SetupWizard inherits Rectangle {
     in property <string> vjoy-elapsed: "";
     in property <string> vjoy-version: "";
     in property <string> vjoy-error: "";
-    in property <bool> vjoy-fallback: false;
-    // FH4 wheel check (v2.0.14): the daemon's GameInput-mapping +
-    // EmuWheel-envelope check, synced with the vJoy status above.
-    // `wheel-line` is the Rust-computed plain-words summary
-    // ("Wheel setup: mapping OK · envelope OK · feed active");
-    // `wheel-next` is the daemon's next step verbatim ("" when all
-    // OK). Both stay hidden until a check exists (`wheel-checked`).
-    in property <bool> wheel-checked: false;
-    in property <bool> wheel-ok: false;
-    in property <string> wheel-line: "";
-    in property <string> wheel-next: "";
+    in property <bool> xbox-fallback: false;
     // Step 2 — Calibrate availability (A17): false while the
     // calibration backend is unavailable; the buttons stay disabled
     // and Next does not gate on calibration then — the step says
@@ -155,12 +145,12 @@ export component SetupWizard inherits Rectangle {
     callback next();
     callback skip();
     callback install-vjoy();
-    callback use-hidmaestro();
+    callback use-xbox();
     callback connect-action(string);
     callback calibrate-action(string);
     callback add-game();
 
-    property <bool> next-enabled: step == 0 ? connect-done : step == 1 ? (vjoy-installed || vjoy-fallback) : step == 2 ? (!calibration-available || (centre-done && pedals-done)) : true;
+    property <bool> next-enabled: step == 0 ? connect-done : step == 1 ? (vjoy-installed || xbox-fallback) : step == 2 ? (!calibration-available || (centre-done && pedals-done)) : true;
     property <string> step-title: step == 0 ? "Connect your wheel" : step == 1 ? "Install the game controller" : step == 2 ? "Calibrate your wheel" : "Add your games";
     property <string> step-lead: step == 0 ? "Join the wheel's Wi-Fi, or plug in a USB cable." : step == 1 ? "Games need a controller driver — vJoy is the default." : step == 2 ? "Centre the wheel and set the pedals, so the game gets true inputs." : "Add your racing games — pick the exe or shortcut for each game. RSH switches profile automatically when a game starts.";
 
@@ -217,7 +207,7 @@ export component SetupWizard inherits Rectangle {
                 // L-2: the live address, never a hardcoded default —
                 // "Wi-Fi · —" until the wheel is really connected.
                 StepRow { num: 1; label: "Connect"; sub: transport == 1 ? "USB cable" : "Wi-Fi · " + address; done: step > 0 || connect-done; now: step == 0; }
-                StepRow { num: 2; label: "Drivers"; sub: "vJoy controller"; done: step > 1 || vjoy-installed || vjoy-fallback; now: step == 1; }
+                StepRow { num: 2; label: "Drivers"; sub: "vJoy controller"; done: step > 1 || vjoy-installed || xbox-fallback; now: step == 1; }
                 StepRow { num: 3; label: "Calibrate"; sub: "Centre and pedals"; done: step > 2; now: step == 2; }
                 StepRow { num: 4; label: "Games"; sub: "Add your racing games"; done: games-done; now: step == 3; }
                 Rectangle { vertical-stretch: 1; }
@@ -374,20 +364,17 @@ export component SetupWizard inherits Rectangle {
                         if !vjoy-installed && !vjoy-installing : Btn { label: "Install vJoy"; primary: true; disabled: busy-kind == 14; clicked => { install-vjoy(); } }
                     }
                 }
-                // FH4 wheel check (v2.0.14): only once vJoy is
-                // installed and the daemon has checked — the line
-                // is plain words for a photo, never registry paths
-                // or hex. The next step is the daemon's own text.
-                if vjoy-installed && wheel-checked : Text { text: wheel-line; font-size: Theme.fs-label; font-weight: 600; color: wheel-ok ? Theme.ok : Theme.bad; wrap: word-wrap; }
-                if vjoy-installed && wheel-checked && wheel-next != "" : Text { text: wheel-next; font-size: Theme.fs-label; color: Theme.mute; wrap: word-wrap; }
                 if vjoy-error != "" : Text { text: vjoy-error; font-size: Theme.fs-label; color: Theme.bad; wrap: word-wrap; }
                 // R2-40: an install failure strands the wizard on
                 // this step unless the fallback is picked — say so
                 // on the step itself, next to the error.
-                if vjoy-error != "" && !vjoy-fallback : Text { text: "Install failed — you can still continue with HIDMaestro below."; font-size: Theme.fs-label; color: Theme.mute; wrap: word-wrap; }
-                // D16: the HIDMaestro fallback is offered UP FRONT
-                // (not only after a failure) — it is always visible
-                // while vJoy is not installed.
+                if vjoy-error != "" && !xbox-fallback : Text { text: "Install failed — you can still continue with Xbox (ViGEmBus) below."; font-size: Theme.fs-label; color: Theme.mute; wrap: word-wrap; }
+                // D16 (v2.0.19): the Xbox (ViGEmBus) fallback is
+                // offered UP FRONT (not only after a failure) — it
+                // is always visible while vJoy is not installed.
+                // It needs the ViGEmBus driver: if it is not
+                // installed, RSH offers to install it and shows a
+                // plain error if that is declined or fails.
                 if !vjoy-installed : Rectangle {
                     horizontal-stretch: 1;
                     width: 584px;
@@ -400,17 +387,17 @@ export component SetupWizard inherits Rectangle {
                         padding-left: 16px;
                         padding-right: 16px;
                         spacing: 12px;
-                        Text { vertical-alignment: center; text: "HIDMaestro"; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; }
-                        Text { vertical-alignment: center; text: "Needs admin permission when first used."; font-size: Theme.fs-label; color: Theme.mute; }
+                        Text { vertical-alignment: center; text: "Xbox (ViGEmBus)"; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; }
+                        Text { vertical-alignment: center; text: "For games that don't see the vJoy wheel. Needs the ViGEmBus driver."; font-size: Theme.fs-label; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
-                        Btn { label: vjoy-fallback ? "Selected" : "Use HIDMaestro instead"; primary: !vjoy-fallback; disabled: busy-kind == 14 || backend-cooldown-secs > 0; clicked => { use-hidmaestro(); } }
+                        Btn { label: xbox-fallback ? "Selected" : "Use Xbox instead"; primary: !xbox-fallback; disabled: busy-kind == 14 || backend-cooldown-secs > 0; clicked => { use-xbox(); } }
                     }
                 }
                 // P2: the cooldown countdown — `visible`, never
                 // `if`, so the step keeps the SAME size while it
                 // shows/hides.
                 Text { visible: backend-cooldown-secs > 0; text: "Retry in " + backend-cooldown-secs + " s — switching is paused after the last failure."; font-size: Theme.fs-label; color: Theme.warn; wrap: word-wrap; }
-                if vjoy-fallback : Text { text: "HIDMaestro selected — RSH will ask for admin permission on start."; font-size: Theme.fs-label; color: Theme.mute; wrap: word-wrap; }
+                if xbox-fallback : Text { text: "Xbox selected — the wheel appears as an Xbox 360 controller in games (steering on the left stick)."; font-size: Theme.fs-label; color: Theme.mute; wrap: word-wrap; }
             }
 
             // ---- Step 2: Calibrate ----
@@ -523,7 +510,7 @@ export component SetupWizard inherits Rectangle {
                 spacing: 8px;
                 // P2-12: why Next is disabled — a silently dead
                 // button reads as broken. Step 3 never disables.
-                if !next-enabled : Text { vertical-alignment: center; text: step == 0 ? "Connect the wheel to continue." : step == 1 ? "Install vJoy or choose HIDMaestro to continue." : "Set the centre and pedals to continue."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
+                if !next-enabled : Text { vertical-alignment: center; text: step == 0 ? "Connect the wheel to continue." : step == 1 ? "Install vJoy or choose Xbox to continue." : "Set the centre and pedals to continue."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
                 Rectangle { horizontal-stretch: 1; }
                 if step > 0 : Btn { label: "Back"; clicked => { back(); } }
                 if next-enabled : Btn { label: step == 3 ? "Finish" : "Next"; primary: true; clicked => { next(); } }

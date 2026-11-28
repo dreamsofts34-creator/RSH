@@ -105,7 +105,7 @@ export component SettingsScreen inherits VerticalLayout {
     // L-2: "—" until Rust sets the live address — never a hardcoded
     // default (the window binds this to setup-address).
     in-out property <string> address: "—";
-    in-out property <int> backend: 0; // 0 HIDMaestro, 1 vJoy
+    in-out property <int> backend: 0; // 0 vJoy (default), 1 Xbox (ViGEmBus)
     // P2 (v2.0.10 HID retest, Bug 1 retry storm): seconds left on
     // the post-failure backend-selector cooldown, 0 = idle. Rust
     // arms it for 30 s on ANY backend-switch failure and ticks it
@@ -113,31 +113,13 @@ export component SettingsScreen inherits VerticalLayout {
     in property <int> backend-cooldown-secs: 0;
     in-out property <bool> start-with-windows: true;
     in-out property <bool> keep-in-tray: true;
-    // A2 (Steam FH4 wheel mode): the daemon's `steam_fh4_mode`
-    // (default OFF), seeded from the live cache — Rust reverts it
-    // on a failed toggle, like the other switches above.
-    in-out property <bool> steam-fh4-mode: false;
-    // G29 spoof mode: the daemon's `g29_spoof_mode` (default
-    // OFF), seeded from the live cache — Rust reverts it on a
-    // failed toggle, like the switch above.
-    in-out property <bool> g29-spoof-mode: false;
-    // G29 pedal layout: the daemon's `g29_pedal_layout`
-    // ("hidmaestro" default, "pcgamingwiki" alternate) — which
-    // G29 axis carries accel/clutch. Seeded from the live cache;
-    // Rust reverts it on a failed change, like the switch above.
-    in-out property <string> g29-pedal-layout: "hidmaestro";
-    // G29 handbrake button: the daemon's `g29_handbrake_button`
-    // (1–25, default 8) — which G29 button the handbrake
-    // presses. Seeded from the live cache; Rust reverts it on a
-    // failed change, like the switch above.
-    in-out property <int> g29-handbrake-button: 8;
     // R2-31 (UI-UX polish, h): the STORED theme choice (0 Dark,
     // 1 Light, 2 Auto) — what the Appearance segment shows. The
     // window's `theme` prop stays the resolved 0/1 that drives
     // Theme.mode; the window binds this two-way to `theme-choice`.
     in-out property <int> theme-choice: 0;
     in-out property <[ProfileRow]> profiles;
-    in-out property <string> app-version: "RSH 2.0.18";
+    in-out property <string> app-version: "RSH 2.0.19";
     in-out property <string> firmware-text: "—";
     in-out property <string> app-update-text: "Auto-update is off — new versions are on GitHub Releases";
     in-out property <string> backup-text: "No backups yet";
@@ -164,10 +146,6 @@ export component SettingsScreen inherits VerticalLayout {
     callback backend-selected(int);
     callback toggled-start-windows(bool);
     callback toggled-keep-tray(bool);
-    callback toggled-steam-fh4-mode(bool);
-    callback toggled-g29-spoof-mode(bool);
-    callback g29-pedal-layout-selected(string);
-    callback g29-handbrake-button-selected(int);
     callback theme-selected(int);
     callback new-profile();
     callback use-profile(int);
@@ -434,15 +412,15 @@ export component SettingsScreen inherits VerticalLayout {
                             VerticalLayout {
                                 spacing: 6px;
                                 RadioOptionCard {
-                                    title: "HIDMaestro";
-                                    desc: "Needs admin permission when first used.";
+                                    title: "vJoy";
+                                    desc: "The wheel as a joystick. Needs vJoy.";
                                     selected: backend == 0;
                                     disabled: busy-kind == 2 || backend-cooldown-secs > 0;
                                     clicked => { backend = 0; backend-selected(0); }
                                 }
                                 RadioOptionCard {
-                                    title: "vJoy";
-                                    desc: "No admin prompt. Needs vJoy.";
+                                    title: "Xbox (ViGEmBus)";
+                                    desc: "The wheel as an Xbox 360 controller, for games that don't see vJoy. Needs the ViGEmBus driver.";
                                     selected: backend == 1;
                                     disabled: busy-kind == 2 || backend-cooldown-secs > 0;
                                     clicked => { backend = 1; backend-selected(1); }
@@ -457,148 +435,6 @@ export component SettingsScreen inherits VerticalLayout {
                             // the remaining ~26 s.
                             Text { visible: backend-cooldown-secs > 0; text: "Retry in " + backend-cooldown-secs + " s — switching is paused after the last failure."; font-size: Theme.fs-hint; color: Theme.warn; wrap: word-wrap; }
                             Rectangle { height: 1px; background: Theme.line; }
-                            // A2/A4 (Steam FH4 wheel mode): vJoy-only
-                            // — the flag is written to the vJoy OEM
-                            // key, so on HIDMaestro (backend == 0)
-                            // the switch is disabled with the reason
-                            // beside it. While a SettingsOp job runs
-                            // (busy-kind == 14) it is disabled too —
-                            // the busy strip is the loading state and
-                            // the job's 10 s bound is the timeout.
-                            HorizontalLayout {
-                                padding-top: 6px;
-                                padding-bottom: 6px;
-                                alignment: space-between;
-                                cross-axis-alignment: center;
-                                spacing: 10px;
-                                VerticalLayout {
-                                    horizontal-stretch: 1;
-                                    spacing: 0px;
-                                    Text { text: "Steam FH4 wheel mode"; font-size: Theme.fs-label; color: Theme.text; }
-                                    Text { text: backend == 1 ? "Shows the wheel in Forza Horizon 4 (Steam)." : "vJoy only — switch the controller to vJoy to use it."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
-                                }
-                                Switch { accessible-name: "Steam FH4 wheel mode"; on: steam-fh4-mode; disabled: backend != 1 || busy-kind == 14; toggled => { steam-fh4-mode = !steam-fh4-mode; toggled-steam-fh4-mode(steam-fh4-mode); } }
-                            }
-                            // The restart notice — `visible`, never
-                            // `if`, so the card keeps the SAME size
-                            // on/off (see the cooldown line above).
-                            // The toggle also toasts this on change.
-                            Text { visible: steam-fh4-mode; text: "Disable/enable vJoy and restart your PC."; font-size: Theme.fs-hint; color: Theme.warn; wrap: word-wrap; }
-                            Rectangle { height: 1px; background: Theme.line; }
-                            // G29 spoof mode: HID-only — the wheel is
-                            // presented as a Logitech G29 (VID 046D /
-                            // PID C24F), so on vJoy (backend == 1)
-                            // the switch is disabled with the reason
-                            // beside it. While a SettingsOp job runs
-                            // (busy-kind == 14) it is disabled too —
-                            // the busy strip is the loading state and
-                            // the job's 10 s bound is the timeout.
-                            // The daemon also refuses an enable on
-                            // vJoy (`g29_spoof_hid_only`); the toast
-                            // carries that reason. This is not a
-                            // Logitech product, and FH4
-                            // auto-recognition is not promised — even
-                            // a real G29 needs a custom control
-                            // scheme in Forza Horizon 4.
-                            HorizontalLayout {
-                                padding-top: 6px;
-                                padding-bottom: 6px;
-                                alignment: space-between;
-                                cross-axis-alignment: center;
-                                spacing: 10px;
-                                VerticalLayout {
-                                    horizontal-stretch: 1;
-                                    spacing: 0px;
-                                    Text { text: "G29 spoof mode"; font-size: Theme.fs-label; color: Theme.text; }
-                                    Text { text: backend == 0 ? "Presents the wheel as a Logitech G29 (VID 046D / PID C24F) for game compatibility. Not a Logitech product — even a real G29 needs a custom control scheme in Forza Horizon 4." : "HID only — switch the controller to HIDMaestro to use it."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
-                                }
-                                Switch { accessible-name: "G29 spoof mode"; on: g29-spoof-mode; disabled: backend != 0 || busy-kind == 14; toggled => { g29-spoof-mode = !g29-spoof-mode; toggled-g29-spoof-mode(g29-spoof-mode); } }
-                            }
-                            // The restart/reconnect notice — `visible`,
-                            // never `if`, so the card keeps the SAME
-                            // size on/off (see the cooldown line
-                            // above). The toggle also toasts this on
-                            // change.
-                            Text { visible: g29-spoof-mode; text: "Restart or reconnect the game controller backend for the change to take effect."; font-size: Theme.fs-hint; color: Theme.warn; wrap: word-wrap; }
-                            // Bug 4 (v2.0.17): the flag alone creates
-                            // no device — the G29 device is only
-                            // created by the daemon's live HID
-                            // backend, so while the wheel is
-                            // disconnected the switch can read ON
-                            // with nothing behind it. This line says
-                            // so, in the user's words ("HID connect
-                            // hone par lagu hoga", English UI). It
-                            // shows only while the flag is ON and
-                            // `connected` is false, and hides the
-                            // moment the backend connects and the
-                            // device goes live — `connected` is
-                            // re-derived every frame by Rust, and
-                            // `g29-spoof-mode` is re-synced by
-                            // `sync_g29_spoof_mode`, so the note
-                            // follows both. `visible`, never `if`,
-                            // so the card keeps the SAME size.
-                            Text { visible: g29-spoof-mode && !connected; text: "Will apply when the HID backend connects."; font-size: Theme.fs-hint; color: Theme.warn; wrap: word-wrap; }
-                            Rectangle { height: 1px; background: Theme.line; }
-                            // G29 pedal layout: HID-only, like the
-                            // toggle above — these axes only exist on
-                            // the G29 profile. Two radios, mirroring
-                            // the HIDMaestro/vJoy radios above. The
-                            // change persists at once and the live HID
-                            // backend recreates with the new map when
-                            // connected (same path as the G29 toggle);
-                            // while disconnected it applies when the
-                            // HID backend connects (see the note
-                            // above).
-                            VerticalLayout {
-                                spacing: 6px;
-                                Text { text: "Pedal layout"; font-size: Theme.fs-label; color: Theme.text; }
-                                RadioOptionCard {
-                                    title: "HIDMaestro";
-                                    desc: "Z accel · Rz brake · Y clutch";
-                                    selected: g29-pedal-layout == "hidmaestro";
-                                    disabled: backend != 0 || busy-kind == 14;
-                                    clicked => { g29-pedal-layout = "hidmaestro"; g29-pedal-layout-selected("hidmaestro"); }
-                                }
-                                RadioOptionCard {
-                                    title: "PCGamingWiki";
-                                    desc: "Y accel · Rz brake · Z clutch";
-                                    selected: g29-pedal-layout == "pcgamingwiki";
-                                    disabled: backend != 0 || busy-kind == 14;
-                                    clicked => { g29-pedal-layout = "pcgamingwiki"; g29-pedal-layout-selected("pcgamingwiki"); }
-                                }
-                            }
-                            Rectangle { height: 1px; background: Theme.line; }
-                            // G29 handbrake button: HID-only, like
-                            // the toggle above. Stepper, 1–25,
-                            // default 8 — each tap persists at once
-                            // and the live HID backend recreates when
-                            // connected (same path as the G29 toggle);
-                            // while disconnected it applies when the
-                            // HID backend connects.
-                            HorizontalLayout {
-                                padding-top: 6px;
-                                padding-bottom: 6px;
-                                alignment: space-between;
-                                cross-axis-alignment: center;
-                                spacing: 10px;
-                                VerticalLayout {
-                                    horizontal-stretch: 1;
-                                    spacing: 0px;
-                                    Text { text: "Handbrake button"; font-size: Theme.fs-label; color: Theme.text; }
-                                    Text { text: "Which G29 button the handbrake presses (1–25)."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
-                                }
-                                HorizontalLayout {
-                                    spacing: 8px;
-                                    cross-axis-alignment: center;
-                                    Btn { label: "-"; disabled: backend != 0 || busy-kind == 14 || g29-handbrake-button <= 1; clicked => { g29-handbrake-button = g29-handbrake-button - 1; g29-handbrake-button-selected(g29-handbrake-button); } }
-                                    Text { text: "" + g29-handbrake-button; font-size: Theme.fs-value; font-family: Theme.font-mono; color: Theme.text; }
-                                    Btn { label: "+"; disabled: backend != 0 || busy-kind == 14 || g29-handbrake-button >= 25; clicked => { g29-handbrake-button = g29-handbrake-button + 1; g29-handbrake-button-selected(g29-handbrake-button); } }
-                                }
-                            }
-                            // M-6 (v2.0.2): the sub-text wraps — at
-                            // 920px the "Run setup" button is primary
-                            // (wider), so the 39-char sub needs two
-                            // lines instead of pushing past the card.
                             Text { text: "Recommended: vJoy"; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
                         }
                     }
