@@ -121,11 +121,7 @@ pub struct IpcRequest {
     /// `firmware_update_status`, `board_address`,
     /// `set_board_address`, `module_enabled`, `set_module_enabled`,
     /// `auto_pause`, `set_auto_pause`, `close_to_tray`,
-    /// `set_close_to_tray`, `steam_fh4_mode`, `set_steam_fh4_mode`,
-    /// `g29_spoof_mode`, `set_g29_spoof_mode`,
-    /// `g29_pedal_layout`, `set_g29_pedal_layout`,
-    /// `g29_handbrake_button`, `set_g29_handbrake_button`,
-    /// `restore_backup`, `rename_profile`,
+    /// `set_close_to_tray`, `restore_backup`, `rename_profile`,
     /// `link_profile`, `knob_actions`, `set_knob_action`).
     pub method: String,
     /// Method params (object; may be empty).
@@ -465,14 +461,6 @@ pub fn dispatch(
         | "set_auto_pause"
         | "close_to_tray"
         | "set_close_to_tray"
-        | "steam_fh4_mode"
-        | "set_steam_fh4_mode"
-        | "g29_spoof_mode"
-        | "set_g29_spoof_mode"
-        | "g29_pedal_layout"
-        | "set_g29_pedal_layout"
-        | "g29_handbrake_button"
-        | "set_g29_handbrake_button"
         | "restore_backup"
         | "rename_profile"
         | "link_profile"
@@ -658,10 +646,6 @@ fn detailed_api_error(error: &rsh_api::UserError) -> IpcError {
 /// `{"enabled"}` to set) and return `{"enabled"}`; `auto_pause` /
 /// `set_auto_pause` use `{"paused"}`; `close_to_tray` /
 /// `set_close_to_tray` use `{"close_to_tray"}` / `{"enabled"}`;
-/// `steam_fh4_mode` / `set_steam_fh4_mode` use `{"steam_fh4_mode"}` / `{"enabled"}`;
-/// `g29_spoof_mode` / `set_g29_spoof_mode` use `{"g29_spoof_mode"}` / `{"enabled"}`;
-/// `g29_pedal_layout` / `set_g29_pedal_layout` use `{"g29_pedal_layout"}` / `{"layout"}`;
-/// `g29_handbrake_button` / `set_g29_handbrake_button` use `{"g29_handbrake_button"}` / `{"button"}`;
 /// `restore_backup` → `{"message"}`; `rename_profile` takes
 /// `{"id", "name"}`; `link_profile` takes `{"id", "game_slug"}`;
 /// `knob_actions` → `{"knobs": [[...], [...]]}`; `set_knob_action`
@@ -768,39 +752,6 @@ fn dispatch_round3(
             let enabled = parse_bool_param(params, "enabled")?;
             api.set_close_to_tray(enabled)
                 .map(|new_state| serde_json::json!({"close_to_tray": new_state}))
-                .map_err(|error| detailed_api_error(&error))
-        }
-        "steam_fh4_mode" => Ok(serde_json::json!({"steam_fh4_mode": api.steam_fh4_mode()})),
-        "set_steam_fh4_mode" => {
-            let enabled = parse_bool_param(params, "enabled")?;
-            api.set_steam_fh4_mode(enabled)
-                .map(|new_state| serde_json::json!({"steam_fh4_mode": new_state}))
-                .map_err(|error| detailed_api_error(&error))
-        }
-        "g29_spoof_mode" => Ok(serde_json::json!({"g29_spoof_mode": api.g29_spoof_mode()})),
-        "set_g29_spoof_mode" => {
-            let enabled = parse_bool_param(params, "enabled")?;
-            api.set_g29_spoof_mode(enabled)
-                .map(|new_state| serde_json::json!({"g29_spoof_mode": new_state}))
-                .map_err(|error| detailed_api_error(&error))
-        }
-        "g29_pedal_layout" => Ok(serde_json::json!({"g29_pedal_layout": api.g29_pedal_layout()})),
-        "set_g29_pedal_layout" => {
-            let layout = params
-                .get("layout")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| IpcError::Api("Protocol|layout must be a string".to_string()))?;
-            api.set_g29_pedal_layout(layout)
-                .map(|new_state| serde_json::json!({"g29_pedal_layout": new_state}))
-                .map_err(|error| detailed_api_error(&error))
-        }
-        "g29_handbrake_button" => {
-            Ok(serde_json::json!({"g29_handbrake_button": api.g29_handbrake_button()}))
-        }
-        "set_g29_handbrake_button" => {
-            let button = parse_u8_param(params, "button")?;
-            api.set_g29_handbrake_button(u32::from(button))
-                .map(|new_state| serde_json::json!({"g29_handbrake_button": new_state}))
                 .map_err(|error| detailed_api_error(&error))
         }
         "restore_backup" => api

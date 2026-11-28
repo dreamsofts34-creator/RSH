@@ -8,7 +8,6 @@
 //! from [`AppStateCore`]: "Connected" is only ever reported when
 //! the session gate is open (C-02).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -92,27 +91,22 @@ pub struct DaemonApi {
     /// [`DaemonApi::slow_static`]. The lock is never held across a
     /// state read.
     slow_cache: Mutex<SlowStaticCache>,
-    /// Steam FH4 marker adoption guard (FH4 fix, v2.0.15): the
-    /// installer-marker adoption in [`AppApi::steam_fh4_mode`] may
-    /// only be attempted ONCE per daemon process. The UI reads the
-    /// getter on every slow cycle, and a declined UAC prompt must
-    /// not re-prompt on the next cycle (adoption failure falls
-    /// through silently) — the user re-arms it by toggling the
-    /// mode on manually in Settings, or by restarting the daemon.
-    /// A successful adoption flips the stored flag on, so later
-    /// reads short-circuit before reaching the guard anyway.
-    steam_fh4_adoption_attempted: AtomicBool,
 }
 
 impl DaemonApi {
     /// Build over an opened [`AppStateCore`].
     #[must_use]
     pub fn new(state: Arc<AppStateCore>) -> Arc<Self> {
+        // v2.0.19: first start after the cleanup deletes the stale
+        // HKCU `OEMData` value the Steam FH4 mode left on the vJoy
+        // key (best-effort, no-op off Windows — the installer
+        // removes the HKLM half). A stale value can confuse the
+        // Microsoft Store build of FH4, so it must not survive.
+        rsh_output::delete_stale_oemdata_hkcu();
         Arc::new(Self {
             state,
             manager: Mutex::new(ConnectionManager::new()),
             slow_cache: Mutex::new(SlowStaticCache::default()),
-            steam_fh4_adoption_attempted: AtomicBool::new(false),
         })
     }
 
@@ -357,38 +351,18 @@ impl DaemonApi {
             clutch: snap.pedals.clutch,
             // H10: live button bitmask from the last edge frame.
             button_mask,
-            // M-3: live handbrake + gear from the pipeline output.
+            // M-3: live handbrake from the pipeline output. Gear is
+            // always 0 in v2.0.19 (H-pattern deleted; the
+            // `SnapshotInfo.gear` field stays for the wire shape).
             handbrake: snap.handbrake,
-            gear: snap.gear,
+            gear: 0,
             // L-4: the engine tick this snapshot was built from.
             seq: snap.seq,
         }
     }
 }
 
-/// Whether Steam FH4 wheel mode may be ENABLED on the named live
-/// backend (FH4 fix, v2.0.15 — A4): only vJoy (and no-backend /
-/// unknown names, which cannot be `HIDMaestro`) may be enabled.
-/// `HIDMaestro` is refused — the `OEMData` flag must never be
-/// written for the HID key. Pure, so the guard is unit-testable
-/// without a live backend. Disabling is always allowed and never
-/// consults this helper.
-#[must_use]
-fn steam_fh4_enable_allowed(backend_name: &str) -> bool {
-    rsh_output::selector::BackendKind::from_backend_name(backend_name)
-        .is_none_or(|kind| kind != rsh_output::selector::BackendKind::HidMaestro)
-}
 
-/// G29 spoof enable guard (v2.0.16): enabling is HIDMaestro-only —
-///
-/// the `G29` profile is a `HIDMaestro` catalog profile, so there is no
-/// device to spoof with on vJoy (or with no backend). Disabling is
-/// always allowed and never consults this helper.
-#[must_use]
-fn g29_spoof_enable_allowed(backend_name: &str) -> bool {
-    rsh_output::selector::BackendKind::from_backend_name(backend_name)
-        == Some(rsh_output::selector::BackendKind::HidMaestro)
-}
 
 impl AppApi for DaemonApi {
     fn version(&self) -> String {
@@ -882,197 +856,29 @@ impl AppApi for DaemonApi {
             .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
     }
 
-    fn steam_fh4_mode(&self) -> bool {
-        // Installer-marker adoption on read (FH4 fix, v2.0.15): the
-        // installer checkbox writes the HKLM marker
-        // (`SteamFh4OemData` = 1) instead of the config flag, so a
-        // first read after an install with the box ticked adopts it
-        // — full set path (persist + registry + live-backend push),
-        // so the flag is written, not just the config. Adoption
-        // failure (HID backend, declined UAC prompt) falls through
-        // to the stored flag — a read never fails loudly. Adoption
-        // deliberately does NOT run in `DaemonApi::new`: a startup
-        // adoption would pop a UAC prompt at login, before the user
-        // ever opened the app — the first UI read is the
-        // user-initiated moment for it.
-        // One adoption attempt per daemon process (see
-        // `steam_fh4_adoption_attempted`): a declined UAC prompt
-        // must not re-prompt on the next slow-cycle read.
-        if !self.state.steam_fh4_mode()
-            && rsh_output::steam_fh4_marker_present()
-            && !self
-                .steam_fh4_adoption_attempted
-                .swap(true, Ordering::SeqCst)
-            && let Ok(adopted) = self.set_steam_fh4_mode(true)
-        {
-            return adopted;
-        }
-        self.state.steam_fh4_mode()
-    }
 
-    fn set_steam_fh4_mode(&self, enabled: bool) -> Result<bool, UserError> {
-        // A4: enabling on HIDMaestro is refused BEFORE any persist
-        // or registry write — the OEMData flag is vJoy-only and must
-        // never be written for the HID key (VID_1209&PID_5253).
-        // Disabling always succeeds: cleanup is never blocked by
-        // the backend.
-        if enabled && !steam_fh4_enable_allowed(&self.state.backend_name()) {
-            return Err(UserError {
-                code: "steam_fh4_vjoy_only".to_string(),
-                title: "Steam FH4 wheel mode needs vJoy".to_string(),
-                what_happened: "Steam FH4 wheel mode only works with the vJoy backend — the current backend is HIDMaestro, and the wheel flag must never be written for it."
-                    .to_string(),
-                what_to_do: "Switch the output backend to vJoy first, then turn Steam FH4 wheel mode on."
-                    .to_string(),
-                detail: None,
-            });
-        }
-        #[cfg(windows)]
-        let before = self.state.steam_fh4_mode();
-        let stored = self
-            .state
-            .set_steam_fh4_mode(enabled)
-            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))?;
-        // Registry actuation (Windows only — off Windows there is
-        // no registry to write, and the persisted flag + the
-        // live-backend push in `AppStateCore::set_steam_fh4_mode`
-        // are the whole behaviour).
-        #[cfg(windows)]
-        {
-            let registry = if enabled {
-                rsh_output::set_wheel_flag(true)
-            } else {
-                // Toggle-off deletes the flag AND the installer
-                // marker (same elevated run, one UAC prompt), so the
-                // marker cannot re-adopt the mode on the next read.
-                rsh_output::set_wheel_flag_and_clear_marker(false)
-            };
-            if let Err(error) = registry {
-                // Roll the persisted flag back, like `set_autostart`
-                // does for the Run key — a failed registry write
-                // must not leave Settings showing ON with no flag
-                // written (or OFF with the flag still set).
-                let _ = self.state.set_steam_fh4_mode(before);
-                return Err(UserError::from_connection(
-                    ConnectionError::Unknown,
-                    error.to_string(),
-                ));
-            }
-        }
-        Ok(stored)
-    }
 
-    fn g29_spoof_mode(&self) -> bool {
-        self.state.g29_spoof_mode()
-    }
 
-    fn set_g29_spoof_mode(&self, enabled: bool) -> Result<bool, UserError> {
-        // G29 spoof (v2.0.16): enabling on anything but HIDMaestro
-        // is refused BEFORE any persist — the G29 profile is a
-        // HIDMaestro catalog profile, so vJoy (or no backend) has no
-        // device to spoof with. Disabling always succeeds: cleanup
-        // is never blocked by the backend.
-        if enabled && !g29_spoof_enable_allowed(&self.state.backend_name()) {
-            return Err(UserError {
-                code: "g29_spoof_hid_only".to_string(),
-                title: "G29 spoof needs HIDMaestro".to_string(),
-                what_happened: "G29 spoof only works with the HIDMaestro backend — the current backend has no HIDMaestro profile to switch, so there is no G29 device to present."
-                    .to_string(),
-                what_to_do: "Switch the output backend to HIDMaestro first, then turn G29 spoof on."
-                    .to_string(),
-                detail: None,
-            });
-        }
-        // Was the live HID backend connected before the toggle? A
-        // connected backend is recreated with the new profile by
-        // `AppStateCore::set_g29_spoof_mode` (sidecar respawn + UAC
-        // dwell — this call can take as long as a backend switch);
-        // a disconnected one just records the flag for its next
-        // connect, so there is nothing to roll back there.
-        let was_connected = self.state.output_state().connected;
-        let stored = self
-            .state
-            .set_g29_spoof_mode(enabled)
-            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))?;
-        if was_connected && !self.state.output_state().connected {
-            // Recreate failed: the backend is disconnected after the
-            // toggle. On ENABLE the persisted flag is rolled back,
-            // like `set_steam_fh4_mode` does for a failed registry
-            // write — Settings must not show ON with the custom
-            // profile still live (and disconnected). On DISABLE
-            // (Bug 2, v2.0.17) the flag is already stored off, so no
-            // rollback is needed — but the failure must still surface
-            // instead of returning Ok with a dead backend. The
-            // backend's own status carries the failure reason for the
-            // Output page.
-            if enabled {
-                let _ = self.state.set_g29_spoof_mode(false);
-                return Err(UserError::from_connection(
-                    ConnectionError::Unknown,
-                    "G29 spoof could not recreate the HIDMaestro controller with the G29 profile — the backend is disconnected; the mode was left off.",
-                ));
-            }
-            return Err(UserError::from_connection(
-                ConnectionError::Unknown,
-                "G29 spoof could not recreate the HIDMaestro controller with the custom profile — the backend is disconnected; the mode was left off.",
-            ));
-        }
-        Ok(stored)
-    }
 
-    fn g29_pedal_layout(&self) -> String {
-        self.state.g29_pedal_layout()
-    }
 
-    fn set_g29_pedal_layout(&self, layout: &str) -> Result<String, UserError> {
-        self.state
-            .set_g29_pedal_layout(layout)
-            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
-    }
 
-    fn g29_handbrake_button(&self) -> u32 {
-        self.state.g29_handbrake_button()
-    }
 
-    fn set_g29_handbrake_button(&self, button: u32) -> Result<u32, UserError> {
-        self.state
-            .set_g29_handbrake_button(button)
-            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
-    }
 
     fn output_backend(&self) -> String {
         self.state.backend_name()
     }
 
     fn set_output_backend(&self, name: &str) -> Result<String, UserError> {
+        // v2.0.19: no backend needs elevation any more (the
+        // elevated sidecar backend is gone), so there is no UAC-decline
+        // branch — a switch failure is a plain typed error.
         let outcome = self.state.set_output_backend(name).map_err(|detail| {
-            // B6/A10: the admin-decline case gets a typed error with
-            // plain words — not `Unknown` / "Something went wrong."
-            // (the UI shows the title + what happened + what to do).
-            // `contains`, not `==`: the state wraps the failure
-            // ("could not switch output backend to HIDMaestro: …"),
-            // so the equality check never fired and every UAC
-            // decline arrived at the UI as a generic error (Bug 4).
-            if detail.contains(AppStateCore::HID_NOT_ADMIN) {
-                UserError {
-                    code: "not_admin".to_string(),
-                    title: "Admin permission needed".to_string(),
-                    what_happened: detail.clone(),
-                    what_to_do:
-                        "Approve the Windows prompt when switching to HIDMaestro, or keep using vJoy (no permission needed)."
-                            .to_string(),
-                    detail: None,
-                }
-            } else {
-                UserError::from_connection(ConnectionError::Unknown, detail)
-            }
+            UserError::from_connection(ConnectionError::Unknown, detail)
         });
         // H4 (v2.0.8 retest Bug 1): preserve the switch outcome in
-        // the daemon log (rsh-YYYYMMDD.log) — a hello failure used
+        // the daemon log (rsh-YYYYMMDD.log) — a connect failure used
         // to leave no trace there, so the next failure is
-        // diagnosable from the log alone. The failure reason IS the
-        // hello verdict ("sidecar did not report a DLL hash
-        // measurement", …); a success implies the hello passed.
+        // diagnosable from the log alone.
         match &outcome {
             Ok(_) => {
                 let _ = rsh_app_core::diagnostics::append_startup_log_both(&format!(
@@ -1516,7 +1322,7 @@ pub fn binding_user_error(code: &str, message: String) -> UserError {
     let (title, what_to_do) = match code {
         "InvalidButton" => (
             "Button cannot be bound",
-            "Bind a physical button (1-32) or an encoder button (65-72).",
+            "Bind a physical button (1-32).",
         ),
         "UnknownAction" => (
             "Unknown action",
@@ -1621,226 +1427,10 @@ mod tests {
         (DaemonApi::new(state), dir)
     }
 
-    /// FH4 fix (v2.0.15): the mode defaults off and toggles through
-    /// the API (persisted flag + live-backend push; the registry
-    /// write is Windows-only, so on Linux the toggle is the whole
-    /// behaviour). The test backend is the `NullSink`, which is not
-    /// `HIDMaestro`, so enabling is allowed.
-    #[test]
-    fn steam_fh4_mode_defaults_off_and_toggles() {
-        let (api, _dir) = live_api();
-        assert!(!api.steam_fh4_mode(), "default must be off");
-        assert!(api.set_steam_fh4_mode(true).expect("enable"));
-        assert!(api.steam_fh4_mode());
-        assert!(!api.set_steam_fh4_mode(false).expect("disable"));
-        assert!(!api.steam_fh4_mode());
-    }
 
-    /// FH4 fix (v2.0.15 — A4): enabling is refused only on
-    /// `HIDMaestro`; `vJoy`, no backend, and unknown names may enable.
-    /// Disabling never consults this guard (it is enforced in
-    /// `set_steam_fh4_mode`, not here).
-    #[test]
-    fn steam_fh4_enable_allowed_only_refuses_hidmaestro() {
-        assert!(!steam_fh4_enable_allowed("HIDMaestro"));
-        assert!(!steam_fh4_enable_allowed("hidmaestro"));
-        assert!(steam_fh4_enable_allowed("vJoy"));
-        assert!(steam_fh4_enable_allowed("VJoy"));
-        assert!(steam_fh4_enable_allowed("NullSink"));
-        assert!(steam_fh4_enable_allowed("None"));
-        assert!(steam_fh4_enable_allowed("something-unknown"));
-    }
 
-    /// G29 spoof (v2.0.16): the mode defaults off. The test backend
-    /// is the `NullSink`, which is not `HIDMaestro`, so enabling is
-    /// refused with `g29_spoof_hid_only` and the flag stays off;
-    /// disabling always succeeds (cleanup is never blocked).
-    #[test]
-    fn g29_spoof_mode_defaults_off_and_refuses_non_hid_backend() {
-        let (api, _dir) = live_api();
-        assert!(!api.g29_spoof_mode(), "default must be off");
-        let err = api
-            .set_g29_spoof_mode(true)
-            .expect_err("enable on NullSink");
-        assert_eq!(err.code, "g29_spoof_hid_only");
-        assert!(!api.g29_spoof_mode(), "refused enable must not persist");
-        assert!(
-            !api.set_g29_spoof_mode(false)
-                .expect("disable always succeeds")
-        );
-        assert!(!api.g29_spoof_mode());
-    }
 
-    /// G29 spoof (v2.0.16): enabling is allowed ONLY on
-    /// `HIDMaestro`; every other backend name (and unknown names)
-    /// refuses. Disabling never consults this guard (it is enforced
-    /// in `set_g29_spoof_mode`, not here).
-    #[test]
-    fn g29_spoof_enable_allowed_only_allows_hidmaestro() {
-        assert!(g29_spoof_enable_allowed("HIDMaestro"));
-        assert!(g29_spoof_enable_allowed("hidmaestro"));
-        assert!(!g29_spoof_enable_allowed("vJoy"));
-        assert!(!g29_spoof_enable_allowed("VJoy"));
-        assert!(!g29_spoof_enable_allowed("NullSink"));
-        assert!(!g29_spoof_enable_allowed("None"));
-        assert!(!g29_spoof_enable_allowed("something-unknown"));
-    }
 
-    /// Test-only `HIDMaestro` stand-in (Bug 2, v2.0.17): models the
-    /// real `HidMaestroOutput::set_g29_spoof_mode` restart — a mode
-    /// change while connected disconnects, records the flag, and
-    /// reconnects; a reconnect that fails (flipped on with
-    /// `set_fail_connect`) leaves it disconnected. All clones share
-    /// the one state, so the factory can hand out a fresh box per
-    /// build and the test still observes the installed instance.
-    #[derive(Clone)]
-    struct FailingG29Backend {
-        connected: Arc<Mutex<bool>>,
-        g29_spoof: Arc<Mutex<bool>>,
-        fail_connect: Arc<AtomicBool>,
-    }
-
-    impl FailingG29Backend {
-        fn new() -> Self {
-            Self {
-                connected: Arc::new(Mutex::new(false)),
-                g29_spoof: Arc::new(Mutex::new(false)),
-                fail_connect: Arc::new(AtomicBool::new(false)),
-            }
-        }
-
-        fn set_fail_connect(&self, fail: bool) {
-            self.fail_connect.store(fail, Ordering::SeqCst);
-        }
-
-        fn factories(&self) -> BackendFactories {
-            let hidmaestro = self.clone();
-            BackendFactories {
-                hidmaestro: Some(Box::new(move || {
-                    Box::new(hidmaestro.clone()) as Box<dyn IJoystickOutput>
-                })),
-                vjoy: None,
-                none: Box::new(|| Box::new(NullSink) as Box<dyn IJoystickOutput>),
-            }
-        }
-    }
-
-    impl IJoystickOutput for FailingG29Backend {
-        fn name(&self) -> &'static str {
-            "HIDMaestro"
-        }
-
-        fn is_connected(&self) -> bool {
-            *self.connected.lock().expect("connected lock poisoned")
-        }
-
-        fn try_connect(&mut self) -> Result<(), VJoyError> {
-            if self.fail_connect.load(Ordering::SeqCst) {
-                return Err(VJoyError::DriverNotFound(
-                    "mock sidecar failed to start.".to_string(),
-                ));
-            }
-            *self.connected.lock().expect("connected lock poisoned") = true;
-            Ok(())
-        }
-
-        fn disconnect(&mut self) {
-            *self.connected.lock().expect("connected lock poisoned") = false;
-        }
-
-        fn update(&mut self, _state: &ProcessedState) -> Result<(), VJoyError> {
-            if !self.is_connected() {
-                return Err(VJoyError::NotConnected);
-            }
-            Ok(())
-        }
-
-        fn send_neutral(&mut self) -> Result<(), VJoyError> {
-            Ok(())
-        }
-
-        fn set_g29_spoof_mode(&mut self, enabled: bool) {
-            // Real `HidMaestroOutput` restart semantics: a mode
-            // change while connected disposes + reconnects with the
-            // other profile; a failed reconnect leaves it
-            // disconnected (the daemon reads that as the failure).
-            if enabled == *self.g29_spoof.lock().expect("g29 lock poisoned") {
-                return;
-            }
-            let was_connected = self.is_connected();
-            if was_connected {
-                self.disconnect();
-            }
-            *self.g29_spoof.lock().expect("g29 lock poisoned") = enabled;
-            if was_connected {
-                let _ = self.try_connect();
-            }
-        }
-    }
-
-    /// Bug 2 (v2.0.17): disabling G29 spoof when the recreate fails
-    /// must ERROR, not return Ok with a dead backend. Setup: a
-    /// connected mock `HIDMaestro` whose reconnect fails after the
-    /// mode is on; disable → the daemon sees `was_connected &&
-    /// !connected` and errors, the flag stays off (already stored
-    /// off — no rollback), and the backend stays disconnected.
-    #[test]
-    fn g29_spoof_disable_with_failed_recreate_errors() {
-        let (api, _dir) = live_api();
-        let backend = FailingG29Backend::new();
-        let factories = backend.factories();
-        api.state
-            .set_output_backend_with_factories("HIDMaestro", &factories)
-            .expect("HIDMaestro switch succeeds");
-        assert!(
-            api.state.output_state().connected,
-            "mock HIDMaestro is connected"
-        );
-        assert!(api.set_g29_spoof_mode(true).expect("enable succeeds"));
-        assert!(api.g29_spoof_mode());
-        assert!(
-            api.state.output_state().connected,
-            "enable recreate reconnected"
-        );
-
-        backend.set_fail_connect(true);
-        let err = api
-            .set_g29_spoof_mode(false)
-            .expect_err("disable with a failed recreate must error");
-        assert!(
-            err.detail.as_deref().unwrap_or("").contains("disconnected"),
-            "error names the dead backend: {err:?}"
-        );
-        assert!(!api.g29_spoof_mode(), "flag stays off");
-        assert!(
-            !api.state.output_state().connected,
-            "backend stays disconnected"
-        );
-    }
-
-    /// G29 settings (v2.0.17): pedal layout + handbrake button
-    /// round-trip through the daemon API (persist + getter). The
-    /// test backend is the `NullSink`, so no live push happens.
-    /// Validation errors change nothing.
-    #[test]
-    fn g29_settings_round_trip_through_daemon_api() {
-        let (api, _dir) = live_api();
-        assert_eq!(api.g29_pedal_layout(), "hidmaestro");
-        assert_eq!(api.g29_handbrake_button(), 8);
-        assert_eq!(
-            api.set_g29_pedal_layout("pcgamingwiki")
-                .expect("set layout"),
-            "pcgamingwiki"
-        );
-        assert_eq!(api.g29_pedal_layout(), "pcgamingwiki");
-        assert_eq!(api.set_g29_handbrake_button(12).expect("set button"), 12);
-        assert_eq!(api.g29_handbrake_button(), 12);
-        assert!(api.set_g29_pedal_layout("banana").is_err());
-        assert_eq!(api.g29_pedal_layout(), "pcgamingwiki");
-        assert!(api.set_g29_handbrake_button(0).is_err());
-        assert!(api.set_g29_handbrake_button(26).is_err());
-        assert_eq!(api.g29_handbrake_button(), 12);
-    }
 
     /// R2-46: `diag_stats` exports the per-method IPC latency —
     /// the method that is slow must be visible, not just the global
@@ -2057,13 +1647,20 @@ mod tests {
         assert_eq!(bound.button, 5);
         assert_eq!(bound.action, "horn");
         let bound = api
-            .set_binding(65, "profile_next")
-            .expect("bind encoder button");
-        assert_eq!(bound.button, 65);
+            .set_binding(6, "profile_next")
+            .expect("bind button 6");
+        assert_eq!(bound.button, 6);
         let listed = api.list_bindings();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].button, 5, "button order, not insertion order");
-        assert_eq!(listed[1].button, 65);
+        assert_eq!(listed[1].button, 6);
+        // v2.0.19: encoder buttons are gone — button 65 is rejected.
+        assert_eq!(
+            api.set_binding(65, "profile_next")
+                .expect_err("encoder button 65")
+                .code,
+            "InvalidButton"
+        );
         // Rebind the same button: the new action wins.
         assert_eq!(
             api.set_binding(5, "shifter_up").expect("rebind").action,

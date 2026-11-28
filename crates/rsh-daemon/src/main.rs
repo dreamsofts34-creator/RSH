@@ -1635,24 +1635,6 @@ impl AppApi for DeferredApi {
     fwd!(result set_close_to_tray(enabled: bool) -> bool);
     fwd!(value output_backend() -> String = String::new());
     fwd!(result set_output_backend(name: &str) -> String);
-    // G29 spoof (v2.0.16): these MUST be forwarded — the v2.0.15
-    // Steam FH4 toggle failed on the user's PC with the trait
-    // default ("not supported by this API") for exactly this
-    // reason: `DaemonApi::set_steam_fh4_mode` exists, but the IPC
-    // server holds this `DeferredApi` permanently and the FH4
-    // methods were never forwarded here, so the live impl was
-    // unreachable. (The FH4 methods stay un-forwarded ON PURPOSE:
-    // user decision 2026-11-27 ~14:50 PKT — G29 replaces the FH4
-    // toggle, which is not fixed. Do NOT "fix" that by adding
-    // steam_fh4 forwarding here.) Before install the getter
-    // answers the starting value (off) and the setter fails with
-    // `starting_error`, like every other forwarded method.
-    fwd!(value g29_spoof_mode() -> bool = false);
-    fwd!(result set_g29_spoof_mode(enabled: bool) -> bool);
-    fwd!(value g29_pedal_layout() -> String = "hidmaestro".to_string());
-    fwd!(result set_g29_pedal_layout(layout: &str) -> String);
-    fwd!(value g29_handbrake_button() -> u32 = 8);
-    fwd!(result set_g29_handbrake_button(button: u32) -> u32);
     fwd!(result backup_now() -> String);
     fwd!(value list_profiles() -> Vec<ProfileSummary> = Vec::new());
     fwd!(result activate_profile(id: &str) -> String);
@@ -2052,18 +2034,9 @@ fn main() {
     // never probes inline.
     state.start_board_port_refresher();
     // BACKEND-2 migration: log the persisted-backend note (if any)
-    // so a HIDMaestro→vJoy switch is visible in the startup log.
+    // so a backend migration is visible in the startup log.
     if let Some(note) = state.backend_migration_note() {
         log_line(verbose, &format!("daemon: backend migration: {note}"));
-    }
-    // FH4 wheel check (v2.0.14): log the one-line summary at
-    // startup so the daemon log tells us, without the user running
-    // diagnostics, which piece is missing on his PC (mapping,
-    // envelope, feeder). No-op off Windows — `wheel_check` is
-    // `None` there. On Windows the first `vjoy_status()` call runs
-    // the check and caches it for the slow poll.
-    if let Some(check) = state.vjoy_status().wheel_check {
-        log_line(verbose, &format!("daemon: {}", check.summary_line()));
     }
     // Binding store: log the load warnings (dropped entries,
     // corrupt file) so a binding that did not survive is never
@@ -2210,11 +2183,10 @@ fn main() {
             .name("rsh-daemon-startup".to_string())
             .spawn(move || {
                 // D-7 lazy-start (Phase 7): activate the startup
-                // output backend. vJoy activates now; HIDMaestro
-                // stays deferred until the user turns "Send to
-                // game" on, so autostart never pops a UAC prompt at
-                // login. This never fails the launch (see the
-                // outcome log).
+                // output backend. v2.0.19: the selected backend
+                // activates now — no backend is deferred at
+                // startup and no UAC prompt appears at login.
+                // This never fails the launch (see the outcome log).
                 let backend = state.activate_startup_backend();
                 log_line(
                     verbose,
@@ -3839,259 +3811,8 @@ mod tests {
         );
     }
 
-    /// G29 spoof (v2.0.16) — the v2.0.15 FH4-toggle failure, pinned:
-    /// the daemon's IPC server holds a `DeferredApi` permanently,
-    /// and a `DaemonApi` override not forwarded there silently
-    /// answers the trait default FOREVER. The test backend is the
-    /// `NullSink`, which is not `HIDMaestro`, so enabling is refused
-    /// by the LIVE `DaemonApi` with `g29_spoof_hid_only` — the
-    /// refusal itself proves the forward (the trait default would
-    /// say "not supported by this API") — and disabling always
-    /// succeeds, like the real daemon.
-    #[test]
-    fn deferred_api_forwards_g29_spoof_mode_after_install() {
-        let dir = temp_dir("deferred-g29");
-        let state =
-            Arc::new(AppStateCore::open_with_null_sink(&dir).expect("open state with null sink"));
-        let live = Arc::new(DaemonApi::new(state));
-        let deferred = DeferredApi::new();
-        deferred.install(Arc::clone(&live));
 
-        assert!(!deferred.g29_spoof_mode(), "default must be off");
-        let err = deferred
-            .set_g29_spoof_mode(true)
-            .expect_err("enable on NullSink must be refused by the live DaemonApi");
-        assert_eq!(err.code, "g29_spoof_hid_only");
-        assert!(
-            !deferred.g29_spoof_mode(),
-            "refused enable must not persist"
-        );
-        assert!(
-            !deferred
-                .set_g29_spoof_mode(false)
-                .expect("disable always succeeds"),
-            "disable returns the new state (off)"
-        );
-        assert!(!deferred.g29_spoof_mode());
-    }
 
-    /// G29 spoof (v2.0.16): before install the getter answers the
-    /// starting value (off) and the setter fails with the honest
-    /// "still starting" error — never the trait default ("not
-    /// supported by this API"), and never a silent success.
-    #[test]
-    fn deferred_api_g29_spoof_mode_fails_starting_before_install() {
-        let deferred = DeferredApi::new();
-        assert!(
-            !deferred.g29_spoof_mode(),
-            "before install the getter answers the starting value (off)"
-        );
-        let err = deferred
-            .set_g29_spoof_mode(true)
-            .expect_err("setter before install must fail");
-        let detail = err.detail.clone().unwrap_or_default();
-        assert!(
-            detail.contains("still starting"),
-            "before install the error must say starting, got: {detail}"
-        );
-        assert!(
-            !detail.contains("not supported by this API"),
-            "the trait default must never surface, got: {detail}"
-        );
-    }
 
-    /// G29 spoof (v2.0.16) — the EXACT UI call path, end to end:
-    /// Settings toggle → `IpcClient` `set_g29_spoof_mode` → IPC
-    /// dispatch → `DeferredApi` → `DaemonApi` → backend. The
-    /// rsh-ipc round-trip test only exercises a test double, which
-    /// is how the v2.0.15 FH4 gap hid: the dispatch and the daemon
-    /// impl were both fine, but the `DeferredApi` in between was
-    /// never forwarded. This test drives `rsh_ipc::dispatch`
-    /// directly against a `DeferredApi` holding a real `DaemonApi`
-    /// (temp data dir, no board): the getter returns the persisted
-    /// flag, disabling succeeds through the whole chain, and
-    /// enabling on the `NullSink` test backend is refused with the
-    /// live daemon's `g29_spoof_hid_only` — never the trait
-    /// default.
-    #[test]
-    fn deferred_api_g29_spoof_mode_through_ipc_dispatch() {
-        fn call(
-            api: &Arc<dyn AppApi>,
-            method: &str,
-            params: serde_json::Value,
-        ) -> Result<serde_json::Value, rsh_ipc::IpcError> {
-            rsh_ipc::dispatch(
-                api,
-                &rsh_ipc::IpcRequest {
-                    v: rsh_ipc::IPC_PROTOCOL_VERSION,
-                    id: 1,
-                    method: method.to_string(),
-                    params,
-                },
-            )
-        }
 
-        let dir = temp_dir("deferred-g29-ipc");
-        let state =
-            Arc::new(AppStateCore::open_with_null_sink(&dir).expect("open state with null sink"));
-        let live = Arc::new(DaemonApi::new(state));
-        let deferred = Arc::new(DeferredApi::new());
-        deferred.install(Arc::clone(&live));
-        let api: Arc<dyn AppApi> = deferred;
-
-        let got =
-            call(&api, "g29_spoof_mode", serde_json::json!({})).expect("g29_spoof_mode dispatch");
-        assert_eq!(
-            got.get("g29_spoof_mode")
-                .and_then(serde_json::Value::as_bool),
-            Some(false),
-            "default must be off through the dispatch"
-        );
-
-        let applied = call(
-            &api,
-            "set_g29_spoof_mode",
-            serde_json::json!({"enabled": false}),
-        )
-        .expect("set_g29_spoof_mode off dispatch");
-        assert_eq!(
-            applied
-                .get("g29_spoof_mode")
-                .and_then(serde_json::Value::as_bool),
-            Some(false),
-            "disable through the dispatch returns off"
-        );
-
-        let err = call(
-            &api,
-            "set_g29_spoof_mode",
-            serde_json::json!({"enabled": true}),
-        )
-        .expect_err("enable on NullSink must be refused through the dispatch");
-        let body = match &err {
-            rsh_ipc::IpcError::Api(body) => body.clone(),
-            other => panic!("expected IpcError::Api, got: {other:?}"),
-        };
-        assert!(
-            body.starts_with("g29_spoof_hid_only|"),
-            "the refusal must carry the live daemon's code, got: {body}"
-        );
-        assert!(
-            !body.contains("not supported by this API"),
-            "the trait default must never surface through the dispatch, got: {body}"
-        );
-    }
-
-    /// G29 settings (v2.0.17) — the EXACT UI call path, end to
-    /// end: Settings → `IpcClient` → IPC dispatch → `DeferredApi`
-    /// → `DaemonApi` → persisted settings. Same shape as the
-    /// spoof-mode test above (the v2.0.15 lesson: a method that is
-    /// never forwarded falls through to the trait default
-    /// forever). Defaults read back, valid writes apply, invalid
-    /// writes error and change nothing — never the trait default.
-    #[test]
-    fn deferred_api_g29_settings_through_ipc_dispatch() {
-        fn call(
-            api: &Arc<dyn AppApi>,
-            method: &str,
-            params: serde_json::Value,
-        ) -> Result<serde_json::Value, rsh_ipc::IpcError> {
-            rsh_ipc::dispatch(
-                api,
-                &rsh_ipc::IpcRequest {
-                    v: rsh_ipc::IPC_PROTOCOL_VERSION,
-                    id: 1,
-                    method: method.to_string(),
-                    params,
-                },
-            )
-        }
-
-        let dir = temp_dir("deferred-g29-settings-ipc");
-        let state =
-            Arc::new(AppStateCore::open_with_null_sink(&dir).expect("open state with null sink"));
-        let live = Arc::new(DaemonApi::new(state));
-        let deferred = Arc::new(DeferredApi::new());
-        deferred.install(Arc::clone(&live));
-        let api: Arc<dyn AppApi> = deferred;
-
-        let got = call(&api, "g29_pedal_layout", serde_json::json!({})).expect("g29_pedal_layout");
-        assert_eq!(
-            got.get("g29_pedal_layout")
-                .and_then(serde_json::Value::as_str),
-            Some("hidmaestro"),
-            "default layout must be hidmaestro through the dispatch"
-        );
-        let got = call(&api, "g29_handbrake_button", serde_json::json!({}))
-            .expect("g29_handbrake_button");
-        assert_eq!(
-            got.get("g29_handbrake_button")
-                .and_then(serde_json::Value::as_u64),
-            Some(8),
-            "default handbrake button must be 8 through the dispatch"
-        );
-
-        let applied = call(
-            &api,
-            "set_g29_pedal_layout",
-            serde_json::json!({"layout": "pcgamingwiki"}),
-        )
-        .expect("set_g29_pedal_layout dispatch");
-        assert_eq!(
-            applied
-                .get("g29_pedal_layout")
-                .and_then(serde_json::Value::as_str),
-            Some("pcgamingwiki")
-        );
-        let applied = call(
-            &api,
-            "set_g29_handbrake_button",
-            serde_json::json!({"button": 12}),
-        )
-        .expect("set_g29_handbrake_button dispatch");
-        assert_eq!(
-            applied
-                .get("g29_handbrake_button")
-                .and_then(serde_json::Value::as_u64),
-            Some(12)
-        );
-
-        let err = call(
-            &api,
-            "set_g29_pedal_layout",
-            serde_json::json!({"layout": "banana"}),
-        )
-        .expect_err("unknown layout must be refused through the dispatch");
-        let body = match &err {
-            rsh_ipc::IpcError::Api(body) => body.clone(),
-            other => panic!("expected IpcError::Api, got: {other:?}"),
-        };
-        assert!(
-            !body.contains("not supported by this API"),
-            "the trait default must never surface through the dispatch, got: {body}"
-        );
-        let err = call(
-            &api,
-            "set_g29_handbrake_button",
-            serde_json::json!({"button": 26}),
-        )
-        .expect_err("button 26 must be refused through the dispatch");
-        let body = match &err {
-            rsh_ipc::IpcError::Api(body) => body.clone(),
-            other => panic!("expected IpcError::Api, got: {other:?}"),
-        };
-        assert!(
-            !body.contains("not supported by this API"),
-            "the trait default must never surface through the dispatch, got: {body}"
-        );
-
-        let got = call(&api, "g29_pedal_layout", serde_json::json!({}))
-            .expect("g29_pedal_layout after refused writes");
-        assert_eq!(
-            got.get("g29_pedal_layout")
-                .and_then(serde_json::Value::as_str),
-            Some("pcgamingwiki"),
-            "refused writes must change nothing"
-        );
-    }
 }
