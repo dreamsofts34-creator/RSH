@@ -98,7 +98,9 @@ pub struct ModuleTuning {
     /// Curve strength, `-1..=1` (0 = linear). Positive softens the
     /// centre (progressive), negative sharpens it.
     pub curve_strength: f32,
-    /// One Euro smoothing, `0..=1` (0 = off). Default `0.3`.
+    /// One Euro smoothing, `0..=1` (0 = off). Default `0.0`
+    /// (v2.0.21 P2 — the old `0.3` lagged the primary axis; the
+    /// 0.1 µF cap + trimmed mean handle the noise instead).
     pub smoothing: f32,
     /// Range minimum in millivolts. Default `300`.
     pub min_mv: u16,
@@ -183,7 +185,14 @@ impl Default for ModuleTuning {
             enabled: true,
             deadzone: 0.02,
             curve_strength: 0.0,
-            smoothing: 0.3,
+            // v2.0.21 P2: smoothing off by default (was 0.3). The
+            // per-module press/release ramps stay at the legacy
+            // 150/100 ms here — this struct default is
+            // module-agnostic, so the per-module values live in
+            // `rsh_api::{default_press_ms, default_release_ms}`
+            // (throttle 100/50, brake 0/50, clutch 50/300), which
+            // `get_tuning` applies before the plan is built.
+            smoothing: 0.0,
             min_mv: DEFAULT_MIN_MV,
             max_mv: DEFAULT_MAX_MV,
             center_mv: DEFAULT_CENTER_MV,
@@ -222,7 +231,7 @@ impl ModuleTuning {
         let mut out = *self;
         out.deadzone = clamp_finite(self.deadzone, 0.0, 0.5, 0.02);
         out.curve_strength = clamp_finite(self.curve_strength, -1.0, 1.0, 0.0);
-        out.smoothing = clamp_finite(self.smoothing, 0.0, 1.0, 0.3);
+        out.smoothing = clamp_finite(self.smoothing, 0.0, 1.0, 0.0);
         out.scale = clamp_finite(self.scale, 0.2, 1.0, 1.0);
         // --- Steering per-module tuning ---
         out.scale_left = clamp_finite(self.scale_left, 0.2, 1.0, 1.0);
@@ -317,15 +326,47 @@ impl PipelinePlan {
 
 impl Default for PipelinePlan {
     fn default() -> Self {
+        // v2.0.21 P2 factory defaults (new installs + 1-tap reset
+        // only — stored profiles keep their own values):
+        // steering 360° lock (scale 0.4) with no smoothing, throttle
+        // press 100 / release 50, brake press 0 (instant) / release
+        // 50 with progressive curve 1.3 (strength 0.3), clutch press
+        // 50 / release 300 with 15% slip zone, handbrake press 0
+        // instant, shifter lockout 50 ms, horn 400 ms momentary.
+        // Deadzone is 0.02 everywhere (noisy 50k pots must not
+        // drift). The generic `ModuleTuning::default` keeps the
+        // legacy 150/100 ramps (module-agnostic by design), so
+        // every per-module ramp is overridden here; the live plan
+        // always comes from `get_tuning` + the profile anyway.
         Self {
-            steering: ModuleTuning::default(),
-            accelerator: ModuleTuning::default(),
-            brake: ModuleTuning::default(),
-            clutch: ModuleTuning {
-                enabled: false,
+            steering: ModuleTuning {
+                scale: 0.4,
+                scale_left: 0.4,
+                scale_right: 0.4,
                 ..ModuleTuning::default()
             },
-            handbrake: ModuleTuning::default(),
+            accelerator: ModuleTuning {
+                press_ms: 100.0,
+                release_ms: 50.0,
+                ..ModuleTuning::default()
+            },
+            brake: ModuleTuning {
+                press_ms: 0.0,
+                release_ms: 50.0,
+                curve_strength: 0.3,
+                ..ModuleTuning::default()
+            },
+            clutch: ModuleTuning {
+                enabled: false,
+                press_ms: 50.0,
+                release_ms: 300.0,
+                bite_width: 0.15,
+                ..ModuleTuning::default()
+            },
+            handbrake: ModuleTuning {
+                press_ms: 0.0,
+                ..ModuleTuning::default()
+            },
             shifter: ModuleTuning::default(),
             horn: ModuleTuning::default(),
             combine_pedals: false,
@@ -1454,7 +1495,9 @@ mod tests {
     }
 
     /// A plan with all shaping off, for exact golden vectors:
-    /// deadzone 0, curve 0, smoothing 0, ramps off, scale 1.0,
+    /// deadzone 0, curve 0, smoothing 0, ramps off, scale 1.0
+    /// (including the steering side scales — the steering divide
+    /// reads `scale_left`/`scale_right`, not the single `scale`),
     /// everything enabled (including clutch).
     fn plain_plan() -> PipelinePlan {
         let mut plan = PipelinePlan::default();
@@ -1473,6 +1516,8 @@ mod tests {
             tuning.press_ms = 0.0;
             tuning.release_ms = 0.0;
             tuning.scale = 1.0;
+            tuning.scale_left = 1.0;
+            tuning.scale_right = 1.0;
             tuning.enabled = true;
         }
         plan
@@ -1634,8 +1679,43 @@ mod tests {
             ..super::ModuleTuning::default()
         };
         let clean = tuning.sanitized();
-        assert_eq!(clean.smoothing, 0.3);
+        // v2.0.21 P2: a non-finite smoothing falls back to the new
+        // factory default 0.0 (off), not the old 0.3.
+        assert_eq!(clean.smoothing, 0.0);
         assert_eq!(clean.scale, 1.0);
+    }
+
+    #[test]
+    fn factory_defaults_match_p2_tuning_defaults() {
+        // v2.0.21 P2 factory defaults (new installs + 1-tap reset):
+        // steering 360° lock (scale 0.4) with no smoothing, throttle
+        // press 100 / release 50, brake press 0 (instant) / release
+        // 50 with progressive curve 1.3 (strength 0.3), clutch press
+        // 50 / release 300 with 15% slip zone, handbrake press 0
+        // instant, shifter lockout 50 ms, horn 400 ms momentary,
+        // deadzone 0.02 everywhere (noisy 50k pots must not drift).
+        let plan = super::PipelinePlan::default();
+        assert_eq!(plan.steering.scale, 0.4);
+        assert_eq!(plan.steering.scale_left, 0.4);
+        assert_eq!(plan.steering.scale_right, 0.4);
+        assert_eq!(plan.steering.smoothing, 0.0);
+        assert_eq!(plan.steering.deadzone, 0.02);
+        assert_eq!(plan.accelerator.press_ms, 100.0);
+        assert_eq!(plan.accelerator.release_ms, 50.0);
+        assert_eq!(plan.accelerator.deadzone, 0.02);
+        assert_eq!(plan.brake.press_ms, 0.0);
+        assert_eq!(plan.brake.release_ms, 50.0);
+        assert_eq!(plan.brake.curve_strength, 0.3);
+        assert_eq!(plan.brake.saturation, 1.0);
+        assert_eq!(plan.brake.deadzone, 0.02);
+        assert!(!plan.clutch.enabled);
+        assert_eq!(plan.clutch.press_ms, 50.0);
+        assert_eq!(plan.clutch.release_ms, 300.0);
+        assert_eq!(plan.clutch.bite_width, 0.15);
+        assert_eq!(plan.handbrake.press_ms, 0.0);
+        assert_eq!(plan.shifter.shift_lockout_ms, 50.0);
+        assert_eq!(plan.horn.horn_min_ms, 400.0);
+        assert!(!plan.horn.horn_latch);
     }
 
     #[test]

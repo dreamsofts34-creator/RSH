@@ -57,30 +57,34 @@ pub fn steering_lock_deg_to_scale(deg: f64) -> f64 {
 }
 
 /// Default pedal press-ramp ms for a module (per-module tuning,
-/// Workstream C): the accelerator opens over 100 ms, the brake bites
-/// over 50 ms, the handbrake grabs instantly (0 ms, H2); other
-/// modules have no press ramp of their own and fall back to the
-/// profile's global `pedal_press_ms` (150 ms).
+/// Workstream C): the accelerator opens over 100 ms, the brake
+/// bites instantly (0 ms, v2.0.21 F7 — the 50 ms press was felt
+/// lag on every brake input), the clutch opens over 50 ms, the
+/// handbrake grabs instantly (0 ms, H2); other modules have no
+/// press ramp of their own and fall back to the profile's global
+/// `pedal_press_ms` (150 ms).
 /// Both spellings of the throttle id are accepted — the UI writes
 /// `"throttle"`, the pipeline reads `"accelerator"`.
 #[must_use]
 pub fn default_press_ms(module: &str) -> Option<f64> {
     match module {
         "accelerator" | "throttle" => Some(100.0),
-        "brake" => Some(50.0),
-        "handbrake" => Some(0.0),
+        "brake" | "handbrake" => Some(0.0),
+        "clutch" => Some(50.0),
         _ => None,
     }
 }
 
 /// Default pedal release-ramp ms for a module (per-module tuning,
-/// Workstream C): the accelerator closes over 50 ms, the clutch
-/// releases over 300 ms; other modules fall back to the profile's
-/// global `pedal_release_ms` (100 ms).
+/// Workstream C): the accelerator closes over 50 ms, the brake
+/// releases over 50 ms (v2.0.21 F7 — the old 100 ms global made
+/// the brake feel sticky on lift-off), the clutch releases over
+/// 300 ms; other modules fall back to the profile's global
+/// `pedal_release_ms` (100 ms).
 #[must_use]
 pub fn default_release_ms(module: &str) -> Option<f64> {
     match module {
-        "accelerator" | "throttle" => Some(50.0),
+        "accelerator" | "throttle" | "brake" => Some(50.0),
         "clutch" => Some(300.0),
         _ => None,
     }
@@ -248,13 +252,15 @@ pub struct TuningSettings {
     /// Pedal press ramp in ms (accelerator / brake / clutch only;
     /// `None` = no per-module ramp — the profile's global
     /// `pedal_press_ms` applies). Defaults: accelerator 100 ms,
-    /// brake 50 ms (see [`default_press_ms`]).
+    /// brake 0 ms (instant, v2.0.21 F7), clutch 50 ms (see
+    /// [`default_press_ms`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub press_ms: Option<f64>,
     /// Pedal release ramp in ms (accelerator / brake / clutch only;
     /// `None` = no per-module ramp — the profile's global
     /// `pedal_release_ms` applies). Defaults: accelerator 50 ms,
-    /// clutch 300 ms (see [`default_release_ms`]).
+    /// brake 50 ms (v2.0.21 F7), clutch 300 ms (see
+    /// [`default_release_ms`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_ms: Option<f64>,
     /// Combined pedals (accelerator + brake as one axis, for old
@@ -805,14 +811,15 @@ mod tests {
     #[test]
     fn pedal_ramp_defaults_and_round_trip() {
         // --- Pedal ramps/curves per-module tuning ---
-        // Task defaults: accel press 100 / release 50, brake press
-        // 50, clutch release 300, combined pedals off.
+        // Task defaults (v2.0.21 F7/P2): accel press 100 /
+        // release 50, brake press 0 (instant) / release 50,
+        // clutch press 50 / release 300, combined pedals off.
         assert_eq!(default_press_ms("accelerator"), Some(100.0));
         assert_eq!(default_release_ms("accelerator"), Some(50.0));
         assert_eq!(default_press_ms("throttle"), Some(100.0));
-        assert_eq!(default_press_ms("brake"), Some(50.0));
-        assert_eq!(default_release_ms("brake"), None);
-        assert_eq!(default_press_ms("clutch"), None);
+        assert_eq!(default_press_ms("brake"), Some(0.0));
+        assert_eq!(default_release_ms("brake"), Some(50.0));
+        assert_eq!(default_press_ms("clutch"), Some(50.0));
         assert_eq!(default_release_ms("clutch"), Some(300.0));
         assert_eq!(default_press_ms("steering"), None);
         assert_eq!(default_release_ms("steering"), None);

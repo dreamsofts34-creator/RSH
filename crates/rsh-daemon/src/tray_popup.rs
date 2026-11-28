@@ -978,6 +978,7 @@ mod tests {
             bound_profile_id: None,
             running,
             installed,
+            launch_error: None,
         }
     }
 
