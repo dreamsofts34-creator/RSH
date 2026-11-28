@@ -4,7 +4,10 @@
 //! (via `serde`): inter-arrival jitter p99, output-latency p99, E2E
 //! latency p99 (`None` = "unmeasured", never a fake 0), packet-loss
 //! fraction over the last 1000 packets, and the `seqGap`/`txFail`
-//! counters passed through from status packets.
+//! counters passed through from status packets. F4 (v2.0.21) adds
+//! the Phase 0 PC-side instrumentation: raw arrival-gap p99 + max,
+//! age-at-output p99, and the `frames_received` / `stale_dropped` /
+//! `outputs_sent` / `frames_per_tick_max` counters.
 //!
 //! The record path allocates nothing: p99 uses a fixed 256-sample ring
 //! buffer (sorted copy on query only) and the loss window a fixed
@@ -92,6 +95,14 @@ impl P99Tracker {
         let rank = (99 * self.len).div_ceil(100);
         let idx = rank.saturating_sub(1).min(self.len - 1);
         Some(sorted[idx])
+    }
+
+    /// The largest sample held ([`None`] while unmeasured). A linear
+    /// scan over ≤256 samples — the 1 Hz diagnostics path only, never
+    /// the 200 Hz hot path.
+    #[must_use]
+    pub fn max(&self) -> Option<u64> {
+        self.samples[..self.len].iter().max().copied()
     }
 
     /// Number of samples currently held.
@@ -223,6 +234,29 @@ impl Serialize for LossWindow {
     }
 }
 
+/// The five p99 values [`EngineMetrics::cached_p99s`] returns, in
+/// fixed order: (inter-arrival jitter, output latency, end-to-end
+/// latency, arrival gap, age at output) — all µs, `None` while
+/// unmeasured.
+pub type P99Set = (
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+);
+
+/// A cached [`P99Set`] plus the millisecond timestamp it was
+/// computed at (`0` = never computed).
+type CachedP99s = (
+    u64,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+);
+
 /// Engine metrics — the data model the Performance panel consumes.
 ///
 /// Serializes as the current snapshot values: p99 fields are `null`
@@ -241,14 +275,46 @@ pub struct EngineMetrics {
     pub seq_gap: u64,
     /// `txFail` counter passed through from the latest status packet.
     pub tx_fail: u64,
-    /// Cached p99 triple (PERF P1-3): (`computed_at_ms`, jitter, output
-    /// latency, e2e) — all `Copy`, so `EngineMetrics` stays `Copy`.
+    /// PC-side inter-arrival gap p99 (µs, F4 v2.0.21): the gap
+    /// between successive accepted frames as the engine received
+    /// them. Unlike the jitter tracker (which measures deviation
+    /// from the expected period), this is the raw spacing — the
+    /// number that proves whether frames arrive steadily or in
+    /// bursts after Wi-Fi stalls.
+    pub arrival_gap_p99_us: P99Tracker,
+    /// Largest PC-side inter-arrival gap observed (µs, F4): the
+    /// worst single stall. A separate scalar (not a tracker) so a
+    /// single long gap is never averaged away by the p99.
+    pub arrival_gap_max_us: u64,
+    /// Age-at-output p99 (µs, F4): how old the frame the engine
+    /// just sent was when it was sent (engine receipt → output
+    /// send). The queueing delay the output path adds on top of
+    /// the transport delay.
+    pub age_at_output_p99_us: P99Tracker,
+    /// Frames received by the engine (F4 `seqReceived`): accepted
+    /// stream frames, duplicates excluded.
+    pub frames_received: u64,
+    /// Frames dropped as stale (F4): duplicates the dedupe
+    /// dropped plus frames the drain cap discarded. A rising count
+    /// with a healthy `frames_received` means the board is
+    /// double-sending or the engine is draining late.
+    pub stale_dropped: u64,
+    /// Output sends (F4): how many times the engine actually sent
+    /// a state to the output backend (ViGEm/Xbox).
+    pub outputs_sent: u64,
+    /// Largest burst in one engine tick (F4): most frames drained
+    /// in a single tick. >1 means frames arrived bunched (Wi-Fi
+    /// stall + catch-up, or double-send).
+    pub frames_per_tick_max: u32,
+    /// Cached p99 quintuple (PERF P1-3): (`computed_at_ms`,
+    /// jitter, output latency, e2e, arrival gap, age at output) —
+    /// all `Copy`, so `EngineMetrics` stays `Copy`.
     /// `0` = never computed. Skipped by serde (it is a cache, not a
     /// measurement). Recomputed at most every 100 ms by
     /// [`EngineMetrics::cached_p99s`]; a stale-by-≤100 ms p99 is fine
     /// for the diagnostics that read it at ≤20 Hz.
     #[serde(skip)]
-    cached_p99s: (u64, Option<u64>, Option<u64>, Option<u64>),
+    cached_p99s: CachedP99s,
 }
 
 impl EngineMetrics {
@@ -262,13 +328,57 @@ impl EngineMetrics {
             packet_loss: LossWindow::new(),
             seq_gap: 0,
             tx_fail: 0,
-            cached_p99s: (0, None, None, None),
+            arrival_gap_p99_us: P99Tracker::new(),
+            arrival_gap_max_us: 0,
+            age_at_output_p99_us: P99Tracker::new(),
+            frames_received: 0,
+            stale_dropped: 0,
+            outputs_sent: 0,
+            frames_per_tick_max: 0,
+            cached_p99s: (0, None, None, None, None, None),
         }
     }
 
     /// Record one inter-arrival jitter sample (µs).
     pub fn record_inter_arrival_jitter(&mut self, jitter_us: u64) {
         self.inter_arrival_jitter_p99_us.record(jitter_us);
+    }
+
+    /// Record one PC-side inter-arrival gap sample (µs, F4): the
+    /// time since the previous accepted frame reached the engine.
+    /// Updates the gap max as well.
+    pub fn record_arrival_gap(&mut self, gap_us: u64) {
+        self.arrival_gap_p99_us.record(gap_us);
+        self.arrival_gap_max_us = self.arrival_gap_max_us.max(gap_us);
+    }
+
+    /// Record one age-at-output sample (µs, F4): how old the frame
+    /// was when the engine sent it to the output backend.
+    pub fn record_age_at_output(&mut self, age_us: u64) {
+        self.age_at_output_p99_us.record(age_us);
+    }
+
+    /// Count one accepted stream frame (F4 `seqReceived`).
+    pub fn record_frame_received(&mut self) {
+        self.frames_received += 1;
+    }
+
+    /// Count `count` frames dropped as stale (F4): duplicates the
+    /// dedupe dropped, or frames the drain cap discarded.
+    pub fn record_stale_dropped(&mut self, count: u64) {
+        self.stale_dropped += count;
+    }
+
+    /// Count one output send (F4): the engine sent a state to the
+    /// output backend.
+    pub fn record_output_sent(&mut self) {
+        self.outputs_sent += 1;
+    }
+
+    /// Record one tick's burst size (F4): the number of frames
+    /// drained in that tick. Only the max is kept.
+    pub fn record_burst(&mut self, frames: u32) {
+        self.frames_per_tick_max = self.frames_per_tick_max.max(frames);
     }
 
     /// Record one output-latency sample (µs).
@@ -303,24 +413,26 @@ impl EngineMetrics {
         self.tx_fail = tx_fail;
     }
 
-    /// The three p99s, cached (PERF P1-3): the three 256-sample
+    /// The five p99s, cached (PERF P1-3): the five 256-sample
     /// sorts run at most once per 100 ms (10 Hz) instead of on every
     /// 200 Hz `ingest_frame` tick (~14 µs/tick → ~0.1–0.2 µs/tick
     /// amortized). Callers on the hot path use this; the plain
     /// `*_p99()` accessors below stay exact for tests / slow paths.
     #[must_use]
-    pub fn cached_p99s(&mut self) -> (Option<u64>, Option<u64>, Option<u64>) {
+    pub fn cached_p99s(&mut self) -> P99Set {
         let now_ms = p99_cache_now_ms();
-        let (at, jitter, output, e2e) = self.cached_p99s;
+        let (at, jitter, output, e2e, arrival_gap, age_at_output) = self.cached_p99s;
         if at != 0 && now_ms.saturating_sub(at) < 100 {
-            return (jitter, output, e2e);
+            return (jitter, output, e2e, arrival_gap, age_at_output);
         }
         let fresh = (
             self.inter_arrival_jitter_p99_us.p99(),
             self.output_latency_p99_us.p99(),
             self.e2e_latency_p99_us.p99(),
+            self.arrival_gap_p99_us.p99(),
+            self.age_at_output_p99_us.p99(),
         );
-        self.cached_p99s = (now_ms, fresh.0, fresh.1, fresh.2);
+        self.cached_p99s = (now_ms, fresh.0, fresh.1, fresh.2, fresh.3, fresh.4);
         fresh
     }
 
@@ -340,6 +452,25 @@ impl EngineMetrics {
     #[must_use]
     pub fn e2e_latency_p99(&self) -> Option<u64> {
         self.e2e_latency_p99_us.p99()
+    }
+
+    /// PC-side inter-arrival gap p99 (µs, F4), [`None`] while
+    /// unmeasured.
+    #[must_use]
+    pub fn arrival_gap_p99(&self) -> Option<u64> {
+        self.arrival_gap_p99_us.p99()
+    }
+
+    /// Largest PC-side inter-arrival gap observed (µs, F4).
+    #[must_use]
+    pub const fn arrival_gap_max(&self) -> u64 {
+        self.arrival_gap_max_us
+    }
+
+    /// Age-at-output p99 (µs, F4), [`None`] while unmeasured.
+    #[must_use]
+    pub fn age_at_output_p99(&self) -> Option<u64> {
+        self.age_at_output_p99_us.p99()
     }
 
     /// Packet-loss fraction over the last 1000 packets (D8).
@@ -542,5 +673,63 @@ mod tests {
         metrics.update_status_counters(9, 3);
         assert_eq!(metrics.seq_gap, 9);
         assert_eq!(metrics.tx_fail, 3);
+    }
+
+    /// F4 (v2.0.21): arrival-gap p99 + max, age-at-output p99, and
+    /// the counters. The max is a scalar, so one long stall is
+    /// never averaged away by the p99.
+    #[test]
+    fn f4_arrival_gap_and_age_at_output() {
+        let mut metrics = EngineMetrics::new();
+        assert_eq!(metrics.arrival_gap_p99(), None);
+        assert_eq!(metrics.arrival_gap_max(), 0);
+        assert_eq!(metrics.age_at_output_p99(), None);
+        assert_eq!(metrics.frames_received, 0);
+        assert_eq!(metrics.stale_dropped, 0);
+        assert_eq!(metrics.outputs_sent, 0);
+        assert_eq!(metrics.frames_per_tick_max, 0);
+        for gap in [5000_u64, 5000, 5000, 20_000] {
+            metrics.record_arrival_gap(gap);
+        }
+        assert_eq!(metrics.arrival_gap_p99(), Some(20_000));
+        assert_eq!(metrics.arrival_gap_max(), 20_000);
+        metrics.record_age_at_output(1200);
+        metrics.record_age_at_output(800);
+        assert_eq!(metrics.age_at_output_p99(), Some(1200));
+        metrics.record_frame_received();
+        metrics.record_frame_received();
+        metrics.record_stale_dropped(3);
+        metrics.record_output_sent();
+        metrics.record_burst(1);
+        metrics.record_burst(4);
+        metrics.record_burst(2);
+        assert_eq!(metrics.frames_received, 2);
+        assert_eq!(metrics.stale_dropped, 3);
+        assert_eq!(metrics.outputs_sent, 1);
+        assert_eq!(metrics.frames_per_tick_max, 4);
+        let json = serde_json::to_string(&metrics).expect("metrics serialize");
+        assert!(json.contains("\"arrival_gap_p99_us\":20000"), "{json}");
+        assert!(json.contains("\"arrival_gap_max_us\":20000"), "{json}");
+        assert!(json.contains("\"age_at_output_p99_us\":1200"), "{json}");
+        assert!(json.contains("\"frames_received\":2"), "{json}");
+        assert!(json.contains("\"stale_dropped\":3"), "{json}");
+        assert!(json.contains("\"outputs_sent\":1"), "{json}");
+        assert!(json.contains("\"frames_per_tick_max\":4"), "{json}");
+    }
+
+    /// F4: the cached quintuple carries the two new p99s (and the
+    /// cache still refreshes after 100 ms — the cached values are
+    /// the fresh ones here because nothing was cached yet).
+    #[test]
+    fn f4_cached_p99s_include_arrival_gap_and_age() {
+        let mut metrics = EngineMetrics::new();
+        metrics.record_arrival_gap(6000);
+        metrics.record_age_at_output(900);
+        let (jitter, output, e2e, arrival_gap, age) = metrics.cached_p99s();
+        assert_eq!(jitter, None);
+        assert_eq!(output, None);
+        assert_eq!(e2e, None);
+        assert_eq!(arrival_gap, Some(6000));
+        assert_eq!(age, Some(900));
     }
 }

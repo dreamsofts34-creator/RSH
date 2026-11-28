@@ -631,7 +631,15 @@ mod tests {
             Ok(self.connection())
         }
         fn disconnect(&self) -> Result<ConnectionInfo, UserError> {
-            Ok(self.connection())
+            // F3 (v2.0.21): mirrors the real `DaemonApi::disconnect`
+            // contract — after a disconnect the info reports Idle /
+            // "Disconnected" with no active session, never the
+            // pre-disconnect Active state.
+            let mut info = self.connection();
+            info.state = ConnectionState::Idle;
+            info.label = "Disconnected".to_string();
+            info.session_active = false;
+            Ok(info)
         }
         fn wifi_status(&self) -> rsh_api::WifiStatus {
             rsh_api::WifiStatus {
@@ -752,6 +760,13 @@ mod tests {
                 jitter_ms_p99: Some(3.4),
                 output_latency_ms: None,
                 e2e_ms: None,
+                arrival_gap_ms_p99: Some(5.0),
+                arrival_gap_ms_max: 12.0,
+                age_at_output_ms_p99: Some(1.2),
+                frames_received: 1000,
+                stale_dropped: 2,
+                outputs_sent: 998,
+                frames_per_tick_max: 2,
                 seq_gap: 7,
                 tx_fail: 3,
                 ipc_p50_ms: None,
@@ -1066,6 +1081,37 @@ mod tests {
         assert_eq!(accept_error_delay(5), std::time::Duration::from_millis(500));
         assert_eq!(accept_error_delay(10), std::time::Duration::from_secs(1));
         assert_eq!(accept_error_delay(100), std::time::Duration::from_secs(1));
+    }
+
+    /// F3 (v2.0.21): the `disconnect` IPC method is plumbed
+    /// end-to-end — `{"v":2,"id":N,"method":"disconnect",
+    /// "params":{}}` routes to `AppApi::disconnect` and returns
+    /// the post-disconnect `ConnectionInfo` (Idle / "Disconnected",
+    /// no active session). The Frontend team's buttons call exactly
+    /// this method, with no parameters, for both Wi-Fi and USB.
+    #[test]
+    fn disconnect_round_trip_through_dispatch() {
+        let server = stub_server();
+        let resp = server
+            .handle_line(r#"{"v":2,"id":7,"method":"disconnect","params":{}}"#)
+            .expect("disconnect parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        assert_eq!(resp.id, 7);
+        let result = resp.result.expect("result");
+        assert_eq!(
+            result.get("state"),
+            Some(&serde_json::Value::String("Idle".to_string())),
+            "disconnect must report Idle, got {result}"
+        );
+        assert_eq!(
+            result.get("label"),
+            Some(&serde_json::Value::String("Disconnected".to_string()))
+        );
+        assert_eq!(
+            result.get("session_active"),
+            Some(&serde_json::Value::Bool(false)),
+            "no session may stay active after a disconnect: {result}"
+        );
     }
 
     #[test]

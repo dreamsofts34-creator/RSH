@@ -339,6 +339,12 @@ pub struct GameSummary {
     /// Id of the profile bound to this game, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_profile_id: Option<String>,
+    /// The last launch failure for this game (F2, v2.0.21): set
+    /// when a just-launched game closed immediately, so the UI can
+    /// show the error instead of the tile silently flipping back
+    /// to "not running". [`None`] otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_error: Option<String>,
 }
 
 /// The active profile's captured calibration, as the API reports it
@@ -453,6 +459,36 @@ pub struct DiagStats {
     /// End-to-end latency p99 in milliseconds (ping-derived).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub e2e_ms: Option<f64>,
+    /// Inter-arrival gap p99 in milliseconds (F4, v2.0.21 Phase 0):
+    /// the p99 gap between packet arrivals at the PC reader thread.
+    /// [`None`] until the daemon measures it — the acceptance bar
+    /// is p99 ≤ 6 ms. (The old `jitter_ms_p99` is board-timestamp
+    /// jitter, not network jitter — this is the PC-side measure.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrival_gap_ms_p99: Option<f64>,
+    /// Largest PC-side inter-arrival gap observed in milliseconds
+    /// (F4): the worst single stall. Acceptance: < 25 ms.
+    #[serde(default)]
+    pub arrival_gap_ms_max: f64,
+    /// Age-at-output p99 in milliseconds (F4, v2.0.21 Phase 0):
+    /// the p99 age of the frame the engine last wrote to the
+    /// output (PC arrival → `send_output`). [`None`] until the
+    /// daemon measures it — the acceptance bar is p99 ≤ 6 ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_at_output_ms_p99: Option<f64>,
+    /// Frames received by the engine (F4 `seqReceived`).
+    #[serde(default)]
+    pub frames_received: u64,
+    /// Frames dropped as stale (F4): duplicates + drain-cap drops.
+    #[serde(default)]
+    pub stale_dropped: u64,
+    /// Output sends (F4): states actually sent to the backend.
+    #[serde(default)]
+    pub outputs_sent: u64,
+    /// Largest burst in one engine tick (F4): most frames drained
+    /// in a single tick.
+    #[serde(default)]
+    pub frames_per_tick_max: u32,
     /// `seqGap` counter from the latest status packet.
     pub seq_gap: u64,
     /// `txFail` counter from the latest status packet.

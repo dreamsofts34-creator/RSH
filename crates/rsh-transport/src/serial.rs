@@ -95,6 +95,16 @@ const STATUS_CHANNEL_CAPACITY: usize = 16;
 const PING_CHANNEL_CAPACITY: usize = 8;
 /// Reader-thread sleep after a non-timeout read error (back-off).
 const READ_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+/// Serial HELO keepalive interval (F1, v2.0.21): the board marks the
+/// serial peer inactive 2000 ms after the last HELO (firmware
+/// `HELLO_TIMEOUT_MS`), so the transport sends a flag-0 (resume)
+/// HELO every 1 s — the same cadence as the UDP HELO thread — and
+/// the stream never stalls for a missing keepalive. The session
+/// layer still sends its own explicit flag-1 HELO for a new session.
+pub const SERIAL_HELO_INTERVAL: Duration = Duration::from_secs(1);
+/// HELO-loop sleep step: the loop wakes this often to notice
+/// shutdown promptly instead of sleeping a whole interval.
+const HELO_SLEEP_STEP: Duration = Duration::from_millis(50);
 
 /// Silicon Labs CP2102 VID — the ESP32 `DevKit V1` USB-UART bridge
 /// (protocol v2.2 §10.3).
@@ -150,6 +160,10 @@ struct AtomicCounters {
     /// Reader-thread panics caught by the `catch_unwind` guard (M6:
     /// a panicking reader must be visible in `counters()`, not silent).
     reader_panics: AtomicU64,
+    /// Flag-0 HELO keepalives sent by the HELO thread (F1).
+    helos_sent: AtomicU64,
+    /// HELO-thread panics caught by the `catch_unwind` guard (M6).
+    helo_panics: AtomicU64,
 }
 
 impl AtomicCounters {
@@ -180,6 +194,8 @@ impl AtomicCounters {
             status_received: load(&self.status_received),
             ping_received: load(&self.ping_received),
             reader_panics: load(&self.reader_panics),
+            helos_sent: load(&self.helos_sent),
+            helo_panics: load(&self.helo_panics),
         }
     }
 }
@@ -226,6 +242,10 @@ pub struct SerialCounters {
     pub ping_received: u64,
     /// Reader-thread panics caught by the `catch_unwind` guard (M6).
     pub reader_panics: u64,
+    /// Flag-0 HELO keepalives sent by the HELO thread (F1).
+    pub helos_sent: u64,
+    /// HELO-thread panics caught by the `catch_unwind` guard (M6).
+    pub helo_panics: u64,
 }
 
 /// Configuration for [`SerialTransport::open`].
@@ -297,6 +317,10 @@ pub struct SerialTransport {
     /// so a dead reader is observable instead of silent. Never
     /// joined — the thread is detached and exits on shutdown.
     reader_handle: Option<JoinHandle<()>>,
+    /// HELO-thread handle (F1, M6): polled by [`Self::helo_alive`]
+    /// so a dead keepalive thread is observable instead of silent.
+    /// Never joined — the thread is detached and exits on shutdown.
+    helo_handle: Option<JoinHandle<()>>,
 }
 
 impl fmt::Debug for SerialTransport {
@@ -348,9 +372,31 @@ impl SerialTransport {
             Arc::clone(&shutdown),
         )
         .map(|handle| reader_handle = Some(handle))?;
+        let port = Arc::new(Mutex::new(port));
+        // F1 (v2.0.21): the 1 Hz flag-0 HELO keepalive. Without it
+        // the board marks the serial peer inactive 2 s after the
+        // last HELO and stops emitting, so the stream died ~1 s
+        // after connect and only briefly revived on each rebuild.
+        let helo_handle = match spawn_helo(
+            Arc::clone(&port),
+            Arc::clone(&counters),
+            Arc::clone(&shutdown),
+        ) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                // DS-38 mirror: the reader thread is already
+                // running — a bare `?` here leaked it forever (the
+                // port Arc it holds keeps the thread alive,
+                // invisible to the caller that got the Err). Tear
+                // it down first: the reader exits within one read
+                // timeout (~100 ms) of the flag.
+                shutdown.store(true, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
         Ok(Self {
             port_name: config.port_name,
-            port: Arc::new(Mutex::new(port)),
+            port,
             frame_rx,
             control_rx,
             hello_rx,
@@ -359,6 +405,7 @@ impl SerialTransport {
             counters,
             shutdown,
             reader_handle,
+            helo_handle,
         })
     }
 
@@ -397,12 +444,25 @@ impl SerialTransport {
             .is_some_and(|handle| !handle.is_finished())
     }
 
+    /// `true` while the HELO keepalive thread is still running (F1,
+    /// M6 health check — poll this alongside
+    /// `counters().helo_panics`). A dead HELO thread means the board
+    /// stops emitting 2 s later, so this is a connect-health signal,
+    /// not trivia.
+    #[must_use]
+    pub fn helo_alive(&self) -> bool {
+        self.helo_handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+    }
+
     /// Send a HELO request (protocol §2.1) over the serial link,
     /// wrapped as an `RSHS` kind-6 frame. The session layer drives
-    /// this — there is no automatic HELO thread here, unlike the UDP
-    /// transport's 1 Hz HELO: over serial the session is opened on
-    /// demand (connect / reconnect), and the board's serial
-    /// session ends on HELO timeout.
+    /// this on demand (connect / reconnect) for its explicit
+    /// flag-1 new-session HELO — and a 1 Hz HELO thread (F1, see
+    /// [`Self::open`]) sends the flag-0 resume keepalive in the
+    /// background, mirroring the UDP transport, so the board's
+    /// 2 s serial HELO timeout never fires while the port is open.
     ///
     /// # Errors
     ///
@@ -777,6 +837,77 @@ fn spawn_reader(
             }
         })
         .map_err(TransportError::Io)
+}
+
+/// Spawn the HELO keepalive thread (F1, v2.0.21; detached, exits on
+/// shutdown). Sends a flag-0 (resume) HELO every
+/// [`SERIAL_HELO_INTERVAL`] so the board's 2 s serial HELO timeout
+/// never fires while the port is open — mirroring the UDP HELO
+/// thread. Returns the thread handle so the transport can poll its
+/// health (M6). A HELO panic is caught and counted in `helo_panics`
+/// instead of silently killing the keepalive.
+fn spawn_helo(
+    port: Arc<Mutex<Box<dyn SerialPort>>>,
+    counters: Arc<AtomicCounters>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<JoinHandle<()>, TransportError> {
+    // The payload is constant (flag 0, resume): encode once, reuse
+    // on every tick — the same shape as the UDP HELO thread.
+    let payload = HeloRequest::new_v2(0).encode();
+    Builder::new()
+        .name("rsh-serial-helo".to_owned())
+        .spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                helo_loop(
+                    || {
+                        write_frame_to(
+                            &port,
+                            &counters,
+                            &SerialFrame::new(SerialKind::Helo, payload.clone()),
+                        )
+                    },
+                    SERIAL_HELO_INTERVAL,
+                    &counters,
+                    &shutdown,
+                );
+            }));
+            if result.is_err() {
+                counters.helo_panics.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+        .map_err(TransportError::Io)
+}
+
+/// The HELO loop: send immediately, then once per `interval`.
+///
+/// `send` is a closure so the cadence is testable without a port:
+/// the production closure writes the flag-0 HELO frame to the
+/// shared port ([`write_frame_to`], which counts write failures in
+/// `send_errors`); a test closure records the send instants. A
+/// successful send is counted in `helos_sent`. The sleep between
+/// sends is stepped ([`HELO_SLEEP_STEP`]) so shutdown is noticed
+/// promptly instead of after a whole interval.
+fn helo_loop(
+    send: impl Fn() -> Result<(), TransportError>,
+    interval: Duration,
+    counters: &AtomicCounters,
+    shutdown: &AtomicBool,
+) {
+    while !shutdown.load(Ordering::Relaxed) {
+        // A failed send is already counted in `send_errors` by
+        // `write_frame_to`; the loop keeps trying on the next tick
+        // — a transient port error must not kill the keepalive.
+        if send().is_ok() {
+            counters.helos_sent.fetch_add(1, Ordering::Relaxed);
+        }
+        let deadline = Instant::now() + interval;
+        while Instant::now() < deadline {
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            thread::sleep(HELO_SLEEP_STEP);
+        }
+    }
 }
 
 /// The reader loop: `read`, feed the incremental decoder, demux the
@@ -1349,5 +1480,91 @@ mod tests {
         counters.dropped_overflow.store(1, Ordering::Relaxed);
         counters.dropped_unexpected.store(2, Ordering::Relaxed);
         assert_eq!(counters.snapshot().frames_dropped, 10);
+    }
+
+    /// F1 (v2.0.21): the HELO loop sends immediately and then once
+    /// per interval — at 100 ms intervals, ~260 ms of running must
+    /// produce at least the immediate send plus two interval sends,
+    /// and no send may land after shutdown is set. The recording
+    /// closure stands in for the port write, so no hardware is
+    /// needed. (Regression test for the ~1 s USB drop: without this
+    /// loop the board stops emitting 2 s after the last HELO.)
+    #[test]
+    fn helo_loop_sends_immediately_then_per_interval() {
+        let counters = Arc::new(AtomicCounters::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let sends = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let sends_clone = Arc::clone(&sends);
+        let counters_clone = Arc::clone(&counters);
+        let shutdown_clone = Arc::clone(&shutdown);
+        let handle = thread::spawn(move || {
+            helo_loop(
+                || {
+                    sends_clone.lock().unwrap().push(Instant::now());
+                    Ok(())
+                },
+                Duration::from_millis(100),
+                &counters_clone,
+                &shutdown_clone,
+            );
+        });
+        thread::sleep(Duration::from_millis(260));
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().expect("helo loop thread joins");
+        let sends = sends.lock().unwrap();
+        assert!(
+            sends.len() >= 3,
+            "expected immediate + 2 interval sends in 260 ms, got {}",
+            sends.len()
+        );
+        assert_eq!(counters.snapshot().helos_sent, sends.len() as u64);
+        // Cadence: consecutive sends ~100 ms apart (generous bounds
+        // — a loaded CI runner may sleep late, but a 2× slip is a
+        // real bug, not jitter).
+        for pair in sends.windows(2) {
+            let gap = pair[1].duration_since(pair[0]);
+            assert!(
+                gap >= Duration::from_millis(50) && gap <= Duration::from_millis(250),
+                "helo gap {gap:?} outside 50–250 ms"
+            );
+        }
+    }
+
+    /// F1: a failing send (dead port) does not kill the loop — the
+    /// next tick retries, and `helos_sent` stays 0 while the error
+    /// is counted by the writer (here: not at all, the closure owns
+    /// the error). A keepalive that dies on the first transient
+    /// error would reproduce the original drop.
+    #[test]
+    fn helo_loop_retries_after_send_failure() {
+        let counters = Arc::new(AtomicCounters::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicU64::new(0));
+        let attempts_clone = Arc::clone(&attempts);
+        let counters_clone = Arc::clone(&counters);
+        let shutdown_clone = Arc::clone(&shutdown);
+        let handle = thread::spawn(move || {
+            helo_loop(
+                || {
+                    attempts_clone.fetch_add(1, Ordering::Relaxed);
+                    Err(TransportError::Io(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "dead port",
+                    )))
+                },
+                Duration::from_millis(50),
+                &counters_clone,
+                &shutdown_clone,
+            );
+        });
+        thread::sleep(Duration::from_millis(160));
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().expect("helo loop thread joins");
+        assert!(
+            attempts.load(Ordering::Relaxed) >= 3,
+            "loop must retry after failures, got {} attempts",
+            attempts.load(Ordering::Relaxed)
+        );
+        assert_eq!(counters.snapshot().helos_sent, 0);
     }
 }

@@ -497,6 +497,17 @@ fn default_scale() -> f64 {
     1.0
 }
 
+/// Factory default steering scale for a NEW profile (v2.0.21 P2):
+/// 0.4 = 360° lock — 900° felt unresponsive in FH4 and 360° is the
+/// road-car sweet spot for arcade/simcade. This is deliberately
+/// separate from [`default_scale`] (the serde default): an old
+/// profile file without `steering_scale` still loads as full lock
+/// (1.0), so existing stored profiles are untouched — only profiles
+/// created from now on start at 360°.
+fn default_steering_scale() -> f64 {
+    0.4
+}
+
 fn default_true() -> bool {
     true
 }
@@ -531,8 +542,12 @@ fn default_log_level() -> String {
 /// which fail the store's own validation, and `AppSettings::default()`
 /// had an empty `theme`/`esp_ip`. `Default` must match the documented
 /// serde defaults above, so a freshly created profile/settings is
-/// valid without a JSON round-trip. (Struct-update syntax
-/// `..Default::default()` would recurse, so every field is listed.)
+/// valid without a JSON round-trip — with ONE deliberate exception:
+/// `WheelProfile::default` uses [`default_steering_scale`] (0.4 =
+/// 360°, the v2.0.21 factory default) while the serde default stays
+/// 1.0, so old profile files without the field still load as full
+/// lock. (Struct-update syntax `..Default::default()` would recurse,
+/// so every field is listed.)
 impl Default for PerModuleTuning {
     fn default() -> Self {
         Self {
@@ -590,7 +605,7 @@ impl Default for WheelProfile {
             gear_down_vjoy_button: default_gear_down_button(),
             pedal_press_ms: default_pedal_press_ms(),
             pedal_release_ms: default_pedal_release_ms(),
-            steering_scale: default_scale(),
+            steering_scale: default_steering_scale(),
             // --- Steering per-module tuning ---
             steering_balance_pct: 0.0,
             steering_center_trim_pct: 0.0,

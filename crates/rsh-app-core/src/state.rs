@@ -363,6 +363,13 @@ pub struct GameInfo {
     pub running: bool,
     /// True when the game exe was found on disk.
     pub installed: bool,
+    /// The last launch failure for this game (F2, v2.0.21): set
+    /// when a just-launched game closed immediately, so the UI can
+    /// show the error instead of the tile silently flipping back
+    /// to "not running". [`None`] otherwise — a game that never
+    /// failed to launch, or whose failure was already shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_error: Option<String>,
 }
 
 /// Calibration, as the frontend's `Calibration` shape consumes it.
@@ -4096,6 +4103,16 @@ impl AppStateCore {
             jitter_ms_p99: stats.jitter_ms_p99,
             output_latency_ms: stats.output_latency_ms,
             e2e_ms: stats.e2e_ms,
+            // F4 (v2.0.21): the Phase 0 PC-side instrumentation —
+            // the loss split is `loss_pct` (PC window) against
+            // `seq_gap` / `tx_fail` (board counters) below.
+            arrival_gap_ms_p99: stats.arrival_gap_ms_p99,
+            arrival_gap_ms_max: stats.arrival_gap_ms_max,
+            age_at_output_ms_p99: stats.age_at_output_ms_p99,
+            frames_received: stats.frames_received,
+            stale_dropped: stats.stale_dropped,
+            outputs_sent: stats.outputs_sent,
+            frames_per_tick_max: stats.frames_per_tick_max,
             seq_gap: snapshot.seq_gap,
             tx_fail: snapshot.tx_fail,
             // DS-82: the core does not know the IPC latency — only
@@ -4902,14 +4919,21 @@ impl AppStateCore {
         // supervisor has not processed the abort yet.)
         self.forwarder_retry_wait.store(0, Ordering::SeqCst);
         self.forwarder_breaker_open.store(false, Ordering::SeqCst);
+        // F3 (v2.0.21): the local state lands BEFORE the fallible
+        // engine command below — a dead or never-started engine must
+        // not leave a stuck Connected/Connecting report behind (the
+        // C-02 defence would otherwise downgrade it to Connecting
+        // forever, with no forwarder left to ever complete). The
+        // send error is still returned so the caller knows the
+        // engine never got the message.
+        self.set_connection(ConnectionState::Disconnected);
+        // DS-27: a disconnect invalidates the cached board port.
+        self.rescan_board_port();
         let tx = lock(&self.engine_cmd_tx)
             .clone()
             .ok_or_else(|| "engine is not running".to_string())?;
         tx.try_send(EngineCommand::Disconnect)
             .map_err(|error| format!("could not queue transport disconnect: {error}"))?;
-        self.set_connection(ConnectionState::Disconnected);
-        // DS-27: a disconnect invalidates the cached board port.
-        self.rescan_board_port();
         Ok(())
     }
 
@@ -6255,18 +6279,50 @@ impl AppStateCore {
     #[must_use]
     pub fn list_games(&self) -> Vec<GameInfo> {
         let games = lock(&self.manual_games).list().to_vec();
-        let mut launcher = lock(&self.launcher);
-        let _ = launcher.refresh();
-        let running_id = launcher.running().map(|running| running.game_id.clone());
+        let (running_id, closed, notes) = {
+            let mut launcher = lock(&self.launcher);
+            let _ = launcher.refresh();
+            (
+                launcher.running().map(|running| running.game_id.clone()),
+                launcher.take_closed_immediately(),
+                launcher.take_launch_notes(),
+            )
+        };
+        // F2 (v2.0.21): a just-launched game that turned out to
+        // have no live process at all surfaces here — in the
+        // daemon log, as a `game-state` event, and on the game's
+        // own list row (`launch_error`) so the UI can show the
+        // `game_closed_immediately` error instead of the tile
+        // silently flipping back to "not running".
+        for note in notes {
+            self.push_connection_log("info", &note);
+        }
+        if let Some((game_id, detail)) = &closed {
+            self.push_connection_log(
+                "warn",
+                &format!("game '{game_id}' closed immediately after launch: {detail}"),
+            );
+            self.queue_app_event(
+                GAME_STATE_EVENT,
+                serde_json::json!({ "gameId": game_id, "state": "closed_immediately" }),
+            );
+        }
         games
             .into_iter()
-            .map(|game| GameInfo {
-                id: game.id.clone(),
-                name: game.name.clone(),
-                exe_path: game.exe_path.clone(),
-                bound_profile_id: game.bound_profile_id.clone(),
-                running: running_id.as_deref() == Some(game.id.as_str()),
-                installed: Path::new(&game.exe_path).is_file(),
+            .map(|game| {
+                let launch_error = match &closed {
+                    Some((closed_id, detail)) if *closed_id == game.id => Some(detail.clone()),
+                    _ => None,
+                };
+                GameInfo {
+                    id: game.id.clone(),
+                    name: game.name.clone(),
+                    exe_path: game.exe_path.clone(),
+                    bound_profile_id: game.bound_profile_id.clone(),
+                    running: running_id.as_deref() == Some(game.id.as_str()),
+                    installed: Path::new(&game.exe_path).is_file(),
+                    launch_error,
+                }
             })
             .collect()
     }
@@ -6303,7 +6359,7 @@ impl AppStateCore {
     /// Returns a message when the game is unknown, not installed,
     /// another game is already running, or the OS refuses to start it.
     pub fn launch_game(&self, id: &str) -> Result<GameInfo, String> {
-        use crate::launcher::LaunchError;
+        use crate::launcher::{LaunchError, PostGrace};
         let game = lock(&self.manual_games)
             .get(id)
             .cloned()
@@ -6332,6 +6388,38 @@ impl AppStateCore {
                         format!("game launch is not supported on this platform: {detail}")
                     }
                 })?;
+        }
+        // F2 (v2.0.21) post-grace verification: the launch
+        // succeeded, but when the tracked pid is already dead the
+        // "success" may be a helper that exited (or a process whose
+        // image was unreadable) — wait out the grace for the real
+        // game to appear under another pid instead of reporting
+        // success for a game that never runs. Healthy launches
+        // (tracked pid alive) skip this entirely. The wait polls
+        // without holding the launcher lock: each 100 ms tick locks
+        // briefly for one `post_grace_poll`. Bounded at ~10 s
+        // (grace is 5 s) so a stuck clock cannot hang the launch;
+        // the refresh path still surfaces a late failure through
+        // `list_games`.
+        let tracked_dead = {
+            let launcher = lock(&self.launcher);
+            launcher.tracked_pid_dead()
+        };
+        if tracked_dead {
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                let outcome = {
+                    let mut launcher = lock(&self.launcher);
+                    launcher.post_grace_poll()
+                };
+                match outcome {
+                    PostGrace::Running => break,
+                    PostGrace::Waiting => {}
+                    PostGrace::ClosedImmediately(detail) => {
+                        return Err(format!("failed to launch game: {detail}"));
+                    }
+                }
+            }
         }
         // H4: capture the pre-game profile for the stop-time restore.
         let pre_game = lock(&self.store).active().map(|active| active.id.clone());
@@ -6667,9 +6755,10 @@ impl AppStateCore {
 
     /// The tuning for one module: the session's validated tuning when
     /// one was set, else the active profile's stored tuning converted
-    /// to the frontend shape, else the neutral default (deadzone 0,
-    /// linear curve, full 0–3300 mV span, no smoothing). Nothing here
-    /// is invented data — the default is the documented neutral tuning.
+    /// to the frontend shape, else the factory default (deadzone 2%
+    /// — v2.0.21 P2: kills pot idle drift on noisy 50k pots — linear
+    /// curve, full 0–3300 mV span, no smoothing). Nothing here is
+    /// invented data — the default is the documented factory tuning.
     /// The module id is canonicalized first (C-MOD-1: `"accel"` →
     /// `"accelerator"`), so a caller using either spelling reads the
     /// same tuning. The extended fields (C-TUNE-1: min/max mV, bite
@@ -6721,7 +6810,11 @@ impl AppStateCore {
         let is_clutch = module == "clutch";
         TuningSettings {
             module,
-            deadzone: 0.0,
+            // v2.0.21 P2: 2% deadzone kills pot idle drift (the old
+            // 0% let a noisy 50k pot wander off-centre); the engine's
+            // `ModuleTuning::default` already uses 0.02, so the
+            // fresh-branch default finally agrees with it.
+            deadzone: 2.0,
             curve,
             min_mv: 0.0,
             max_mv: 3300.0,
@@ -8173,8 +8266,9 @@ impl SessionTransport for SerialTransport {
     }
 
     fn request_hello(&mut self, session_flag: u8) -> Result<(), String> {
-        // Serial has no automatic HELO thread: the session layer
-        // drives HELO on demand (connect / pair / reconnect).
+        // One-shot HELO: the 1 Hz HELO thread always sends flag 0
+        // (resume), so a new session needs this explicit flag-1 HELO
+        // — same shape as the UDP transport (F1, v2.0.21).
         self.send_helo(session_flag)
             .map_err(|error| error.to_string())
     }
@@ -11006,9 +11100,11 @@ mod tests {
     #[test]
     fn tuning_validates_stores_and_falls_back_to_neutral() {
         let (state, _dir) = test_state();
-        // Neutral default for a module with no tuning anywhere.
+        // Factory default for a module with no tuning anywhere
+        // (v2.0.21 P2: 2% deadzone, linear curve, full span, no
+        // smoothing).
         let neutral = state.get_tuning("steering");
-        assert_eq!(neutral.deadzone, 0.0);
+        assert_eq!(neutral.deadzone, 2.0);
         assert_eq!(neutral.curve, 1.0);
         assert_eq!(neutral.max_mv, 3300.0);
         // Invalid tuning is rejected, never stored.
@@ -11016,7 +11112,7 @@ mod tests {
         bad.module = "brake".to_string();
         bad.deadzone = 99.0;
         assert!(state.set_tuning(&bad).is_err());
-        assert_eq!(state.get_tuning("brake").deadzone, 0.0);
+        assert_eq!(state.get_tuning("brake").deadzone, 2.0);
         // Valid tuning stores, survives a get, and lands in the draft
         // (L4) — NOT in the stored profile: a fresh store over the
         // same dir still sees the old tuning until Save.
@@ -11177,10 +11273,11 @@ mod tests {
             "refused switch stays on the old profile"
         );
 
-        // …Discard reverts the live tuning and frees the switch.
+        // …Discard reverts the live tuning and frees the switch —
+        // the brake falls back to the factory default (deadzone 2%).
         assert!(state.discard_draft());
         assert!(!state.draft_dirty());
-        assert_eq!(state.get_tuning("brake").deadzone, 0.0);
+        assert_eq!(state.get_tuning("brake").deadzone, 2.0);
         assert_eq!(state.get_tuning("brake").bite_point, None);
         assert_eq!(state.get_tuning("brake").saturation, None);
         state
@@ -11227,10 +11324,11 @@ mod tests {
     fn pipeline_plan_carries_draft_tuning_and_bite_point() {
         let (state, _dir) = test_state();
         let _ = activate_first_profile(&state);
-        // Default plan: clutch disabled, neutral steering.
+        // Default plan: clutch disabled, neutral steering (v2.0.21
+        // P2: the factory deadzone is 2%, i.e. 0.02 as a fraction).
         let plan = state.build_pipeline_plan();
         assert!(!plan.clutch.enabled);
-        assert_eq!(plan.steering.deadzone, 0.0);
+        assert_eq!(plan.steering.deadzone, 0.02);
         // --- Brake per-module tuning ---
         // Default plan: saturation 1.0 (full travel = full brake).
         assert!((plan.brake.saturation - 1.0).abs() < f32::EPSILON);
@@ -11295,23 +11393,29 @@ mod tests {
     fn pedal_ramps_and_combined_pedals_round_trip_to_plan() {
         let (state, _dir) = test_state();
         let _ = activate_first_profile(&state);
-        // Task defaults on a fresh profile: accel 100/50, brake
-        // press 50, clutch release 300, combined off.
+        // Task defaults on a fresh profile (v2.0.21 F7/P2): accel
+        // 100/50, brake press 0 (instant) / release 50, clutch
+        // press 50 / release 300, combined off.
         let accel = state.get_tuning("accelerator");
         assert_eq!(accel.press_ms, Some(100.0));
         assert_eq!(accel.release_ms, Some(50.0));
         assert_eq!(accel.combine_pedals, Some(false));
-        assert_eq!(state.get_tuning("brake").press_ms, Some(50.0));
+        assert_eq!(state.get_tuning("brake").press_ms, Some(0.0));
+        assert_eq!(state.get_tuning("brake").release_ms, Some(50.0));
+        assert_eq!(state.get_tuning("clutch").press_ms, Some(50.0));
         assert_eq!(state.get_tuning("clutch").release_ms, Some(300.0));
         let plan = state.build_pipeline_plan();
         assert!((plan.accelerator.press_ms - 100.0).abs() < f32::EPSILON);
         assert!((plan.accelerator.release_ms - 50.0).abs() < f32::EPSILON);
-        assert!((plan.brake.press_ms - 50.0).abs() < f32::EPSILON);
+        assert!((plan.brake.press_ms - 0.0).abs() < f32::EPSILON);
+        assert!((plan.brake.release_ms - 50.0).abs() < f32::EPSILON);
+        assert!((plan.clutch.press_ms - 50.0).abs() < f32::EPSILON);
         assert!((plan.clutch.release_ms - 300.0).abs() < f32::EPSILON);
         assert!(!plan.combine_pedals);
-        // A side with no per-module ramp keeps the global (150/100).
-        assert!((plan.brake.release_ms - 100.0).abs() < f32::EPSILON);
-        assert!((plan.clutch.press_ms - 150.0).abs() < f32::EPSILON);
+        // A module with no per-module ramp (steering) keeps the
+        // profile's global ramp (150/100).
+        assert!((plan.steering.press_ms - 150.0).abs() < f32::EPSILON);
+        assert!((plan.steering.release_ms - 100.0).abs() < f32::EPSILON);
         // Edit: brake press 200, clutch release 800, combined on —
         // all land in the plan and read back.
         let mut brake = state.get_tuning("brake");
@@ -11336,8 +11440,9 @@ mod tests {
 
     /// Bug 7 (PC-test fix): steering invert + lock round-trip —
     /// `get_tuning` reports the profile defaults (not inverted,
-    /// 900°), a `set_tuning` with invert + 540° lock lands in the
-    /// live plan (inverted, scale 0.6), and a Save persists both
+    /// 360° — v2.0.21 P2 factory default), a `set_tuning` with
+    /// invert + 540° lock lands in the live plan (inverted, scale
+    /// 0.6), and a Save persists both
     /// fields so a reopened store reads them back.
     #[test]
     fn steering_invert_and_lock_round_trip_through_plan_and_store() {
@@ -11347,8 +11452,8 @@ mod tests {
         assert_eq!(tuning.invert, Some(false), "default is not inverted");
         assert_eq!(
             tuning.steering_lock_deg,
-            Some(900.0),
-            "default is full lock"
+            Some(360.0),
+            "default is the 360° factory lock (v2.0.21 P2)"
         );
         let mut steering = tuning;
         steering.invert = Some(true);
@@ -11381,9 +11486,10 @@ mod tests {
     /// Steering per-module tuning (S2+S3): balance + centre trim
     /// round-trip — `get_tuning` reports the profile defaults
     /// (even, untrimmed), a `set_tuning` with +20% balance and
-    /// −4% trim lands in the live plan (left scale 0.8, right
-    /// scale clamped to 1.0, centre shifted by −4% of the
-    /// half-span), and a Save persists both.
+    /// −4% trim lands in the live plan (left scale 0.32, right
+    /// scale 0.48 — base is the 0.4 factory lock, v2.0.21 P2 —
+    /// centre shifted by −4% of the half-span), and a Save persists
+    /// both.
     #[test]
     fn steering_balance_and_trim_round_trip_through_plan_and_store() {
         let (state, dir) = test_state();
@@ -11403,12 +11509,12 @@ mod tests {
             .expect("set steering balance+trim");
         let plan = state.build_pipeline_plan();
         assert!(
-            (plan.steering.scale_left - 0.8).abs() < f32::EPSILON,
-            "balance +20% → left scale 0.8 (base 1.0)"
+            (plan.steering.scale_left - 0.32).abs() < f32::EPSILON,
+            "balance +20% → left scale 0.32 (base 0.4)"
         );
         assert!(
-            (plan.steering.scale_right - 1.0).abs() < f32::EPSILON,
-            "balance +20% → right scale clamps to 1.0"
+            (plan.steering.scale_right - 0.48).abs() < f32::EPSILON,
+            "balance +20% → right scale 0.48 (base 0.4)"
         );
         assert_eq!(
             plan.steering.center_mv, 1734,
@@ -13225,6 +13331,30 @@ mod tests {
         state.start_engine().expect("second start is a no-op");
         let outcome = state.stop_engine();
         assert!(outcome.joined, "engine stops bounded");
+    }
+
+    /// F3 (v2.0.21): disconnect with no engine running still lands
+    /// the local state — the send fails honestly ("engine is not
+    /// running"), but the connection must report Disconnected, not
+    /// a stuck Connecting (the C-02 defence would otherwise hold
+    /// it there forever, with no forwarder left to complete).
+    #[test]
+    fn disconnect_without_engine_still_reports_disconnected() {
+        let (state, _dir) = test_state();
+        state.set_connection(ConnectionState::Connected);
+        let err = state
+            .disconnect_transport()
+            .expect_err("no engine to queue to");
+        assert!(
+            err.contains("engine is not running"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            state.transport_state().state,
+            ConnectionState::Disconnected,
+            "disconnect without an engine must still land Disconnected"
+        );
+        assert!(!state.session_gate_open(), "gate stays closed");
     }
 
     #[test]

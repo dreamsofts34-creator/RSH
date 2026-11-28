@@ -50,6 +50,13 @@ use std::time::Duration;
 /// refreshes inside this window never clear a just-launched game.
 const LAUNCH_GRACE: Duration = Duration::from_secs(5);
 
+/// How long after the launch grace expires a cleared record still
+/// counts as "closed immediately" (F2, v2.0.21): a game that is
+/// gone within grace + this window failed to start and the UI must
+/// say so; a game the user played and then closed is a normal
+/// exit and clears silently.
+const CLOSED_IMMEDIATELY_WINDOW_SECS: u64 = 30;
+
 /// Unix seconds now (0 on a clock failure — never panics).
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
@@ -121,6 +128,17 @@ pub struct RunningGame {
     /// liveness-only for unresolved shortcuts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_exe_path: Option<String>,
+    /// The exe image the game itself is expected to run as (F2,
+    /// v2.0.21): the stored exe for a plain launch, the shortcut's
+    /// target exe for a `.lnk` launch. This is what the post-grace
+    /// verification searches for — `resolved_exe_path` is the
+    /// image the *tracked pid* runs, which is a helper's image
+    /// when the tracked pid is a launcher stub, so it cannot be
+    /// the search key. [`None`] on records built before v2.0.21
+    /// (the search then falls back to `exe_path` for plain
+    /// launches, and is skipped for shortcuts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_exe_path: Option<String>,
     /// Unix seconds when the game was launched.
     pub started_unix_secs: u64,
 }
@@ -168,6 +186,29 @@ pub trait ProcessSpawner {
     fn exe_path(&self, _pid: u32) -> Option<PathBuf> {
         None
     }
+
+    /// Exit code of a pid that has already died, when the spawner
+    /// can determine it (F2, v2.0.21): `None` when the pid is still
+    /// alive, the code is unreadable, or the spawner cannot answer.
+    /// A nonzero code proves the game itself failed to start — the
+    /// settle check uses it when the dead pid's image could not be
+    /// read at all (the process died between spawn and the first
+    /// image query). The default returns `None` — a spawner that
+    /// cannot answer leaves the launch checks unchanged.
+    fn exit_code(&self, _pid: u32) -> Option<u32> {
+        None
+    }
+
+    /// Pid of a live process running the given exe image, when the
+    /// spawner can determine it (F2 post-grace verification: the
+    /// tracked pid may be a helper that exited while the real game
+    /// runs under a different pid — Store apps and launcher stubs
+    /// do exactly this). The default returns `None` — a spawner
+    /// that cannot answer leaves the tracked-pid-only checks
+    /// unchanged.
+    fn find_process_with_image(&self, _exe: &Path) -> Option<u32> {
+        None
+    }
 }
 
 #[cfg(windows)]
@@ -202,6 +243,47 @@ mod win32 {
         pub fn ShellExecuteExW(info: *mut ShellExecuteInfoW) -> i32;
         /// Returns the pid for a process handle, or 0 on failure.
         pub fn GetProcessId(process: Handle) -> u32;
+        /// Takes a snapshot of the processes; returns
+        /// `INVALID_HANDLE_VALUE` (-1) on failure.
+        pub fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> Handle;
+        /// Reads the first process from a snapshot; returns
+        /// non-zero on success.
+        pub fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
+        /// Reads the next process from a snapshot; returns
+        /// non-zero on success.
+        pub fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
+    }
+
+    /// `TH32CS_SNAPPROCESS` (0x2): snapshot all processes.
+    pub const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    /// `INVALID_HANDLE_VALUE` (-1): failed snapshot handle.
+    pub const INVALID_HANDLE_VALUE: Handle = -1;
+
+    /// `PROCESSENTRY32W` (partial: only `dwSize` and
+    /// `th32ProcessID` are read; `szExeFile` is present so the
+    /// layout matches the real struct).
+    #[repr(C)]
+    pub struct ProcessEntry32W {
+        /// Size of this struct, in bytes (must be set by the caller).
+        pub dw_size: u32,
+        /// Usage count (unused).
+        pub cnt_usage: u32,
+        /// Process id.
+        pub th32_process_id: u32,
+        /// Default heap id (unused).
+        pub th32_default_heap_id: usize,
+        /// Module id (unused).
+        pub th32_module_id: u32,
+        /// Thread count (unused).
+        pub cnt_threads: u32,
+        /// Parent process id (unused).
+        pub th32_parent_process_id: u32,
+        /// Base priority (unused).
+        pub pc_pri_class_base: i32,
+        /// Flags (unused).
+        pub dw_flags: u32,
+        /// Exe file name (unused — the image is queried per pid).
+        pub sz_exe_file: [u16; 260],
     }
 
     /// `PROCESS_QUERY_LIMITED_INFORMATION` (0x1000).
@@ -656,6 +738,125 @@ impl ProcessSpawner for SystemSpawner {
             std::fs::read_link(Path::new("/proc").join(pid.to_string()).join("exe")).ok()
         }
     }
+
+    fn exit_code(&self, pid: u32) -> Option<u32> {
+        #[cfg(windows)]
+        {
+            // SAFETY: plain Win32 query with checked returns; the
+            // handle is always closed. `STILL_ACTIVE` (259) means
+            // the process is alive — that is "no code", not a code.
+            unsafe {
+                let handle = win32::OpenProcess(win32::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                if handle == 0 {
+                    return None;
+                }
+                let mut code: u32 = 0;
+                let ok = win32::GetExitCodeProcess(handle, &raw mut code);
+                win32::CloseHandle(handle);
+                if ok == 0 || code == win32::STILL_ACTIVE {
+                    None
+                } else {
+                    Some(code)
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            // `/proc/<pid>/stat`: `pid (comm) state … exit_code`
+            // (field 52, last). Only a zombie (`Z`) has a real
+            // code — a live process reports 0, which is "no code".
+            let stat =
+                std::fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat"))
+                    .ok()?;
+            let after_comm = stat.rfind(')')?;
+            let fields: Vec<&str> = stat[after_comm + 1..].split_whitespace().collect();
+            // fields[0] is the state (field 3); exit_code is
+            // field 52, i.e. index 49 after the closing paren.
+            if fields.first() != Some(&"Z") {
+                return None;
+            }
+            let code: i32 = fields.get(49)?.parse().ok()?;
+            u32::try_from(code).ok()
+        }
+    }
+
+    fn find_process_with_image(&self, exe: &Path) -> Option<u32> {
+        #[cfg(windows)]
+        {
+            // SAFETY: plain Win32 snapshot enumeration with checked
+            // returns; every handle is closed. The snapshot lists
+            // pids; each pid's image is queried and compared
+            // case-insensitively (see `paths_equal`).
+            unsafe {
+                let snapshot = win32::CreateToolhelp32Snapshot(win32::TH32CS_SNAPPROCESS, 0);
+                if snapshot == win32::INVALID_HANDLE_VALUE {
+                    return None;
+                }
+                let mut entry = win32::ProcessEntry32W {
+                    dw_size: u32::try_from(std::mem::size_of::<win32::ProcessEntry32W>())
+                        .unwrap_or(u32::MAX),
+                    cnt_usage: 0,
+                    th32_process_id: 0,
+                    th32_default_heap_id: 0,
+                    th32_module_id: 0,
+                    cnt_threads: 0,
+                    th32_parent_process_id: 0,
+                    pc_pri_class_base: 0,
+                    dw_flags: 0,
+                    sz_exe_file: [0; 260],
+                };
+                let mut found = None;
+                let mut ok = win32::Process32FirstW(snapshot, &raw mut entry);
+                while ok != 0 {
+                    let pid = entry.th32_process_id;
+                    if pid != 0 {
+                        if let Some(image) = self.exe_path(pid) {
+                            if paths_equal(&image, exe) {
+                                found = Some(pid);
+                                break;
+                            }
+                        }
+                    }
+                    ok = win32::Process32NextW(snapshot, &raw mut entry);
+                }
+                win32::CloseHandle(snapshot);
+                found
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            // `/proc` scan: the exe symlink of each numeric pid.
+            let entries = std::fs::read_dir("/proc").ok()?;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Ok(pid) = name.to_string_lossy().parse::<u32>() else {
+                    continue;
+                };
+                if let Some(image) = self.exe_path(pid)
+                    && paths_equal(&image, exe)
+                {
+                    return Some(pid);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Outcome of one post-grace verification poll (F2, v2.0.21) —
+/// see [`GameLauncher::post_grace_poll`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PostGrace {
+    /// The game runs: the tracked pid is alive, or the record
+    /// re-attached to the real game's pid.
+    Running,
+    /// Still inside the launch grace: the tracked pid is dead but
+    /// the real game may still appear — poll again.
+    Waiting,
+    /// The grace expired and no live process runs the expected
+    /// image (carries the detail for the `game_closed_immediately`
+    /// error).
+    ClosedImmediately(String),
 }
 
 /// Launches and tracks games: exactly one at a time.
@@ -673,6 +874,16 @@ pub struct GameLauncher<S: ProcessSpawner> {
     /// How long after a launch a dead pid is given the benefit of
     /// the doubt (see [`LAUNCH_GRACE`]).
     grace: Duration,
+    /// A game the post-grace check found closed at once (F2,
+    /// v2.0.21): `(game_id, detail)` — drained by the app layer
+    /// via [`Self::take_closed_immediately`] so the UI can show
+    /// the `game_closed_immediately` error instead of the tile
+    /// silently flipping back to "not running".
+    closed_immediately: Option<(String, String)>,
+    /// Human-readable notes from the last launch / refresh (F2):
+    /// exit codes, re-attachments. Drained via
+    /// [`Self::take_launch_notes`] into the daemon log.
+    launch_notes: Vec<String>,
 }
 
 impl<S: ProcessSpawner> GameLauncher<S> {
@@ -692,6 +903,8 @@ impl<S: ProcessSpawner> GameLauncher<S> {
             running: None,
             settle,
             grace,
+            closed_immediately: None,
+            launch_notes: Vec::new(),
         }
     }
 
@@ -706,6 +919,68 @@ impl<S: ProcessSpawner> GameLauncher<S> {
     #[must_use]
     pub fn running(&self) -> Option<&RunningGame> {
         self.running.as_ref()
+    }
+
+    /// Drains the pending closed-immediately report (F2): the
+    /// `(game_id, detail)` the post-grace check recorded when a
+    /// just-launched game turned out to have no live process at
+    /// all. [`None`] when nothing was recorded since the last drain.
+    #[must_use]
+    pub fn take_closed_immediately(&mut self) -> Option<(String, String)> {
+        self.closed_immediately.take()
+    }
+
+    /// Drains the launch / refresh notes since the last drain (F2):
+    /// exit codes, re-attachments — the app layer logs these.
+    #[must_use]
+    pub fn take_launch_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.launch_notes)
+    }
+
+    /// True when a game is tracked AND its pid is already dead
+    /// (F2): the launch succeeded only because the pid is a helper
+    /// or its image was unreadable — the app layer waits out the
+    /// grace for the real game to appear instead of reporting
+    /// success for a game that never runs.
+    #[must_use]
+    pub fn tracked_pid_dead(&self) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|running| !self.spawner.is_alive(running.pid))
+    }
+
+    /// One post-grace verification poll (F2): no sleeping, so the
+    /// caller can poll on its own cadence without holding the
+    /// launcher lock across the wait. Inside the grace window a
+    /// dead tracked pid is still [`PostGrace::Waiting`]; once the
+    /// grace expires this reuses [`Self::refresh`]'s verification
+    /// (re-attach to the real game, or clear + record
+    /// closed-immediately).
+    #[must_use]
+    pub fn post_grace_poll(&mut self) -> PostGrace {
+        let Some(running) = self.running.as_ref() else {
+            return PostGrace::ClosedImmediately("no game is running".to_string());
+        };
+        if self.spawner.is_alive(running.pid) {
+            return PostGrace::Running;
+        }
+        let now = now_unix_secs();
+        if now
+            < running
+                .started_unix_secs
+                .saturating_add(self.grace.as_secs())
+        {
+            return PostGrace::Waiting;
+        }
+        match self.refresh() {
+            Some(_) => PostGrace::Running,
+            None => match self.take_closed_immediately() {
+                Some((_, detail)) => PostGrace::ClosedImmediately(detail),
+                None => {
+                    PostGrace::ClosedImmediately("game closed immediately after launch".to_string())
+                }
+            },
+        }
     }
 
     /// Launches a manually added game.
@@ -774,7 +1049,7 @@ impl<S: ProcessSpawner> GameLauncher<S> {
         // this; without it every shortcut game was marked "not
         // running" within ~1 s of launch (the resolved image never
         // equals the stored `.lnk` path).
-        let resolved_exe_path = self
+        let mut resolved_exe_path = self
             .spawner
             .exe_path(pid)
             .map(|path| path.to_string_lossy().into_owned());
@@ -783,16 +1058,49 @@ impl<S: ProcessSpawner> GameLauncher<S> {
         // when the dead pid *is* the game. A helper that spawned the
         // real game and exited is the normal case for some
         // shortcuts; its image never matches the expected target.
+        //
+        // F2 (v2.0.21): the v2.0.13 check queried the image ONCE,
+        // immediately after spawn — a process that died in that
+        // gap answered `None`, read as "helper", and the launch
+        // recorded success while nothing was running. So the image
+        // is re-queried on every 100 ms poll while the pid is
+        // alive, and again the moment it dies; and when no image
+        // can be read at all, a nonzero exit code proves the game
+        // itself failed (an exit of 0 / unknown still leaves the
+        // helper case to the post-grace check in `refresh`).
         if !self.settle.is_zero() {
             let deadline = std::time::Instant::now() + self.settle;
             loop {
+                if resolved_exe_path.is_none() {
+                    resolved_exe_path = self
+                        .spawner
+                        .exe_path(pid)
+                        .map(|path| path.to_string_lossy().into_owned());
+                }
                 if !self.spawner.is_alive(pid) {
+                    // One last image query: the process may have
+                    // died between the poll above and this check.
+                    if resolved_exe_path.is_none() {
+                        resolved_exe_path = self
+                            .spawner
+                            .exe_path(pid)
+                            .map(|path| path.to_string_lossy().into_owned());
+                    }
                     let is_game = resolved_exe_path
                         .as_deref()
                         .is_some_and(|image| paths_equal(Path::new(image), &expected));
                     if is_game {
                         return Err(LaunchError::SpawnFailed(format!(
                             "game started but exited immediately ({}). It may need files from its own folder, or administrator rights. Try starting it from File Explorer — if it closes there too, the game itself is failing to start.",
+                            expected.display()
+                        )));
+                    }
+                    if resolved_exe_path.is_none()
+                        && let Some(code) = self.spawner.exit_code(pid)
+                        && code != 0
+                    {
+                        return Err(LaunchError::SpawnFailed(format!(
+                            "game started but exited immediately ({}) with exit code 0x{code:08X} ({code}). It may need files from its own folder, or administrator rights. Try starting it from File Explorer — if it closes there too, the game itself is failing to start.",
                             expected.display()
                         )));
                     }
@@ -809,6 +1117,7 @@ impl<S: ProcessSpawner> GameLauncher<S> {
             pid,
             exe_path: exe_path.to_string(),
             resolved_exe_path,
+            expected_exe_path: Some(expected.to_string_lossy().into_owned()),
             started_unix_secs,
         };
         self.running = Some(running.clone());
@@ -832,35 +1141,121 @@ impl<S: ProcessSpawner> GameLauncher<S> {
     /// refresh must not report the game "not running" while the
     /// real game is starting. The pid-reuse guard still applies
     /// inside the grace (a live pid running another exe clears).
+    ///
+    /// F2 (v2.0.21) post-grace verification: once the grace has
+    /// expired and the tracked pid is dead, the record is NOT
+    /// cleared blindly — first the spawner is asked whether ANY
+    /// live process runs the expected image, and the record
+    /// re-attaches to that pid when one exists (the tracked pid
+    /// was a helper). When no such process exists and the launch
+    /// was recent, the clear is recorded via
+    /// [`Self::take_closed_immediately`] so the app layer can
+    /// surface the `game_closed_immediately` error instead of a
+    /// silent flip back to "not running".
+    ///
+    /// # Panics
+    ///
+    /// Panics if the running record disappears between the liveness
+    /// check and the post-grace re-attach — unreachable in practice
+    /// (`refresh` holds `&mut self` and the record is only cleared
+    /// in this function, after the check), but the `expect` calls
+    /// below name it.
     #[must_use]
     pub fn refresh(&mut self) -> Option<&RunningGame> {
         let now = now_unix_secs();
         let grace_secs = self.grace.as_secs();
-        let dead = match &self.running {
-            Some(running) => {
-                if !self.spawner.is_alive(running.pid) {
-                    now >= running.started_unix_secs.saturating_add(grace_secs)
-                } else if is_shortcut(Path::new(&running.exe_path))
-                    && running.resolved_exe_path.is_none()
-                {
-                    // Unresolved shortcut launch: liveness only —
-                    // there is no trustworthy image to compare.
-                    false
-                } else if let Some(exe) = self.spawner.exe_path(running.pid) {
-                    // The pid is alive but runs a different exe: the
-                    // game exited and the OS reused its pid.
-                    let guard_path = running
-                        .resolved_exe_path
-                        .as_deref()
-                        .unwrap_or(running.exe_path.as_str());
-                    exe != Path::new(guard_path)
-                } else {
-                    false
-                }
-            }
-            None => false,
+        let running = self.running.as_ref()?;
+        let (pid_dead, pid_reused) = if !self.spawner.is_alive(running.pid) {
+            (
+                now >= running.started_unix_secs.saturating_add(grace_secs),
+                false,
+            )
+        } else if is_shortcut(Path::new(&running.exe_path)) && running.resolved_exe_path.is_none() {
+            // Unresolved shortcut launch: liveness only —
+            // there is no trustworthy image to compare.
+            (false, false)
+        } else if let Some(exe) = self.spawner.exe_path(running.pid) {
+            // The pid is alive but runs a different exe: the
+            // game exited and the OS reused its pid.
+            let guard_path = running
+                .resolved_exe_path
+                .as_deref()
+                .unwrap_or(running.exe_path.as_str());
+            (false, exe != Path::new(guard_path))
+        } else {
+            (false, false)
         };
-        if dead {
+        if pid_dead {
+            // F2 (v2.0.21) post-grace verification: the tracked pid
+            // may have been a helper/launcher stub that exited
+            // while the real game runs under a different pid
+            // (Store apps, launcher stubs). Before clearing the
+            // record, look for ANY live process with the expected
+            // image and re-attach to it.
+            let (old_pid, game_id, started, expected) = {
+                let running = self.running.as_ref().expect("checked above");
+                // F2: the search key is the image the GAME is
+                // expected to run as — never `resolved_exe_path`,
+                // which is the image the *tracked pid* runs (a
+                // helper's image when the tracked pid is a launcher
+                // stub). Fallback for pre-v2.0.21 records without
+                // the field: the stored exe for plain launches,
+                // no search for shortcuts.
+                let expected = running.expected_exe_path.clone().or_else(|| {
+                    if is_shortcut(Path::new(&running.exe_path)) {
+                        None
+                    } else {
+                        Some(running.exe_path.clone())
+                    }
+                });
+                (
+                    running.pid,
+                    running.game_id.clone(),
+                    running.started_unix_secs,
+                    expected,
+                )
+            };
+            if let Some(expected) = &expected
+                && let Some(found) = self.spawner.find_process_with_image(Path::new(expected))
+                && found != old_pid
+                && self.spawner.is_alive(found)
+            {
+                let running = self.running.as_mut().expect("checked above");
+                running.pid = found;
+                running.resolved_exe_path = Some(expected.clone());
+                self.launch_notes.push(format!(
+                    "game '{game_id}' re-attached to pid {found} running {expected} (tracked pid {old_pid} exited — it was a launcher/helper)"
+                ));
+                return self.running.as_ref();
+            }
+            // No live process with the expected image: the game is
+            // gone. Record it as closed-immediately — but only
+            // when the launch was recent (grace + 30 s): a game
+            // the user played for an hour and then closed is a
+            // normal exit, not a failed launch.
+            let exit_code = self.spawner.exit_code(old_pid);
+            if let Some(code) = exit_code {
+                self.launch_notes.push(format!(
+                    "game '{game_id}' tracked pid {old_pid} exited with code 0x{code:08X} ({code})"
+                ));
+            }
+            self.running = None;
+            if now
+                <= started
+                    .saturating_add(grace_secs)
+                    .saturating_add(CLOSED_IMMEDIATELY_WINDOW_SECS)
+            {
+                let exit_note = exit_code
+                    .map(|code| format!(" (exit code 0x{code:08X})"))
+                    .unwrap_or_default();
+                let detail = format!(
+                    "game '{game_id}' closed immediately after launch{exit_note} — no running process was found after the launch grace period. Try starting it from File Explorer — if it closes there too, the game itself is failing to start."
+                );
+                self.closed_immediately = Some((game_id, detail));
+            }
+            return None;
+        }
+        if pid_reused {
             self.running = None;
         }
         self.running.as_ref()
@@ -925,6 +1320,10 @@ mod tests {
         fail_terminate: RefCell<bool>,
         /// When set, every spawned pid dies at once.
         die_after_spawn: RefCell<bool>,
+        /// Exit code a pid that died at once reports (F2): 1 by
+        /// default, so an instantly-exiting game fails fast with
+        /// its code; tests set 0 for the clean-exit helper case.
+        die_exit_code: RefCell<u32>,
         /// Shortcut → target resolution (R3-D-04): when a spawn
         /// path is listed here, the pid's image is the target, not
         /// the spawned path — what `QueryFullProcessImageNameW`
@@ -945,6 +1344,7 @@ mod tests {
                 killed: RefCell::new(Vec::new()),
                 fail_terminate: RefCell::new(false),
                 die_after_spawn: RefCell::new(false),
+                die_exit_code: RefCell::new(1),
                 resolve: RefCell::new(HashMap::new()),
                 fail_exe_path: RefCell::new(false),
             }
@@ -952,6 +1352,17 @@ mod tests {
 
         fn kill_from_outside(&self, pid: u32) {
             self.alive.borrow_mut().remove(&pid);
+        }
+
+        /// Register a live process with `image` under `pid` (F2):
+        /// the "real game" a helper spawned under its own pid —
+        /// the post-grace re-attach target.
+        fn spawn_live(&self, pid: u32, image: &Path) {
+            self.alive.borrow_mut().insert(pid, image.to_path_buf());
+        }
+
+        fn set_die_exit_code(&self, code: u32) {
+            *self.die_exit_code.borrow_mut() = code;
         }
 
         fn set_fail_terminate(&self, fail: bool) {
@@ -1022,6 +1433,23 @@ mod tests {
                 return None;
             }
             self.alive.borrow().get(&pid).cloned()
+        }
+
+        fn exit_code(&self, pid: u32) -> Option<u32> {
+            if self.dead.borrow().contains(&pid) {
+                Some(*self.die_exit_code.borrow())
+            } else {
+                None
+            }
+        }
+
+        fn find_process_with_image(&self, exe: &Path) -> Option<u32> {
+            let dead = self.dead.borrow();
+            self.alive
+                .borrow()
+                .iter()
+                .find(|(pid, image)| !dead.contains(pid) && paths_equal(image, exe))
+                .map(|(pid, _)| *pid)
         }
     }
 
@@ -1475,6 +1903,127 @@ mod tests {
         assert_eq!(
             launcher.running().map(|game| game.game_id.as_str()),
             Some("my-race")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F2 (v2.0.21): the dead pid's image could not be read at all
+    /// (it died between spawn and the first query) — a nonzero
+    /// exit code still proves the game itself failed, so the
+    /// launch fails fast with the code in the message. This is the
+    /// case v2.0.13 missed: image `None` used to read as "helper".
+    #[test]
+    fn launch_dead_pid_with_no_image_and_nonzero_exit_is_an_error() {
+        let dir = test_dir("settle-noimage-nonzero");
+        let exe = fake_exe(&dir, "race.exe");
+
+        let mut launcher = GameLauncher::with_timing(
+            FakeSpawner::new(),
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(0),
+        );
+        launcher.spawner.set_die_after_spawn(true);
+        launcher.spawner.set_fail_exe_path(true);
+        let error = launcher
+            .launch("my-race", &exe)
+            .expect_err("a nonzero exit with no image must fail the launch");
+        assert!(
+            matches!(error, LaunchError::SpawnFailed(_)),
+            "must be SpawnFailed, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("0x00000001"),
+            "the error must carry the exit code: {error}"
+        );
+        assert!(launcher.running().is_none(), "no stale running record");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F2: the same unreadable image with a CLEAN exit (0) is the
+    /// helper case — the launch succeeds, and the post-grace
+    /// refresh then reports the game closed immediately (no live
+    /// process with the expected image) instead of silently
+    /// flipping the tile back to "not running".
+    #[test]
+    fn launch_clean_exit_with_no_image_reports_closed_immediately() {
+        let dir = test_dir("settle-noimage-zero");
+        let exe = fake_exe(&dir, "race.exe");
+
+        let mut launcher = GameLauncher::with_timing(
+            FakeSpawner::new(),
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(0),
+        );
+        launcher.spawner.set_die_after_spawn(true);
+        launcher.spawner.set_fail_exe_path(true);
+        launcher.spawner.set_die_exit_code(0);
+        let running = launcher
+            .launch("my-race", &exe)
+            .expect("a clean exit with no image must not fail the launch");
+        assert_eq!(running.game_id, "my-race");
+        assert!(
+            launcher.refresh().is_none(),
+            "the post-grace refresh must clear the record"
+        );
+        let (game_id, detail) = launcher
+            .take_closed_immediately()
+            .expect("the clear must record closed-immediately");
+        assert_eq!(game_id, "my-race");
+        assert!(
+            detail.contains("closed immediately"),
+            "the detail must say the game closed immediately: {detail}"
+        );
+        assert!(
+            detail.contains("0x00000000"),
+            "the detail must carry the exit code: {detail}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F2: the tracked pid was a helper that exited, but the real
+    /// game runs under another pid — the post-grace refresh
+    /// re-attaches to it instead of clearing the record.
+    #[test]
+    fn refresh_reattaches_to_real_game_when_helper_pid_dies() {
+        let dir = test_dir("refresh-reattach");
+        let game_dir = dir.join("game");
+        std::fs::create_dir_all(&game_dir).expect("create game dir");
+        let target = fake_exe(&game_dir, "race.exe");
+        let helper = fake_exe(&dir, "helper.exe");
+        let shortcut = write_lnk(&dir, "race.lnk", Path::new(&target));
+
+        let mut launcher = GameLauncher::with_timing(
+            FakeSpawner::new(),
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(0),
+        );
+        launcher.spawner.map_shortcut(&shortcut, Path::new(&helper));
+        launcher.spawner.set_die_after_spawn(true);
+        let running = launcher
+            .launch("my-race", &shortcut.to_string_lossy())
+            .expect("a helper exit must not fail the launch");
+        assert_eq!(running.pid, 1000);
+        // The real game the helper spawned, under its own pid.
+        launcher.spawner.spawn_live(2000, Path::new(&target));
+        let refreshed = launcher
+            .refresh()
+            .expect("the refresh must re-attach to the real game");
+        assert_eq!(refreshed.pid, 2000);
+        assert_eq!(
+            refreshed.resolved_exe_path.as_deref(),
+            Some(target.as_str()),
+            "the re-attached record binds the real image"
+        );
+        assert!(
+            launcher.take_closed_immediately().is_none(),
+            "a re-attach is not a closed-immediately"
+        );
+        assert!(
+            launcher
+                .take_launch_notes()
+                .iter()
+                .any(|note| note.contains("re-attached")),
+            "the re-attach must be noted for the daemon log"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

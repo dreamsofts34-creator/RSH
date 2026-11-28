@@ -73,6 +73,35 @@ pub struct EngineStats {
     pub output_latency_ms: Option<f64>,
     /// End-to-end latency p99 in milliseconds (ping-derived).
     pub e2e_ms: Option<f64>,
+    /// PC-side inter-arrival gap p99 in milliseconds (F4, v2.0.21):
+    /// the raw spacing between frames as the engine received them.
+    /// `None` serializes as `null` like the other p99 fields (never
+    /// omitted — the frontend reads the key unconditionally).
+    #[serde(default)]
+    pub arrival_gap_ms_p99: Option<f64>,
+    /// Largest PC-side inter-arrival gap observed in milliseconds
+    /// (F4): the worst single stall, never averaged away.
+    #[serde(default)]
+    pub arrival_gap_ms_max: f64,
+    /// Age-at-output p99 in milliseconds (F4): how old the frame
+    /// the engine just sent was when it was sent.
+    /// `None` serializes as `null` like the other p99 fields (never
+    /// omitted — the frontend reads the key unconditionally).
+    #[serde(default)]
+    pub age_at_output_ms_p99: Option<f64>,
+    /// Frames received by the engine (F4 `seqReceived`).
+    #[serde(default)]
+    pub frames_received: u64,
+    /// Frames dropped as stale (F4): duplicates + drain-cap drops.
+    #[serde(default)]
+    pub stale_dropped: u64,
+    /// Output sends (F4): states actually sent to the backend.
+    #[serde(default)]
+    pub outputs_sent: u64,
+    /// Largest burst in one engine tick (F4): most frames drained
+    /// in a single tick.
+    #[serde(default)]
+    pub frames_per_tick_max: u32,
 }
 
 /// Pedal positions in a snapshot, 0..1 (`clutch` is `None` when the
@@ -249,6 +278,13 @@ pub fn build_engine_stats(metrics: &EngineMetrics, loop_hz: Option<f64>) -> Engi
         jitter_ms_p99: metrics.jitter_p99().map(us_to_ms),
         output_latency_ms: metrics.output_latency_p99().map(us_to_ms),
         e2e_ms: metrics.e2e_latency_p99().map(us_to_ms),
+        arrival_gap_ms_p99: metrics.arrival_gap_p99().map(us_to_ms),
+        arrival_gap_ms_max: us_to_ms(metrics.arrival_gap_max()),
+        age_at_output_ms_p99: metrics.age_at_output_p99().map(us_to_ms),
+        frames_received: metrics.frames_received,
+        stale_dropped: metrics.stale_dropped,
+        outputs_sent: metrics.outputs_sent,
+        frames_per_tick_max: metrics.frames_per_tick_max,
     }
 }
 
@@ -259,13 +295,20 @@ pub fn build_engine_stats(metrics: &EngineMetrics, loop_hz: Option<f64>) -> Engi
 /// `build_engine_stats`.
 #[must_use]
 pub fn build_engine_stats_cached(metrics: &mut EngineMetrics, loop_hz: Option<f64>) -> EngineStats {
-    let (jitter, output, e2e) = metrics.cached_p99s();
+    let (jitter, output, e2e, arrival_gap, age_at_output) = metrics.cached_p99s();
     EngineStats {
         loop_hz,
         loss_pct: loss_fraction_to_pct(metrics.loss_fraction()),
         jitter_ms_p99: jitter.map(us_to_ms),
         output_latency_ms: output.map(us_to_ms),
         e2e_ms: e2e.map(us_to_ms),
+        arrival_gap_ms_p99: arrival_gap.map(us_to_ms),
+        arrival_gap_ms_max: us_to_ms(metrics.arrival_gap_max()),
+        age_at_output_ms_p99: age_at_output.map(us_to_ms),
+        frames_received: metrics.frames_received,
+        stale_dropped: metrics.stale_dropped,
+        outputs_sent: metrics.outputs_sent,
+        frames_per_tick_max: metrics.frames_per_tick_max,
     }
 }
 
@@ -345,11 +388,20 @@ mod tests {
         assert_eq!(stats.jitter_ms_p99, None);
         assert_eq!(stats.output_latency_ms, None);
         assert_eq!(stats.e2e_ms, None);
+        assert_eq!(stats.arrival_gap_ms_p99, None);
+        assert_eq!(stats.arrival_gap_ms_max, 0.0);
+        assert_eq!(stats.age_at_output_ms_p99, None);
+        assert_eq!(stats.frames_received, 0);
+        assert_eq!(stats.stale_dropped, 0);
+        assert_eq!(stats.outputs_sent, 0);
+        assert_eq!(stats.frames_per_tick_max, 0);
         let json = serde_json::to_string(&stats).expect("stats serialize");
         assert!(json.contains("\"loopHz\":null"), "{json}");
         assert!(json.contains("\"jitterMsP99\":null"), "{json}");
         assert!(json.contains("\"outputLatencyMs\":null"), "{json}");
         assert!(json.contains("\"e2eMs\":null"), "{json}");
+        assert!(json.contains("\"arrivalGapMsP99\":null"), "{json}");
+        assert!(json.contains("\"ageAtOutputMsP99\":null"), "{json}");
         assert!(json.contains("\"lossPct\":0.0"), "{json}");
     }
 
@@ -359,6 +411,12 @@ mod tests {
         metrics.record_inter_arrival_jitter(3400);
         metrics.record_output_latency(1200);
         metrics.record_e2e_latency(4800);
+        metrics.record_arrival_gap(6000);
+        metrics.record_age_at_output(900);
+        metrics.record_frame_received();
+        metrics.record_stale_dropped(2);
+        metrics.record_output_sent();
+        metrics.record_burst(3);
         for _ in 0..99 {
             metrics.record_packet(true);
         }
@@ -369,10 +427,19 @@ mod tests {
         assert_eq!(stats.jitter_ms_p99, Some(3.4));
         assert_eq!(stats.output_latency_ms, Some(1.2));
         assert_eq!(stats.e2e_ms, Some(4.8));
+        assert_eq!(stats.arrival_gap_ms_p99, Some(6.0));
+        assert_eq!(stats.arrival_gap_ms_max, 6.0);
+        assert_eq!(stats.age_at_output_ms_p99, Some(0.9));
+        assert_eq!(stats.frames_received, 1);
+        assert_eq!(stats.stale_dropped, 2);
+        assert_eq!(stats.outputs_sent, 1);
+        assert_eq!(stats.frames_per_tick_max, 3);
         let json = serde_json::to_string(&stats).expect("stats serialize");
         assert!(json.contains("\"loopHz\":200.0"), "{json}");
         assert!(json.contains("\"lossPct\":1.0"), "{json}");
         assert!(json.contains("\"jitterMsP99\":3.4"), "{json}");
+        assert!(json.contains("\"arrivalGapMsP99\":6.0"), "{json}");
+        assert!(json.contains("\"ageAtOutputMsP99\":0.9"), "{json}");
     }
 
     #[test]

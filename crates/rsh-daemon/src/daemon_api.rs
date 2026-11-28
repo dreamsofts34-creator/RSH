@@ -1402,6 +1402,7 @@ fn to_api_game(game: &GameInfo) -> GameSummary {
         running: game.running,
         installed: game.installed,
         bound_profile_id: game.bound_profile_id.clone(),
+        launch_error: game.launch_error.clone(),
     }
 }
 
