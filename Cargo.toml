@@ -12,7 +12,6 @@ members = [
     "crates/rsh-profiles",
     "crates/rsh-telemetry",
     "crates/rsh-output",
-    "crates/rsh-output-hidmaestro",
     "crates/rsh-led",
     "crates/rsh-app-core",
     # A6 baseline harness (criterion benches, rsh-protocol only).
@@ -46,13 +45,12 @@ default-members = [
     "crates/rsh-profiles",
     "crates/rsh-telemetry",
     "crates/rsh-output",
-    "crates/rsh-output-hidmaestro",
     "crates/rsh-led",
     "crates/rsh-app-core",
 ]
 
 [workspace.package]
-version = "2.0.18"
+version = "2.0.19"
 edition = "2024"
 license = "MIT"
 

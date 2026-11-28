@@ -52,9 +52,7 @@ use std::os::windows::process::CommandExt;
 
 /// `CREATE_NO_WINDOW` (`0x0800_0000`): a console `reg.exe` spawned
 /// without it flashes a console window on every autostart repair
-/// (review bug 4 — the v1.0.1 user-visible console flash; the same
-/// flag the sidecar spawn already uses, see
-/// `rsh-output-hidmaestro/src/transport.rs`).
+/// (review bug 4 — the v1.0.1 user-visible console flash).
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 

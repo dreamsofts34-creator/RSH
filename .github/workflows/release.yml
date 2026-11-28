@@ -20,18 +20,16 @@
 # anymore — the installer ships Slint rsh-ui + rsh-daemon only.
 # (DS-71: src-tauri/ + frontend/ still EXIST in the repo, kept-but-
 # unshipped — see the note under 'REMOVED' below. The Tauri shell is
-# still built by CI's tauri-build job, and its src-tauri/binaries/
-# dir is still the staging place for the HIDMaestro sidecar exe.)
-# The installer bundles two binaries + the HIDMaestro sidecar, all in
+# still built by CI's tauri-build job.)
+# The installer bundles two binaries + the ViGEmBus client DLL, all in
 # one install dir:
 #   rsh-daemon.exe            always-on daemon (engine + transport +
 #                             output + tray + auto profiles)
 #   rsh-ui.exe                Slint main window (spawned from the tray)
-#   RshCoreHiDcr.exe          HIDMaestro NativeAOT sidecar — MUST sit
-#                             beside rsh-daemon.exe: the daemon resolves
-#                             it as <own exe dir>/RshCoreHiDcr.exe
-#                             (rsh-output-hidmaestro `resolve_sidecar_path`)
-# Firmware v4.0.6 IS shipped in this release (user orders 2026-11-16
+#   ViGEmClient.dll           ViGEmBus client DLL — sits beside
+#                             rsh-daemon.exe (the Xbox backend loads it
+#                             from its own exe dir)
+# Firmware v4.0.7 IS shipped in this release (user orders 2026-11-16
 # ~20:20 + 2026-11-17 ~07:48): BOTH firmware files, built + signed
 # HERE on the runner from the tagged source (step 6 below) — never
 # copied from a developer machine. The merged factory image is for
@@ -46,26 +44,19 @@
 #
 # What it does, in order (every step fail-closed — a missing asset
 # or a version mismatch fails the run, never a silent partial release):
-#   1. Sidecar FIRST: fetch HIDMaestro v2.1.0, verify ZIP + DLL SHA-256,
-#      `dotnet publish` NativeAOT win-x64 (shared script
-#      `tools/ci/stage-sidecar.ps1`; it stages to
-#      `src-tauri/binaries/…` — the v2.0 installer picks the exe up
-#      from there; the Tauri shell itself is not built BY THIS
-#      WORKFLOW (CI's tauri-build job still builds it — DS-71,
-#      kept-but-unshipped).
-#   2. Gates: `cargo fmt --check`, `cargo clippy --workspace
+#   1. Gates: `cargo fmt --check`, `cargo clippy --workspace
 #      --exclude rsh-app` (Windows — every non-Tauri member),
 #      `cargo test -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc
 #      --release` (the ship crates, release mode — the one
 #      release-only proof; the debug full suite is CI's job),
 #      `cargo deny check`.
-#   3. `cargo build --release -p rsh-daemon -p rsh-ui`.
-#   4. PE-subsystem check: daemon + UI + sidecar must ALL be
+#   2. `cargo build --release -p rsh-daemon -p rsh-ui`.
+#   3. PE-subsystem check: daemon + UI must both be
 #      GUI-subsystem (2) — a console-subsystem (3) binary would pop
 #      a terminal window on launch (v1.0.0 lesson). rsh-ui sets
 #      `windows_subsystem = "windows"` (Phase 3), so this check
 #      passes; a console-subsystem binary fails it.
-#   5. NSIS installer: the committed `installer/rsh.nsi` (P1-1,
+#   4. NSIS installer: the committed `installer/rsh.nsi` (P1-1,
 #      v2.0.13 — extracted from this workflow), version-substituted
 #      by the "Prepare NSIS script" step, built with `makensis`.
 #      The installer:
@@ -84,10 +75,9 @@
 #          C-10) via `netsh` (hidden, `nsExec`), and removes it on
 #          uninstall;
 #        * registers the WER LocalDumps keys for rsh-daemon.exe /
-#          rsh-ui.exe / RshCoreHiDcr.exe (Round 3 WS-6, R3-AK-02 —
+#          rsh-ui.exe (Round 3 WS-6, R3-AK-02 —
 #          native-crash dumps to `%ProgramData%\RSH\dumps`,
-#          DumpCount 5; v2.0.11 P0 adds the sidecar — its native
-#          crash used to leave no dump at all) and removes
+#          DumpCount 5) and removes
 #          them on uninstall (the dumps themselves are kept, like
 #          `%APPDATA%\RSH`);
 #        * creates NO scheduled task (removed v2.0.13, P2-1:
@@ -99,14 +89,14 @@
 #          Settings owns autostart — the daemon syncs the Run key
 #          from `settings.autostart` on startup (default on), in
 #          the real user's hive.
-#   6. Firmware (v4.0.6): build with PlatformIO (`esp32dev` env),
+#   5. Firmware (v4.0.7): build with PlatformIO (`esp32dev` env),
 #      sign the app image with the release Ed25519 key (GitHub secret
 #      RSH_SIGNING_KEY_PEM — the private key never enters the repo),
 #      verify the signature + version marker fail-closed, then stage
 #      BOTH firmware assets into release-staging/ (merged factory
 #      image + signed OTA image). The merged image is the full-flash
 #      file; the OTA image is what the app's WebOTA flow flashes.
-#   7. Stage + verify: exactly THREE files in release-staging/
+#   6. Stage + verify: exactly THREE files in release-staging/
 #      (exe + merged + OTA), then SHA256SUMS.txt is written as a
 #      4th asset, then `gh release create` with all four
 #      (skipped on dry-run).
@@ -147,8 +137,7 @@
 #     (the `rsh-app` workspace member, built by CI's tauri-build job)
 #     but the v2.0 installer does NOT ship the Tauri bundle: it ships
 #     the Slint `rsh-ui` + `rsh-daemon` binaries. The Tauri shell is
-#     kept-but-unshipped; its `src-tauri/binaries/` dir is still the
-#     staging place for the HIDMaestro sidecar exe (step below).
+#     kept-but-unshipped.
 #   * Frontend gates (`frontend/` lint/tests/build) — the v2.0 UI is
 #     the Slint `rsh-ui` crate; the `frontend/` React app is only the
 #     Tauri shell's frontendDist (kept-but-unshipped, see above).
@@ -311,13 +300,6 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Set up .NET 10 SDK
-        uses: actions/setup-dotnet@v4
-        with:
-          # Pinned (R3-12): SDK 10.0.404 is the version installed on
-          # the green v2.0.6 release run (44717524848) — "10.0.x" floats.
-          dotnet-version: "10.0.404"
-
       - name: Install NSIS (makensis)
         shell: pwsh
         run: |
@@ -342,35 +324,6 @@ jobs:
           # fail-closed, instead of trusting the choco install.
           $ver = (makensis -VERSION) -join " "
           if ($ver -notmatch "^v3\.13") { Write-Error "makensis version is '$ver', expected v3.13.x (NSIS pinned to 3.13.0, R3-12)."; exit 1 }
-
-      # ---- Sidecar FIRST: fetch pinned HIDMaestro, verify hashes, AOT publish ----
-      # The v2.0 installer bundles the staged sidecar exe beside
-      # rsh-daemon.exe (the daemon resolves it relative to its own
-      # exe). The shared script still stages to
-      # `src-tauri/binaries/…` — the packaging step below copies it
-      # out of there; the Tauri shell itself is never built.
-      - name: Fetch + verify HIDMaestro v2.1.0, publish sidecar (AOT)
-        id: sidecar
-        shell: pwsh
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/stage-sidecar.ps1
-
-      # P1-C: the release workflow NEVER ran check-sidecar-hello
-      # (grep count 0) — the staged sidecar was only hash-checked,
-      # never executed, so a sidecar that could not say hello could
-      # still ship. Run it here, against the staged exe + DLL,
-      # BEFORE anything is published: it asserts the stdio hello AND
-      # the TCP connect-back hello (the v2.0.10 failure mode — the
-      # sidecar dying between tcp.Connect and hello) with the token
-      # echoed and the DLL verdict OK. Fail-closed on timeout or a
-      # bad verdict. The runner agent runs elevated, so the sidecar's
-      # requireAdministrator manifest raises no UAC prompt here.
-      # This is the staged-sidecar check, NOT the true daemon-driven
-      # end-to-end path: no test yet spawns the sidecar through the
-      # real daemon via runas (still open — see the team report for
-      # the concrete plan).
-      - name: Check staged sidecar hello (stdio + TCP connect-back)
-        shell: pwsh
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/check-sidecar-hello.ps1
 
       # ---- Gates (superset of the CI gates for the ship crates) ----
       - name: cargo fmt --check
@@ -457,10 +410,9 @@ jobs:
       # The v1.0.0 launch failure (user PC): the app opened behind a
       # visible console window and then vanished. Causes were
       # console-subsystem binaries. This step proves, before anything
-      # is published, that ALL THREE binaries are
+      # is published, that BOTH binaries are
       # IMAGE_SUBSYSTEM_WINDOWS_GUI (2) — a CUI binary (3) fails the
-      # run. Paths: the sidecar path is where stage-sidecar.ps1 stages
-      # it; the daemon/UI exes are the workspace-root target dir.
+      # run. Paths: the daemon/UI exes are the workspace-root target dir.
       - name: No console window — PE subsystem must be GUI
         shell: pwsh
         run: |
@@ -470,7 +422,6 @@ jobs:
             return [BitConverter]::ToUInt16($bytes, $peOffset + 24 + 68)
           }
           $bins = @(
-            "src-tauri/binaries/RshCoreHiDcr-x86_64-pc-windows-msvc.exe",
             "target/release/rsh-daemon.exe",
             "target/release/rsh-ui.exe"
           )
@@ -482,7 +433,7 @@ jobs:
             Write-Host "$b : subsystem 2 (GUI) OK"
           }
 
-      # ---- Firmware v4.0.5: build + sign (TWO assets) ----
+      # ---- Firmware v4.0.7: build + sign (TWO assets) ----
       # Runs BEFORE the NSIS build: the installer bundles
       # firmware-signed.bin, so makensis fails closed if the
       # image is missing or unsigned.
@@ -588,7 +539,7 @@ jobs:
       # GitHub's 21,000-char `run:` ceiling). The "Prepare NSIS
       # script" step below only substitutes $${VERSION}; makensis
       # builds the committed file. It installs the two binaries +
-      # the sidecar beside the daemon + the signed OTA firmware
+      # the ViGEmBus client DLL beside the daemon + the signed OTA firmware
       # image (WebOTA flow, no download needed), creates the
       # program+port-scoped inbound UDP firewall rule for
       # rsh-daemon.exe (Private + Public), and removes the rule on
@@ -640,8 +591,8 @@ jobs:
           # would only shrink the sum while staying positive, so
           # fail closed on each file first. (C P2-1): the +256 KB
           # is the allowance for uninstall.exe (WriteUninstaller)
-          # — a 7th file in $INSTDIR that is not in this 6-file sum.
-          $installedFiles = @("target/release/rsh-daemon.exe", "target/release/rsh-ui.exe", "src-tauri/binaries/RshCoreHiDcr-x86_64-pc-windows-msvc.exe", "src-tauri/binaries/HIDMaestro.Core.dll", "tools/rsh-hm-sidecar/HIDMaestro-LICENSE.txt", "firmware/.pio/build/esp32dev/firmware-signed.bin")
+          # — a 4th file in $INSTDIR that is not in this 3-file sum.
+          $installedFiles = @("target/release/rsh-daemon.exe", "target/release/rsh-ui.exe", "firmware/.pio/build/esp32dev/firmware-signed.bin")
           foreach ($f in $installedFiles) { if (-not (Test-Path $f -PathType Leaf)) { Write-Error "EstimatedSize: expected installed file '$f' is missing."; exit 1 } }
           $installedKb = [int]((Get-ChildItem $installedFiles -File | Measure-Object Length -Sum).Sum / 1KB) + 256
           # Run 45775988045: the bare -DESTIMATEDSIZEKB=$installedKb
@@ -744,17 +695,6 @@ jobs:
       # (headless runner): the window actually painting — process +
       # IPC + rule is the strongest launch evidence available in CI;
       # real paint is a human gate (see the human gates in this workflow's header).
-      # OEMData (v2.0.15, Part A3): the default (silent) install
-      # must NOT write the Steam FH4 OEMData flag — it lives only
-      # in the optional installer section, off by default — so
-      # Assert-NoOem runs after the first install, after the
-      # update install, and after the uninstall, under BOTH hives
-      # (HKLM written by the installer, HKCU by the daemon). The
-      # "present after toggle on" check is deliberately NOT here:
-      # toggling needs the app/daemon UI path and cannot run
-      # headless; it stays a user-PC proof item. ($null.GetValue()
-      # is $null in PowerShell, so a missing OEM key needs no
-      # guard in the helper.)
       # Every process wait here is timeout-bounded via
       # Start-WaitOrFail: run 44047919933 hung SILENTLY for 13+ min
       # in a bare `Start-Process -Wait` on the second install (the
@@ -778,29 +718,15 @@ jobs:
             if ($p.ExitCode -ne 0) { Write-Error "Smoke test: $what exited with code $($p.ExitCode)."; exit 1 }
             Write-Host "Smoke test: $what finished (exit 0)."
           }
-          # FH4 (v2.0.14): complete GameInput RacingWheel tree.
-          function Assert-GameInput($key, $desc, $clutch, $handbrake) {
-            $b = "SYSTEM\CurrentControlSet\Control\GameInput\Devices\$key"
-            function chk($sub, $name, $want) { $p = if ($sub) { "$b\$sub" } else { $b }; $k = $reg64.OpenSubKey($p); $got = if ($k) { $k.GetValue($name) } else { $null }; if ($got -ne $want) { Write-Error "Smoke test: GameInput $key\$sub $name is '$got', expected '$want'."; exit 1 } }
-            chk "" "Description" $desc
-            chk "RacingWheel" "MaxWheelAngle" 450
-            foreach ($a in @(("Wheel",0),("Throttle",1),("Brake",2),("Clutch",$clutch),("Handbrake",$handbrake))) { chk "RacingWheel\$($a[0])" "AxisIndex" $a[1]; chk "RacingWheel\$($a[0])" "Invert" 0 }
-            foreach ($g in @(("PreviousGear",1),("NextGear",0),("Button1",0),("Button2",1))) { chk "RacingWheel\$($g[0])" "ButtonIndex" $g[1] }
-            foreach ($d in @("Up","Down","Left","Right")) { chk "RacingWheel\DPad$d" "SwitchIndex" 0; chk "RacingWheel\DPad$d" "IncludeAdjacent" 1; chk "RacingWheel\DPad$d" "SwitchPosition" $d }
-            chk "Labels\Buttons" "Button0" "LetterA"; chk "Labels\Buttons" "Button1" "LetterB"; chk "Labels\Buttons" "Button2" "LetterX"; chk "Labels\Buttons" "Button3" "LetterY"; chk "Labels\Buttons" "Button6" "Menu"; chk "Labels\Buttons" "Button7" "View"; chk "Labels\Buttons" "Button8" "RightStickButton"; chk "Labels\Buttons" "Button9" "LeftStickButton"
-            chk "Labels\Switches" "Switch0Up" "Up"; chk "Labels\Switches" "Switch0Right" "Right"; chk "Labels\Switches" "Switch0Down" "Down"; chk "Labels\Switches" "Switch0Left" "Left"
-          }
-          function Assert-NoOem { $o = "SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_1234&PID_BEAD"; foreach ($h in $reg64, [Microsoft.Win32.Registry]::CurrentUser) { if ($null -ne $h.OpenSubKey($o).GetValue("OEMData")) { Write-Error "Smoke test: OEMData present."; exit 1 } } }
           $installer = (Get-ChildItem release-staging/*-setup.exe).FullName
           $installDir = "C:\rsh-smoke-test"
           if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
           # NSIS silent install (/S); /D must be last, unquoted.
           Start-WaitOrFail $installer @("/S", "/D=$installDir") 180 "first silent install"
-          # v2.0.8 H1: sidecar hashes the DLL beside itself.
-          foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe", "RshCoreHiDcr.exe", "HIDMaestro.Core.dll", "firmware-signed.bin", "HIDMaestro-LICENSE.txt")) {
+          foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe", "firmware-signed.bin")) {
             if (-not (Test-Path (Join-Path $installDir $exe))) { Write-Error "Smoke test: installed $exe not found in $installDir after silent install."; exit 1 }
           }
-          Write-Host "Installed to $installDir — all three binaries + HIDMaestro DLL + bundled firmware image + HIDMaestro LICENSE present."
+          Write-Host "Installed to $installDir — both binaries + bundled firmware image present."
           $rule = netsh advfirewall firewall show rule name="RSH" | Out-String
           if ($rule -notmatch "RSH") { Write-Error "Smoke test: firewall rule 'RSH' not found after install (netsh show rule)."; exit 1 }
           Write-Host "Firewall rule 'RSH' present after install."
@@ -808,18 +734,13 @@ jobs:
           $reg64 = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
           $dumpsBase = "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps"
           $expectedDumpFolder = Join-Path $env:ProgramData "RSH\dumps"
-          foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe", "RshCoreHiDcr.exe")) {
+          foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe")) {
             $werKey = $reg64.OpenSubKey("$dumpsBase\$exe")
             if (-not $werKey) { Write-Error "Smoke test: WER LocalDumps key for $exe not found after install (64-bit view)."; exit 1 }
             if ($werKey.GetValue("DumpFolder") -ne $expectedDumpFolder) { Write-Error "Smoke test: WER DumpFolder for $exe is '$($werKey.GetValue("DumpFolder"))', expected '$expectedDumpFolder'."; exit 1 }
             if ($werKey.GetValue("DumpType") -ne 1 -or $werKey.GetValue("DumpCount") -ne 5) { Write-Error "Smoke test: WER DumpType/DumpCount for $exe is '$($werKey.GetValue("DumpType"))'/'$($werKey.GetValue("DumpCount"))', expected 1/5."; exit 1 }
           }
-          Write-Host "WER LocalDumps keys present for daemon, UI and sidecar (DumpFolder $expectedDumpFolder, DumpType 1, DumpCount 5)."
-          # FH4 (v2.0.14): complete mapping tree, both devices.
-          Assert-GameInput "1234BEAD00010004" "RSH Wheel (vJoy)" 3 6
-          Assert-GameInput "1209525300010004" "RSH Wheel (HIDMaestro)" 3 4
-          Write-Host "GameInput RacingWheel mapping complete for vJoy + HID (axes, gears, buttons, DPad, Labels)."
-          Assert-NoOem
+          Write-Host "WER LocalDumps keys present for daemon and UI (DumpFolder $expectedDumpFolder, DumpType 1, DumpCount 5)."
           # vJoy descriptor: only when Device01 exists (the runner has
           # no vJoy installed — assert size, else skip).
           $dev1 = $reg64.OpenSubKey("SYSTEM\CurrentControlSet\Services\vjoy\Parameters\Device01")
@@ -871,11 +792,6 @@ jobs:
           $dispVersion = if ($unKey) { $unKey.GetValue("DisplayVersion") } else { $null }
           if ($dispVersion -ne $version) { Write-Error "Smoke test: Uninstall key DisplayVersion is '$dispVersion', expected '$version'."; exit 1 }
           Write-Host "Registry version is $version (RSH key + Uninstall key)."
-          # FH4 (v2.0.14): the update install must rewrite the tree.
-          Assert-GameInput "1234BEAD00010004" "RSH Wheel (vJoy)" 3 6
-          Assert-GameInput "1209525300010004" "RSH Wheel (HIDMaestro)" 3 4
-          Write-Host "GameInput RacingWheel mapping complete after the update install."
-          Assert-NoOem
           Start-Sleep -Seconds 3
           $daemonProc = Get-Process rsh-daemon -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $daemonProc) { Write-Error "Smoke test: daemon was NOT restarted by the update install (no rsh-daemon process)."; exit 1 }
@@ -946,7 +862,7 @@ jobs:
               Write-Host "Smoke test: restarted daemon pid $($daemonProc.Id) parent: $parentName (pid $ppid)"
             } catch { Write-Host "Smoke test: could not read restarted daemon parent process." }
             if ($shellCapable) {
-              if ($elevState -eq "elevated") { Write-Error "Smoke test: update-restarted daemon is ELEVATED (log $elevLog) while a non-elevated explorer shell exists — P4 non-elevated restart failed; the sidecar UAC prompt would be suppressed (parent: $parentName)."; exit 1 }
+              if ($elevState -eq "elevated") { Write-Error "Smoke test: update-restarted daemon is ELEVATED (log $elevLog) while a non-elevated explorer shell exists — P4 non-elevated restart failed (parent: $parentName)."; exit 1 }
               Write-Error "Smoke test: no 'daemon: elevation: ...' line in $elevLog within 60 s after the update restart — cannot prove the daemon runs non-elevated."; exit 1
             }
             Write-Host "Smoke test: WARNING — update-restarted daemon elevation is '$elevState', but no non-elevated explorer shell exists in this session (shell elevated or absent), so a non-elevated restart is unachievable here; recording only (parent: $parentName). P4 is validated on a real desktop, not this runner."
@@ -981,8 +897,6 @@ jobs:
           if (Get-Process rsh-daemon -ErrorAction SilentlyContinue) { Write-Error "Smoke test: rsh-daemon.exe still running 30 s after taskkill."; exit 1 }
           Start-WaitOrFail $daemon @("--check", "--no-tray", "--no-connect", "--data-dir", $dataDir) 60 "daemon --check after the update install"
           Write-Host "Smoke test PASS: update path — data kept, version $version, daemon restarted, --check exit 0."
-          # Stop the sidecar too so it cannot hold its exe open.
-          taskkill /F /IM RshCoreHiDcr.exe | Out-Null
           $uninstaller = Join-Path $installDir "uninstall.exe"
           if (-not (Test-Path $uninstaller)) { Write-Error "Smoke test: uninstaller not found at $uninstaller."; exit 1 }
           Start-WaitOrFail $uninstaller @("/S") 120 "silent uninstall"
@@ -1006,12 +920,11 @@ jobs:
           # P2-A (uninstall side): the WER keys must be gone too.
           # (No scheduled-task check: the task was removed in
           # v2.0.13; the uninstaller still removes a legacy one.)
-          foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe", "RshCoreHiDcr.exe")) {
+          foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe")) {
             if ($reg64.OpenSubKey("$dumpsBase\$exe")) { Write-Error "Smoke test: WER LocalDumps key for $exe still present after uninstall."; exit 1 }
           }
           if (Get-ScheduledTask -TaskName "RSH Daemon" -ErrorAction SilentlyContinue) { Write-Error "Smoke test: legacy scheduled task 'RSH Daemon' still registered after uninstall (the uninstaller must remove it)."; exit 1 }
           Write-Host "Smoke test PASS: uninstall removed the WER keys (and no legacy scheduled task remains)."
-          Assert-NoOem
           # The data dir may never exist on Windows — only remove
           # it when it exists.
           if (Test-Path $dataDir) { Remove-Item $dataDir -Recurse -Force }

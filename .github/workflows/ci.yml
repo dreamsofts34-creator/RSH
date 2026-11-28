@@ -52,14 +52,10 @@
 # fail-closed presence check for the four crates, so a deleted crate
 # fails the job instead of silently dropping out of coverage).
 #
-# `rsh-app` (src-tauri) is a workspace member, but its build script
-# (`tauri_build::build()`) copies the `bundle.externalBin` sidecar at
-# build-script time and fails with `ResourcePathNotFound` when the staged
-# file for the CURRENT target triple is missing (tauri-build 2.7.4
-# `copy_binaries` + tauri-utils 2.10.2 `resource_from_path` — proven
-# from the bundled crate sources). The sidecar is a Windows NativeAOT
-# exe and can only be staged on Windows, so NO Linux job may build
-# `rsh-app`: Linux clippy/test use `--workspace --exclude rsh-app`,
+# `rsh-app` (src-tauri) is a workspace member, but its build needs the
+# Tauri system libraries (WebView2/webkit), which the Linux runner
+# lacks — so NO Linux job may build `rsh-app`: Linux clippy/test use
+# `--workspace --exclude rsh-app`,
 # and the shell is covered by the Windows jobs (`clippy-windows`,
 # `test-windows`, `tauri-build`). A bare `--workspace` on Linux would
 # fail at the rsh-app build script — that is why the scope is split
@@ -151,8 +147,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p target/release src-tauri/binaries tools/rsh-hm-sidecar firmware/.pio/build/esp32dev release-staging
-          for f in target/release/rsh-daemon.exe target/release/rsh-ui.exe src-tauri/binaries/RshCoreHiDcr-x86_64-pc-windows-msvc.exe src-tauri/binaries/HIDMaestro.Core.dll tools/rsh-hm-sidecar/HIDMaestro-LICENSE.txt firmware/.pio/build/esp32dev/firmware-signed.bin; do
+          mkdir -p target/release firmware/.pio/build/esp32dev release-staging
+          for f in target/release/rsh-daemon.exe target/release/rsh-ui.exe firmware/.pio/build/esp32dev/firmware-signed.bin; do
             : > "$f"
           done
           sed 's/${VERSION}/0.0.0-test/g' installer/rsh.nsi > /tmp/rsh-check.nsi
@@ -197,11 +193,11 @@ jobs:
         if: steps.check.outputs.run == 'true'
         uses: Swatinem/rust-cache@v2
       # H3 (deep-scan Round 2): `--workspace` WITHOUT `--exclude rsh-app`
-      # would fail on Linux — the rsh-app build script needs the staged
-      # Windows sidecar (see the header split note). `--exclude rsh-app`
+      # would fail on Linux — the rsh-app build needs the Tauri system
+      # libraries (see the header split note). `--exclude rsh-app`
       # still covers every other member, including the non-default ones
       # (rsh-benchmarks, rsh-rig); the shell itself is covered by the
-      # `clippy-windows` job (-p rsh-app, sidecar staged).
+      # `clippy-windows` job (-p rsh-app).
       - name: Check v2.0 crates present (fail closed)
         if: steps.check.outputs.run == 'true'
         shell: bash
@@ -240,20 +236,6 @@ jobs:
       - name: Cache Cargo dependencies
         if: steps.check.outputs.run == 'true'
         uses: Swatinem/rust-cache@v2
-      # The rsh-app build script validates bundle.externalBin at build
-      # time, so the HIDMaestro sidecar must be staged BEFORE clippy
-      # builds the shell — otherwise it fails with "resource path
-      # `binaries\\RshCoreHiDcr-...exe` doesn't exist" (same failure
-      # as the release dry runs #1/#2). Shared script (M6).
-      - name: Set up .NET 10 SDK
-        if: steps.check.outputs.run == 'true'
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "10.0.404"
-      - name: Stage HIDMaestro sidecar (shared script)
-        if: steps.check.outputs.run == 'true'
-        shell: pwsh
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/stage-sidecar.ps1
       # v1.0.2 Bug 6 follow-up: the stale committed frontend/dist is
       # gone, so dist must be built before any cargo build of rsh-app —
       # tauri::generate_context!() panics at compile time when
@@ -276,9 +258,7 @@ jobs:
         if: steps.check.outputs.run == 'true'
         run: cargo clippy -p rsh-app --all-targets -- -D warnings
       # v2.0 crates (Phase 2/3/7): the daemon + Slint UI + API + IPC.
-      # Explicit -p run (not covered by the -p rsh-app step above);
-      # the sidecar staging above is for rsh-app only — these crates
-      # do not need it at build time.
+      # Explicit -p run (not covered by the -p rsh-app step above).
       - name: cargo clippy -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc (warnings denied)
         if: steps.check.outputs.run == 'true'
         run: cargo clippy -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc --all-targets -- -D warnings
@@ -297,8 +277,8 @@ jobs:
   # (criterion -> alloca needs MSVC lib.exe; the local step runs the
   # plain workspace check plus a scoped --all-targets for the four
   # ship crates instead).
-  # rsh-app is excluded, same as the local step: its build script
-  # needs the staged Windows sidecar, which this job does not stage.
+  # rsh-app is excluded, same as the local step: it needs the Tauri
+  # system libraries, which this job does not install.
   windows-check:
     name: windows-check
     runs-on: windows-latest
@@ -386,9 +366,9 @@ jobs:
       - name: cargo test --workspace (excluding rsh-app on Linux)
         if: steps.check.outputs.run == 'true'
         # Same split as clippy (header note): a bare --workspace would
-        # build rsh-app, whose build script fails on Linux without the
-        # staged Windows sidecar. rsh-app is tested on Windows
-        # (test-windows, sidecar staged); the Linux run covers the
+        # build rsh-app, whose build needs the Tauri system libraries,
+        # unavailable on the Linux runner. rsh-app is tested on Windows
+        # (test-windows); the Linux run covers the
         # other members, including the four v2.0 crates (rsh-daemon,
         # rsh-ui, rsh-api, rsh-ipc). (Deep-scan Round 2 — same root
         # cause as H3; found while fixing the clippy scope, not in the
@@ -421,28 +401,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
       # Windows-only tests run here; on Linux they skip with a reason
       # (TESTING-INPUT §9.1).
-      # The rsh-app build script (Tauri) validates bundle.externalBin at
-      # build time, so the HIDMaestro sidecar must be staged BEFORE any
-      # cargo build of the app — otherwise `cargo test --workspace` fails
-      # with "resource path `binaries\\RshCoreHiDcr-...exe` doesn't
-      # exist" (release dry runs #1/#2 + first CI run, 2026-11-14).
-      - name: Set up .NET 10 SDK
-        if: steps.check.outputs.run == 'true'
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "10.0.404"
-      - name: Stage HIDMaestro sidecar (shared script)
-        if: steps.check.outputs.run == 'true'
-        shell: pwsh
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/stage-sidecar.ps1
-      # v2.0.8 retest Bug 1 (H5): no CI test ever RAN the sidecar, so
-      # a sidecar that could not say hello shipped. Run the staged
-      # exe (DLL beside it) and assert the hello verdict is OK with
-      # the pinned SDK — fail closed on timeout or a bad verdict.
-      - name: Check staged sidecar hello (DLL hash verdict)
-        if: steps.check.outputs.run == 'true'
-        shell: pwsh
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/check-sidecar-hello.ps1
       # v1.0.2 Bug 6 follow-up: the stale committed frontend/dist is
       # gone, so dist must be built before any cargo build of rsh-app —
       # tauri::generate_context!() panics at compile time when
@@ -462,18 +420,9 @@ jobs:
           npm ci
           npm run build
       # The full --workspace run covers the four v2.0 crates
-      # (rsh-daemon, rsh-ui, rsh-api, rsh-ipc) on Windows, sidecar
-      # staged above; on Linux the same crates are covered by
+      # (rsh-daemon, rsh-ui, rsh-api, rsh-ipc) on Windows; on Linux
+      # the same crates are covered by
       # test-linux (--workspace --exclude rsh-app).
-      # It also runs the true daemon→sidecar E2E test
-      # (`crates/rsh-output-hidmaestro/tests/elevated_e2e_tests.rs`):
-      # a real `SidecarManager` with `elevated=true` spawns the
-      # STAGED sidecar above via `runas` + loopback TCP connect-back
-      # and asserts hello + token echo + DLL verdict OK + admin.
-      # The staging step MUST stay before this step — the test
-      # resolves the staged exe from the repo tree and FAILS (never
-      # skips) when it is missing. No driver install is needed:
-      # hello is sent before `HMContext` creation.
       - name: cargo test --workspace
         if: steps.check.outputs.run == 'true'
         run: cargo test --workspace
@@ -518,7 +467,7 @@ jobs:
       - name: Cache Cargo dependencies
         if: steps.check.outputs.run == 'true'
         uses: Swatinem/rust-cache@v2
-      # The daemon alone (no Tauri app, no sidecar, no frontend): its
+      # The daemon alone (no Tauri app, no frontend): its
       # build needs no .NET SDK or Node.js.
       - name: cargo build -p rsh-daemon
         if: steps.check.outputs.run == 'true'
@@ -1051,21 +1000,6 @@ jobs:
             exit 1
           fi
           npm ci
-      # The rsh-app build script (Tauri) validates bundle.externalBin at
-      # build time, so the HIDMaestro sidecar must be staged BEFORE the
-      # build — otherwise `cargo tauri build` fails with "resource path
-      # `binaries\\RshCoreHiDcr-...exe` doesn't exist" (first CI run,
-      # 2026-11-14). Shared script (M6) — same staging as test-windows
-      # and the release workflow.
-      - name: Set up .NET 10 SDK
-        if: steps.check.outputs.run == 'true'
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "10.0.404"
-      - name: Stage HIDMaestro sidecar (shared script)
-        if: steps.check.outputs.run == 'true'
-        shell: pwsh
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/stage-sidecar.ps1
       - name: cargo tauri build --no-bundle
         if: steps.check.outputs.run == 'true'
         working-directory: src-tauri
