@@ -6021,7 +6021,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-api"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "serde",
  "serde_json",
@@ -6030,7 +6030,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-app"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "rsh-app-core",
  "serde",
@@ -6046,14 +6046,13 @@ dependencies = [
 
 [[package]]
 name = "rsh-app-core"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "dirs 7.0.0",
  "ed25519-dalek",
  "rsh-api",
  "rsh-engine",
  "rsh-output",
- "rsh-output-hidmaestro",
  "rsh-profiles",
  "rsh-protocol",
  "rsh-security",
@@ -6068,7 +6067,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-benchmarks"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "criterion",
  "rsh-engine",
@@ -6077,7 +6076,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-daemon"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "dirs 7.0.0",
  "keyring",
@@ -6095,7 +6094,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-engine"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "rsh-protocol",
  "serde",
@@ -6106,7 +6105,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-fake-daemon"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "dirs 7.0.0",
  "rsh-api",
@@ -6117,7 +6116,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-gate-ui"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "i-slint-backend-testing",
  "i-slint-core",
@@ -6127,7 +6126,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-ipc"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "rsh-api",
  "serde",
@@ -6137,11 +6136,11 @@ dependencies = [
 
 [[package]]
 name = "rsh-led"
-version = "2.0.18"
+version = "2.0.19"
 
 [[package]]
 name = "rsh-output"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "libloading 0.7.4",
  "rsh-engine",
@@ -6150,21 +6149,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsh-output-hidmaestro"
-version = "2.0.18"
-dependencies = [
- "getrandom 0.3.4",
- "rsh-engine",
- "rsh-output",
- "serde",
- "serde_json",
- "subtle",
- "windows",
-]
-
-[[package]]
 name = "rsh-profiles"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "rsh-telemetry",
  "serde",
@@ -6173,7 +6159,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-protocol"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "proptest",
  "serde_json",
@@ -6181,7 +6167,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-rig"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "ed25519-dalek",
  "rsh-api",
@@ -6201,7 +6187,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-security"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "ed25519-dalek",
  "keyring",
@@ -6210,14 +6196,14 @@ dependencies = [
 
 [[package]]
 name = "rsh-telemetry"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "windows",
 ]
 
 [[package]]
 name = "rsh-transport"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "mdns-sd",
  "rsh-engine",
@@ -6230,7 +6216,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-ui"
-version = "2.0.18"
+version = "2.0.19"
 dependencies = [
  "dirs 7.0.0",
  "rsh-api",

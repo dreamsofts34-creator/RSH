@@ -28,7 +28,7 @@ Forgot the Wi-Fi password? Hold the board's BOOT button for 10+ seconds — it r
 
 ### 2. Software setup
 
-1. Download **RSH_2.0.18_x64-setup.exe** from the [latest release](https://github.com/dreamsofts34-creator/RSH/releases/latest) and run it. If RSH is already installed, it offers an update instead.
+1. Download **RSH_2.0.19_x64-setup.exe** from the [latest release](https://github.com/dreamsofts34-creator/RSH/releases/latest) and run it. If RSH is already installed, it offers an update instead.
 2. Open RSH and follow the **Setup wizard**: connect the board, check drivers, calibrate, add a game.
 3. **First connect:** join the board's open hotspot (`RSH-XXXX`) from the wizard, or plug in the USB cable. No pairing, no code.
 4. **Set a Wi-Fi password** in Settings → Connection. Until you do, the hotspot stays open.
@@ -37,8 +37,7 @@ Forgot the Wi-Fi password? Hold the board's BOOT button for 10+ seconds — it r
 ## Notes
 
 - Windows 10 22H2 / 11, x64 only. The app is unsigned, so Windows SmartScreen will ask — choose "Run anyway".
-- Output is vJoy by default (HIDMaestro optional). No force feedback yet — planned for a future update.
-- G29 spoof mode (Settings → Game Controller, HIDMaestro backend only, off by default): presents the wheel as a Logitech G29 for games that only list supported wheels (e.g. Forza Horizon 4). It is not a Logitech product, and FH4 still needs a custom control scheme.
+- Output is vJoy by default, with an Xbox (ViGEmBus) fallback for games that do not accept the vJoy wheel (Settings → Output). No force feedback yet — planned for a future update.
 - Games are added by hand (name + exe or shortcut). RSH never scans for games.
 - No auto-update: new versions come from [GitHub Releases](https://github.com/dreamsofts34-creator/RSH/releases). Firmware updates come from the app (WebOTA, signature-checked).
 - The backend engine keeps running when the window is closed. Closing the window never stops the wheel.
