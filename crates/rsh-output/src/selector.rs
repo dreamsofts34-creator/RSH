@@ -12,9 +12,9 @@
 //! # Rules
 //!
 //! * **Default is `vJoy`** ([`BackendKind::DEFAULT`]); `Xbox`
-//!   (ViGEmBus) is the fallback choice for games that do not take
+//!   (`ViGEmBus`) is the fallback choice for games that do not take
 //!   the vJoy wheel; `None` is the no-device sink. vJoy needs no
-//!   elevation after its one-time install; Xbox needs the ViGEmBus
+//!   elevation after its one-time install; Xbox needs the `ViGEmBus`
 //!   driver installed (the wizard offers it).
 //! * **Switch without restart where possible:** the switch below runs
 //!   on the live backend slot — no process restart, no engine restart.
@@ -60,8 +60,8 @@ use crate::error::OutputError;
 /// The output backend the user can select (Settings/Output page).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BackendKind {
-    /// Xbox via ViGEmBus (v2.0.19) - the fallback backend for games
-    /// that do not take the vJoy wheel. Needs the ViGEmBus driver;
+    /// Xbox via `ViGEmBus` (v2.0.19) - the fallback backend for games
+    /// that do not take the vJoy wheel. Needs the `ViGEmBus` driver;
     /// never the default.
     Xbox,
     /// vJoy - the default backend (G3, FFI, no elevation needed).
@@ -159,7 +159,7 @@ impl BackendKind {
 /// that backend is not installed on this machine, and requesting it
 /// errors honestly instead of building a fake.
 pub struct BackendFactories {
-    /// Factory for the `Xbox` (ViGEmBus) backend, when installed.
+    /// Factory for the `Xbox` (`ViGEmBus`) backend, when installed.
     pub xbox: Option<Box<dyn Fn() -> Box<dyn IJoystickOutput> + Send>>,
     /// Factory for the vJoy backend, when installed.
     pub vjoy: Option<Box<dyn Fn() -> Box<dyn IJoystickOutput> + Send>>,
@@ -230,7 +230,7 @@ fn connect(
 /// falls back to vJoy; when it is false (an explicit user switch),
 /// the failure errors with the real reason and the slot is untouched
 /// - never a silent fallback. If vJoy also fails, the error names
-/// both attempts and the previous backend is untouched.
+///   both attempts and the previous backend is untouched.
 ///
 /// # Errors
 ///

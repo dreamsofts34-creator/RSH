@@ -2955,14 +2955,6 @@ mod tests {
         assert_eq!(p.w_steering, 32768);
     }
 
-    fn update_calls(handle: &MockHandle) -> usize {
-        handle
-            .calls()
-            .iter()
-            .filter(|call| matches!(call, MockCall::Update(_)))
-            .count()
-    }
-
     #[test]
     fn update_failure_returns_error_and_stays_connected() {
         let (mock, handle) = MockDll::with_state(MockState {

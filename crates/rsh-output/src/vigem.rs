@@ -1,8 +1,8 @@
-//! Xbox 360 output via ViGEmBus (v2.0.19).
+//! Xbox 360 output via `ViGEmBus` (v2.0.19).
 //!
 //! The fallback backend for games that do not accept a vJoy wheel:
 //! RSH presents as a wired Xbox 360 controller through the
-//! ViGEmBus kernel driver, using the ViGEmClient API directly.
+//! `ViGEmBus` kernel driver, using the `ViGEmClient` API directly.
 //! No `vigem` crate (unverified, single maintainer) — raw FFI
 //! through `libloading`, the same rule as the vJoy backend.
 //!
@@ -10,15 +10,15 @@
 //!
 //! `ViGEmClient.dll` is NOT the driver — it is the user-mode
 //! client library, shipped beside `rsh-daemon.exe` (never
-//! installed system-wide). The driver is ViGEmBus itself; the
+//! installed system-wide). The driver is `ViGEmBus` itself; the
 //! authoritative "is it installed" check is `vigem_connect()`
 //! returning `VIGEM_ERROR_BUS_NOT_FOUND` (`0xE0000001`). The
-//! wizard offers the official ViGEmBus 1.22.0 setup EXE for an
+//! wizard offers the official `ViGEmBus` 1.22.0 setup EXE for an
 //! interactive install when the driver is missing.
 //!
 //! # Thread safety
 //!
-//! The ViGEmBus client library is NOT thread-safe — one client
+//! The `ViGEmBus` client library is NOT thread-safe — one client
 //! only, guarded by the [`Mutex`] in [`VigemOutput`]. Every FFI
 //! call goes through that lock (and the trait hands out `&mut
 //! self`, so calls are serialized twice over). `vigem_connect`
@@ -44,7 +44,7 @@
 //!
 //! # Error convention
 //!
-//! ViGEm success is `0x20000000`, NOT 0. All errors are
+//! `ViGEm` success is `0x20000000`, NOT 0. All errors are
 //! `0xE00000xx`. [`VigemError`] converts into the trait's
 //! [`VJoyError`](crate::vjoy::VJoyError) so the selector's
 //! fallback wording stays the same shape as vJoy's.
@@ -61,12 +61,12 @@ use libloading::{Library, Symbol};
 use crate::vjoy::VJoyError;
 use crate::{IJoystickOutput, ProcessedState};
 
-/// File name of the ViGEmBus client library. Shipped beside
+/// File name of the `ViGEmBus` client library. Shipped beside
 /// `rsh-daemon.exe` by the RSH installer (same rule as the vJoy
 /// DLL: never bundled into the repo, resolved at runtime).
 pub const VIGEM_DLL_FILE_NAME: &str = "ViGEmClient.dll";
 
-/// ViGEm success — `0x20000000`, NOT 0.
+/// `ViGEm` success — `0x20000000`, NOT 0.
 pub const VIGEM_ERROR_NONE: u32 = 0x2000_0000;
 /// No compatible bus driver on the system — the "driver not
 /// installed" signal.
@@ -90,7 +90,7 @@ pub const XUSB_BUTTON_A: u16 = 0x1000;
 pub const XUSB_BUTTON_X: u16 = 0x4000;
 
 /// `XUSB_REPORT` — the 12-byte Xbox 360 report, identical to
-/// `XINPUT_GAMEPAD` (ViGEm README, Microsoft Learn, ViGEm SDK
+/// `XINPUT_GAMEPAD` (`ViGEm` README, Microsoft Learn, `ViGEm` SDK
 /// `BusShared.h`). `#[repr(C)]`, no padding: `size_of` must be
 /// exactly 12 (asserted below).
 #[repr(C)]
@@ -103,7 +103,7 @@ pub struct XusbReport {
     /// Right trigger, 0..=255, offset 3 — the accelerator.
     pub b_right_trigger: u8,
     /// Left stick X, −32768..=32767, offset 4 — the steering
-    /// (positive = right, XInput convention).
+    /// (positive = right, `XInput` convention).
     pub s_thumb_lx: i16,
     /// Left stick Y, offset 6 — unused, always 0.
     pub s_thumb_ly: i16,
@@ -123,7 +123,7 @@ const _: () = assert!(offset_of!(XusbReport, s_thumb_ly) == 6);
 const _: () = assert!(offset_of!(XusbReport, s_thumb_rx) == 8);
 const _: () = assert!(offset_of!(XusbReport, s_thumb_ry) == 10);
 
-/// An opaque ViGEmBus handle (client or target) as returned by
+/// An opaque `ViGEmBus` handle (client or target) as returned by
 /// `vigem_alloc` / `vigem_target_x360_alloc`.
 ///
 /// `*mut c_void` is not `Send` (the extern type carries no
@@ -136,6 +136,28 @@ const _: () = assert!(offset_of!(XusbReport, s_thumb_ry) == 10);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct VigemHandle(*mut c_void);
 unsafe impl Send for VigemHandle {}
+
+/// Convert a 0..=1 pedal value to a trigger byte 0..=255.
+/// The value is clamped to the target range first, so the cast
+/// cannot truncate out of range.
+fn trigger_byte(value: f32) -> u8 {
+    let scaled = (value.clamp(0.0, 1.0) * 255.0).clamp(0.0, 255.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        scaled as u8
+    }
+}
+
+/// Convert a scaled stick value to `i16`. The value is clamped to
+/// the target range (-32768..=32767) first, so the cast cannot
+/// truncate out of range.
+fn stick_i16(scaled: f32) -> i16 {
+    let clamped = scaled.clamp(-32768.0, 32767.0);
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        clamped as i16
+    }
+}
 
 /// Map one processed tick to an [`XusbReport`] (pure, testable on
 /// any OS — no driver, no DLL).
@@ -170,19 +192,19 @@ pub fn build_report(state: &ProcessedState) -> XusbReport {
     }
     XusbReport {
         w_buttons: buttons,
-        b_left_trigger: (state.brake.clamp(0.0, 1.0) * 255.0) as u8,
-        b_right_trigger: (state.accelerator.clamp(0.0, 1.0) * 255.0) as u8,
-        s_thumb_lx: (state.steering.clamp(-1.0, 1.0) * 32767.0) as i16,
+        b_left_trigger: trigger_byte(state.brake),
+        b_right_trigger: trigger_byte(state.accelerator),
+        s_thumb_lx: stick_i16(state.steering.clamp(-1.0, 1.0) * 32767.0),
         s_thumb_ly: 0,
         s_thumb_rx: 0,
-        s_thumb_ry: (-(state.clutch.clamp(0.0, 1.0) * 32768.0)) as i16,
+        s_thumb_ry: stick_i16(-(state.clutch.clamp(0.0, 1.0) * 32768.0)),
     }
 }
 
-/// Everything that can go wrong in the Xbox (ViGEmBus) backend.
+/// Everything that can go wrong in the Xbox (`ViGEmBus`) backend.
 ///
 /// Display strings are the human-readable reason: the caller shows
-/// them verbatim, so they name the fix ("install the ViGEmBus
+/// them verbatim, so they name the fix ("install the `ViGEmBus`
 /// driver …"), never just a code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VigemError {
@@ -191,7 +213,7 @@ pub enum VigemError {
     /// `libloading` could not load the DLL or resolve a symbol.
     DllLoadFailed(String),
     /// `vigem_connect` returned `VIGEM_ERROR_BUS_NOT_FOUND` —
-    /// the ViGEmBus driver is not installed.
+    /// the `ViGEmBus` driver is not installed.
     BusNotFound,
     /// `vigem_connect` failed with a non-bus error (raw code).
     ConnectFailed(u32),
@@ -280,30 +302,62 @@ type VigemTargetFreeFn = unsafe extern "C" fn(*mut c_void);
 /// signature must match (`XUSB_REPORT`, 12 bytes, by value).
 type VigemTargetX360UpdateFn = unsafe extern "C" fn(*mut c_void, *mut c_void, XusbReport) -> u32;
 
-/// The ViGEmBus client calls RSH needs, behind a trait so the
+/// The `ViGEmBus` client calls RSH needs, behind a trait so the
 /// whole backend (except the literal `Library::new`) runs on a
 /// mock in tests with no driver installed.
 pub trait VigemApi: Send {
     /// `vigem_alloc` — NULL on OOM only, NOT on a missing driver.
     fn alloc(&mut self) -> *mut c_void;
     /// `vigem_free`.
-    fn free(&mut self, client: *mut c_void);
+    ///
+    /// # Safety
+    ///
+    /// `client` must be a valid non-null client handle from this API's `alloc`.
+    unsafe fn free(&mut self, client: *mut c_void);
     /// `vigem_connect` — expensive, call once at connect.
-    fn connect(&mut self, client: *mut c_void) -> u32;
+    ///
+    /// # Safety
+    ///
+    /// `client` must be a valid non-null client handle from this API's `alloc`.
+    unsafe fn connect(&mut self, client: *mut c_void) -> u32;
     /// `vigem_disconnect` — destroys attached targets, does NOT
     /// free target objects.
-    fn disconnect(&mut self, client: *mut c_void);
+    ///
+    /// # Safety
+    ///
+    /// `client` must be a valid non-null client handle from this API's `alloc`.
+    unsafe fn disconnect(&mut self, client: *mut c_void);
     /// `vigem_target_x360_alloc`.
     fn target_x360_alloc(&mut self) -> *mut c_void;
     /// `vigem_target_add` — blocks until fully operational.
-    fn target_add(&mut self, client: *mut c_void, target: *mut c_void) -> u32;
+    ///
+    /// # Safety
+    ///
+    /// `client` and `target` must be valid non-null handles from this API's
+    /// `alloc` / `target_x360_alloc`.
+    unsafe fn target_add(&mut self, client: *mut c_void, target: *mut c_void) -> u32;
     /// `vigem_target_remove` — unplug; the target object is
     /// reusable afterwards.
-    fn target_remove(&mut self, client: *mut c_void, target: *mut c_void) -> u32;
+    ///
+    /// # Safety
+    ///
+    /// `client` and `target` must be valid non-null handles from this API's
+    /// `alloc` / `target_x360_alloc`, with `target` added to `client`.
+    unsafe fn target_remove(&mut self, client: *mut c_void, target: *mut c_void) -> u32;
     /// `vigem_target_free` — removing first is the caller's job.
-    fn target_free(&mut self, target: *mut c_void);
+    ///
+    /// # Safety
+    ///
+    /// `target` must be a valid non-null handle from this API's
+    /// `target_x360_alloc`, removed first.
+    unsafe fn target_free(&mut self, target: *mut c_void);
     /// `vigem_target_x360_update` — report BY VALUE.
-    fn target_x360_update(
+    ///
+    /// # Safety
+    ///
+    /// `client` and `target` must be valid non-null handles from this API's
+    /// `alloc` / `target_x360_alloc`, with `target` added to `client`.
+    unsafe fn target_x360_update(
         &mut self,
         client: *mut c_void,
         target: *mut c_void,
@@ -388,15 +442,15 @@ impl VigemApi for RealVigemApi {
         // SAFETY: the pointer comes from the loaded `vigem_alloc`.
         unsafe { (self.alloc)() }
     }
-    fn free(&mut self, client: *mut c_void) {
+    unsafe fn free(&mut self, client: *mut c_void) {
         // SAFETY: `client` was allocated by this API's `alloc`.
         unsafe { (self.free)(client) }
     }
-    fn connect(&mut self, client: *mut c_void) -> u32 {
+    unsafe fn connect(&mut self, client: *mut c_void) -> u32 {
         // SAFETY: `client` was allocated by this API's `alloc`.
         unsafe { (self.connect)(client) }
     }
-    fn disconnect(&mut self, client: *mut c_void) {
+    unsafe fn disconnect(&mut self, client: *mut c_void) {
         // SAFETY: `client` was allocated by this API's `alloc`.
         unsafe { (self.disconnect)(client) }
     }
@@ -405,20 +459,20 @@ impl VigemApi for RealVigemApi {
         // `vigem_target_x360_alloc`.
         unsafe { (self.target_x360_alloc)() }
     }
-    fn target_add(&mut self, client: *mut c_void, target: *mut c_void) -> u32 {
+    unsafe fn target_add(&mut self, client: *mut c_void, target: *mut c_void) -> u32 {
         // SAFETY: both handles come from this API.
         unsafe { (self.target_add)(client, target) }
     }
-    fn target_remove(&mut self, client: *mut c_void, target: *mut c_void) -> u32 {
+    unsafe fn target_remove(&mut self, client: *mut c_void, target: *mut c_void) -> u32 {
         // SAFETY: both handles come from this API.
         unsafe { (self.target_remove)(client, target) }
     }
-    fn target_free(&mut self, target: *mut c_void) {
+    unsafe fn target_free(&mut self, target: *mut c_void) {
         // SAFETY: `target` was allocated by this API's
         // `target_x360_alloc` and removed first by the caller.
         unsafe { (self.target_free)(target) }
     }
-    fn target_x360_update(
+    unsafe fn target_x360_update(
         &mut self,
         client: *mut c_void,
         target: *mut c_void,
@@ -456,7 +510,7 @@ pub fn resolve_dll_path_from_exe(exe: Option<&Path>) -> Option<PathBuf> {
 // Backend
 // ---------------------------------------------------------------------
 
-/// FFI state, behind the [`Mutex`] — the ViGEmBus client is not
+/// FFI state, behind the [`Mutex`] — the `ViGEmBus` client is not
 /// thread-safe, so every call below locks first.
 struct VigemInner {
     api: Option<Box<dyn VigemApi>>,
@@ -465,7 +519,7 @@ struct VigemInner {
     connected: bool,
 }
 
-/// Xbox 360 output via ViGEmBus.
+/// Xbox 360 output via `ViGEmBus`.
 ///
 /// `new()` never fails: a missing DLL just means [`try_connect`](IJoystickOutput::try_connect)
 /// fails later with [`VJoyError::DriverNotFound`] naming the fix —
@@ -501,7 +555,7 @@ impl VigemOutput {
         // — recover the state instead of crashing the daemon.
         self.inner
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Teardown, best-effort, never panics. Called by
@@ -515,14 +569,25 @@ impl VigemOutput {
             // orphaned until process exit), then disconnect the
             // client, then free both objects. Every result is
             // ignored on purpose — teardown must not fail.
-            let _ = api.target_remove(inner.client.0, inner.target.0);
-            api.target_free(inner.target.0);
-            api.disconnect(inner.client.0);
-            api.free(inner.client.0);
+            // SAFETY: `client`/`target` are the handles this API
+            // allocated and plugged in; teardown only runs while
+            // connected, and the target is removed before it is freed.
+            unsafe {
+                let _ = api.target_remove(inner.client.0, inner.target.0);
+                api.target_free(inner.target.0);
+                api.disconnect(inner.client.0);
+                api.free(inner.client.0);
+            }
         }
         inner.client = VigemHandle(null_mut());
         inner.target = VigemHandle(null_mut());
         inner.connected = false;
+    }
+}
+
+impl Default for VigemOutput {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -553,10 +618,13 @@ impl IJoystickOutput for VigemOutput {
         // The borrow of `inner.api` must end before the
         // `inner.client`/`inner.target` writes below, so the whole
         // driver conversation happens in this scope and only plain
-        // handles escape it. (No `unsafe` here: the calls go
-        // through the safe `VigemApi` trait — the raw FFI lives
-        // in `RealVigemApi`.)
-        let outcome = {
+        // handles escape it. The `VigemApi` calls that take handles
+        // are `unsafe` (raw-pointer args), so the scope is an
+        // `unsafe` block; the raw FFI itself lives in `RealVigemApi`.
+        // SAFETY: every handle here comes from this API's `alloc` /
+        // `target_x360_alloc`, and each is freed/disconnected on
+        // every failure path before the scope ends.
+        let outcome = unsafe {
             let api = inner.api.as_mut().expect("checked above");
             let client = VigemHandle(api.alloc());
             if client.0.is_null() {
@@ -564,14 +632,7 @@ impl IJoystickOutput for VigemOutput {
                 Err(VigemError::ClientAllocFailed)
             } else {
                 let rc = api.connect(client.0);
-                if rc != VIGEM_ERROR_NONE {
-                    api.free(client.0);
-                    if rc == VIGEM_ERROR_BUS_NOT_FOUND {
-                        Err(VigemError::BusNotFound)
-                    } else {
-                        Err(VigemError::ConnectFailed(rc))
-                    }
-                } else {
+                if rc == VIGEM_ERROR_NONE {
                     let target = VigemHandle(api.target_x360_alloc());
                     if target.0.is_null() {
                         api.disconnect(client.0);
@@ -581,14 +642,21 @@ impl IJoystickOutput for VigemOutput {
                         // `vigem_target_add` BLOCKS until the
                         // target is fully operational.
                         let rc = api.target_add(client.0, target.0);
-                        if rc != VIGEM_ERROR_NONE {
+                        if rc == VIGEM_ERROR_NONE {
+                            Ok((client, target))
+                        } else {
                             api.target_free(target.0);
                             api.disconnect(client.0);
                             api.free(client.0);
                             Err(VigemError::TargetAddFailed(rc))
-                        } else {
-                            Ok((client, target))
                         }
+                    }
+                } else {
+                    api.free(client.0);
+                    if rc == VIGEM_ERROR_BUS_NOT_FOUND {
+                        Err(VigemError::BusNotFound)
+                    } else {
+                        Err(VigemError::ConnectFailed(rc))
                     }
                 }
             }
@@ -620,7 +688,9 @@ impl IJoystickOutput for VigemOutput {
         let api = inner.api.as_mut().expect("connected implies an API");
         // `client`/`target` are the handles this API plugged in;
         // the report goes BY VALUE.
-        let rc = api.target_x360_update(client, target, report);
+        // SAFETY: both handles come from this API's `alloc` /
+        // `target_x360_alloc` and were added at connect.
+        let rc = unsafe { api.target_x360_update(client, target, report) };
         if rc != VIGEM_ERROR_NONE {
             return Err(VigemError::UpdateFailed(rc).into());
         }
@@ -688,14 +758,14 @@ mod tests {
                 0x1000 as *mut c_void
             }
         }
-        fn free(&mut self, _client: *mut c_void) {
+        unsafe fn free(&mut self, _client: *mut c_void) {
             self.calls.push(MockCall::Free);
         }
-        fn connect(&mut self, _client: *mut c_void) -> u32 {
+        unsafe fn connect(&mut self, _client: *mut c_void) -> u32 {
             self.calls.push(MockCall::Connect);
             self.connect_rc
         }
-        fn disconnect(&mut self, _client: *mut c_void) {
+        unsafe fn disconnect(&mut self, _client: *mut c_void) {
             self.calls.push(MockCall::Disconnect);
         }
         fn target_x360_alloc(&mut self) -> *mut c_void {
@@ -706,18 +776,18 @@ mod tests {
                 0x2000 as *mut c_void
             }
         }
-        fn target_add(&mut self, _client: *mut c_void, _target: *mut c_void) -> u32 {
+        unsafe fn target_add(&mut self, _client: *mut c_void, _target: *mut c_void) -> u32 {
             self.calls.push(MockCall::TargetAdd);
             self.target_add_rc
         }
-        fn target_remove(&mut self, _client: *mut c_void, _target: *mut c_void) -> u32 {
+        unsafe fn target_remove(&mut self, _client: *mut c_void, _target: *mut c_void) -> u32 {
             self.calls.push(MockCall::TargetRemove);
             VIGEM_ERROR_NONE
         }
-        fn target_free(&mut self, _target: *mut c_void) {
+        unsafe fn target_free(&mut self, _target: *mut c_void) {
             self.calls.push(MockCall::TargetFree);
         }
-        fn target_x360_update(
+        unsafe fn target_x360_update(
             &mut self,
             _client: *mut c_void,
             _target: *mut c_void,
@@ -736,37 +806,46 @@ mod tests {
             fn alloc(&mut self) -> *mut c_void {
                 self.0.lock().unwrap().alloc()
             }
-            fn free(&mut self, client: *mut c_void) {
-                self.0.lock().unwrap().free(client);
+            unsafe fn free(&mut self, client: *mut c_void) {
+                // SAFETY: the caller upholds the trait contract.
+                unsafe { self.0.lock().unwrap().free(client) }
             }
-            fn connect(&mut self, client: *mut c_void) -> u32 {
-                self.0.lock().unwrap().connect(client)
+            unsafe fn connect(&mut self, client: *mut c_void) -> u32 {
+                // SAFETY: the caller upholds the trait contract.
+                unsafe { self.0.lock().unwrap().connect(client) }
             }
-            fn disconnect(&mut self, client: *mut c_void) {
-                self.0.lock().unwrap().disconnect(client);
+            unsafe fn disconnect(&mut self, client: *mut c_void) {
+                // SAFETY: the caller upholds the trait contract.
+                unsafe { self.0.lock().unwrap().disconnect(client) }
             }
             fn target_x360_alloc(&mut self) -> *mut c_void {
                 self.0.lock().unwrap().target_x360_alloc()
             }
-            fn target_add(&mut self, client: *mut c_void, target: *mut c_void) -> u32 {
-                self.0.lock().unwrap().target_add(client, target)
+            unsafe fn target_add(&mut self, client: *mut c_void, target: *mut c_void) -> u32 {
+                // SAFETY: the caller upholds the trait contract.
+                unsafe { self.0.lock().unwrap().target_add(client, target) }
             }
-            fn target_remove(&mut self, client: *mut c_void, target: *mut c_void) -> u32 {
-                self.0.lock().unwrap().target_remove(client, target)
+            unsafe fn target_remove(&mut self, client: *mut c_void, target: *mut c_void) -> u32 {
+                // SAFETY: the caller upholds the trait contract.
+                unsafe { self.0.lock().unwrap().target_remove(client, target) }
             }
-            fn target_free(&mut self, target: *mut c_void) {
-                self.0.lock().unwrap().target_free(target);
+            unsafe fn target_free(&mut self, target: *mut c_void) {
+                // SAFETY: the caller upholds the trait contract.
+                unsafe { self.0.lock().unwrap().target_free(target) }
             }
-            fn target_x360_update(
+            unsafe fn target_x360_update(
                 &mut self,
                 client: *mut c_void,
                 target: *mut c_void,
                 report: XusbReport,
             ) -> u32 {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .target_x360_update(client, target, report)
+                // SAFETY: the caller upholds the trait contract.
+                unsafe {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .target_x360_update(client, target, report)
+                }
             }
         }
         let shared = std::sync::Arc::new(Mutex::new(mock));
@@ -821,15 +900,19 @@ mod tests {
 
     #[test]
     fn build_report_shifter_down_is_dpad_down() {
-        let mut state = ProcessedState::default();
-        state.buttons = 0b10;
+        let state = ProcessedState {
+            buttons: 0b10,
+            ..Default::default()
+        };
         assert_eq!(build_report(&state).w_buttons, XUSB_DPAD_DOWN);
     }
 
     #[test]
     fn build_report_clutch_is_analog() {
-        let mut state = ProcessedState::default();
-        state.clutch = 0.5;
+        let mut state = ProcessedState {
+            clutch: 0.5,
+            ..Default::default()
+        };
         assert_eq!(build_report(&state).s_thumb_ry, -16384);
         state.clutch = 0.0;
         assert_eq!(build_report(&state).s_thumb_ry, 0);
@@ -837,8 +920,10 @@ mod tests {
 
     #[test]
     fn build_report_steering_left_is_negative() {
-        let mut state = ProcessedState::default();
-        state.steering = -1.0;
+        let mut state = ProcessedState {
+            steering: -1.0,
+            ..Default::default()
+        };
         assert_eq!(build_report(&state).s_thumb_lx, -32767);
         state.steering = 0.0;
         assert_eq!(build_report(&state).s_thumb_lx, 0);
@@ -846,11 +931,13 @@ mod tests {
 
     #[test]
     fn build_report_clamps_out_of_range_inputs() {
-        let mut state = ProcessedState::default();
-        state.steering = 2.0;
-        state.accelerator = 2.0;
-        state.brake = -1.0;
-        state.clutch = -1.0;
+        let state = ProcessedState {
+            steering: 2.0,
+            accelerator: 2.0,
+            brake: -1.0,
+            clutch: -1.0,
+            ..Default::default()
+        };
         let report = build_report(&state);
         assert_eq!(report.s_thumb_lx, 32767);
         assert_eq!(report.b_right_trigger, 255);
@@ -869,7 +956,6 @@ mod tests {
     #[test]
     fn build_report_handbrake_needs_a_real_pull() {
         let mut state = ProcessedState::default();
-        state.handbrake = 0.0;
         assert_eq!(build_report(&state).w_buttons & XUSB_BUTTON_A, 0);
         state.handbrake = 0.01;
         assert_ne!(build_report(&state).w_buttons & XUSB_BUTTON_A, 0);

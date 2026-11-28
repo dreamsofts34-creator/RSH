@@ -26,7 +26,7 @@ use crate::vjoy::VJoyError;
 ///
 /// Display strings are the human-readable reason (the C# `out string
 /// error`): the Output page shows them verbatim, so they name the fix
-/// ("install vJoy ...", "install the ViGEmBus driver ..."), never just a code.
+/// ("install vJoy ...", "install the `ViGEmBus` driver ..."), never just a code.
 /// Every variant mirrors [`VJoyError`] exactly (same wording), so
 /// a future trait migration maps variant-for-variant with no
 /// message change.

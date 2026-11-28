@@ -109,7 +109,7 @@
 //! envelope: a Steam FH4 `OEMData` wheel flag on the vJoy OEM key
 //! and a `Windows.Gaming.Input` `RacingWheel` mapping tree. Both
 //! are deleted in v2.0.19 — RSH is simply a controller now (vJoy
-//! default, Xbox via ViGEmBus as fallback), and games classify
+//! default, Xbox via `ViGEmBus` as fallback), and games classify
 //! it themselves. The leftover `OEMData` value on a user's PC is
 //! cleaned up in two halves: the installer deletes the HKLM half
 //! at install time, and the daemon deletes the HKCU half on first

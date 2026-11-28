@@ -4,9 +4,9 @@
 //! so it can be tested with a mock backend and no driver installed.
 //!
 //! Backends (v2.0.19): vJoy (default, hand-written FFI — see
-//! [`vjoy`]; the DLL is never bundled) and Xbox via ViGEmBus
+//! [`vjoy`]; the DLL is never bundled) and Xbox via `ViGEmBus`
 //! (fallback for games that do not accept a vJoy wheel — see
-//! [`vigem`]; the ViGEmBus driver is installed separately, the
+//! [`vigem`]; the `ViGEmBus` driver is installed separately, the
 //! client DLL ships beside the daemon).
 //!
 //! The backend selector lives in [`selector`]: [`BackendKind`]
