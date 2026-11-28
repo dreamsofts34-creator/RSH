@@ -4158,16 +4158,33 @@ impl Ctx {
                     return;
                 }
                 match result {
-                    Ok(info) => {
-                        // CORE-13 (v2.0.12): `connect_started:
+                    Ok(info) if info.connect_started == Some(false) => {
+                        // v2.0.20 (Bug 2): `connect_started:
                         // Some(false)` means the call no-op'd
                         // because a retry was already in flight —
-                        // the switch itself is accepted (the
-                        // in-flight retry carries the session), so
-                        // there is nothing to revert or toast; the
-                        // outcome surfaces via the poller, which
-                        // the refresh below picks up. The value is
-                        // logged so a no-op switch is diagnosable.
+                        // the daemon NEVER switched transport, so
+                        // the UI must not show the new one either.
+                        // (v2.0.12 CORE-13 treated this as an
+                        // accepted switch; the in-flight retry
+                        // carries the OLD session, so the switch the
+                        // user saw was not the switch that happened
+                        // — the toggle stayed on the new transport
+                        // while the daemon stayed on the old one.)
+                        // Treat it like the Err arm: revert the
+                        // toggle and say so.
+                        if let Some(i) = index {
+                            win.set_transport(1 - i);
+                        }
+                        self.notify_error(
+                            win,
+                            "Connection",
+                            &UserError::from_connection(
+                                ConnectionError::Unknown,
+                                "A connection retry is already in flight — try again in a moment.",
+                            ),
+                        );
+                    }
+                    Ok(info) => {
                         ui_log!(
                             "RSH-UI transport switch ok: {} (connect_started={:?})",
                             info.label,
@@ -15380,6 +15397,108 @@ mod tests {
         ctx.clear_status(&win);
         assert_eq!(win.get_status_more(), 0);
         assert_eq!(win.get_status_text().as_str(), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v2.0.20 (Bug 2): a transport switch that no-op'd because a
+    /// retry was already in flight (`connect_started: Some(false)`)
+    /// reverts the UI toggle and toasts — it must NOT leave the
+    /// radio on the new transport while the daemon stays on the old
+    /// one (the v2.0.12 CORE-13 behaviour). A genuine switch
+    /// (`Some(true)`) keeps the new selection.
+    #[test]
+    fn transport_switch_noop_reverts_toggle_and_toasts() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("transport no-op test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        // The job must be busy or `apply_job_done` ignores the result.
+        ctx.busy_jobs.borrow_mut().insert(
+            JobKind::Transport,
+            (
+                "Switching connection…".to_string(),
+                Instant::now(),
+                JobKind::Transport.timeout(),
+            ),
+        );
+        // The user clicked USB (segment 1); the daemon no-op'd.
+        win.set_transport(1);
+        let noop_info = ConnectionInfo {
+            state: ConnectionState::Backoff {
+                wait_ms: 2000,
+                attempt: 1,
+            },
+            label: "Reconnecting".to_string(),
+            transport: ApiTransport::Wifi,
+            address: "192.168.4.1".to_string(),
+            session_active: false,
+            board_reachable: false,
+            error: None,
+            hint: None,
+            connect_started: Some(false),
+        };
+        ctx.apply_job_done(
+            &win,
+            JobDone::Transport {
+                index: Some(1),
+                result: Ok(noop_info),
+            },
+        );
+        assert_eq!(
+            win.get_transport(),
+            0,
+            "no-op switch must revert the toggle to Wi-Fi"
+        );
+        assert!(
+            win.get_status_text()
+                .as_str()
+                .contains("retry is already in flight"),
+            "no-op switch must toast, got: {}",
+            win.get_status_text()
+        );
+        assert_eq!(win.get_status_kind().as_str(), "error");
+
+        // A genuine switch keeps the new selection and toasts nothing.
+        ctx.busy_jobs.borrow_mut().insert(
+            JobKind::Transport,
+            (
+                "Switching connection…".to_string(),
+                Instant::now(),
+                JobKind::Transport.timeout(),
+            ),
+        );
+        win.set_transport(1);
+        ctx.clear_status(&win);
+        let ok_info = ConnectionInfo {
+            state: ConnectionState::Active,
+            label: "Connected".to_string(),
+            transport: ApiTransport::Usb,
+            address: String::new(),
+            session_active: true,
+            board_reachable: true,
+            error: None,
+            hint: None,
+            connect_started: Some(true),
+        };
+        ctx.apply_job_done(
+            &win,
+            JobDone::Transport {
+                index: Some(1),
+                result: Ok(ok_info),
+            },
+        );
+        assert_eq!(
+            win.get_transport(),
+            1,
+            "a started switch keeps the new selection"
+        );
+        assert_eq!(
+            win.get_status_text().as_str(),
+            "",
+            "a started switch must not toast"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

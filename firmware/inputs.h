@@ -222,6 +222,17 @@ struct AxisHealth {
   }
 };
 
+// v2.0.20 (user patch): the global stream flag covers bits 0-3
+// only — steering/accel/brake/clutch, exactly 4.0.5 behaviour.
+// Handbrake bit 4 stays in the per-axis mask for diagnostics but
+// must never raise the flag: a floating handbrake pin trips the
+// jitter rule (EMA > 150 counts) with no rail involved, and the
+// PC holds EVERY axis while the flag is set. Pure helper, so the
+// host tests can cover the rule directly.
+static inline bool rsh_axis_invalid_from_mask(uint8_t mask) {
+  return (mask & 0x0F) != 0;
+}
+
 // ---- mV fallback decisions (F13) — pure helpers, inputs.cpp istemal karta hai
 // Boot par bhi aur periodic recheck par bhi yahi faisla hota hai.
 static inline bool rsh_mv_should_fallback(uint32_t rawSum, uint32_t mvSum, uint8_t n) {
@@ -276,5 +287,6 @@ void inputs_set_pedal_analog(bool accelAnalog, bool brakeAnalog);
 // bit3 clutch (Phase F WS5), bit4 handbrake (F-04, polish round),
 // 1 = invalid, F2
 uint8_t inputs_axis_invalid_mask();
+// Global stream flag: bits 0-3 only (handbrake bit 4 is diagnostic-only, v2.0.20).
 bool inputs_axis_invalid();
 SampleGovernor &inputs_governor();   // adaptive sampling (neeche dekho)

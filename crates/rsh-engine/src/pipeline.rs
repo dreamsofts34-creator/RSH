@@ -780,14 +780,27 @@ impl ProcessingPipeline {
     /// glitch filter it used to scale was deleted with the
     /// encoders, so `skipped` is accepted and ignored.)
     ///
-    /// P2-1: when `frame.flags.axis_invalid` is set, the axis
-    /// sample is untrusted (the board flags a rail-stuck / failed
-    /// axis, whose value sits at full deflection) — the axes hold
-    /// their last good outputs instead of being driven from it.
-    /// Filters/ramps are not fed the suspect sample, so resuming
-    /// after the flag clears continues from the held state. Buttons
-    /// still process the live frame (the flag is about
-    /// axes only). Before any good frame the hold is neutral.
+    /// P2-1: when `frame.flags.axis_invalid` is set, the suspect
+    /// axis sample is untrusted (the board flags a rail-stuck /
+    /// failed axis, whose value sits at full deflection) — that axis
+    /// holds its last good output instead of being driven from it.
+    ///
+    /// v2.0.20 (RC-1): the hold is PER-AXIS. The wire carries only
+    /// one bit (protocol v2.2 frozen — no per-axis mask), so the
+    /// suspect is identified from the frame itself: an axis whose
+    /// sample sits at rail (0 or `DEFAULT_MAX_MV` mV) is the one the
+    /// board's rail-stuck criterion fires on, and only it is held;
+    /// every other axis is processed live — a released handbrake at
+    /// rail 0 used to freeze the steering too. When NO axis is at
+    /// rail the flag must come from jitter or an I2C failure, which
+    /// no frame value can identify, so every present axis is held
+    /// (the old behaviour) rather than trusting an unknown suspect. A missing
+    /// axis (`None`) is never held — there is no sample to distrust,
+    /// and the axis processors already emit neutral for it.
+    /// Filters/ramps are not fed a held sample, so resuming after
+    /// the flag clears continues from the held state. Buttons still
+    /// process the live frame (the flag is about axes only). Before
+    /// any good frame the hold is neutral.
     #[must_use]
     pub fn process_with_gap(&mut self, frame: &StreamFrame, skipped: u16) -> OutputState {
         let mut out = OutputState::neutral();
@@ -797,21 +810,28 @@ impl ProcessingPipeline {
         // (+21 ns/tick on criterion) — the local copies scalarize
         // into registers, while the reference re-loads tuning
         // fields from memory on every access. Copies stay.
-        if frame.flags.axis_invalid {
-            // P2-1 hold-last-good (see the doc comment above).
-            out.steering = self.last_good_axes[0];
-            out.accelerator = self.last_good_axes[1];
-            out.brake = self.last_good_axes[2];
-            out.clutch = self.last_good_axes[3];
-            out.handbrake = self.last_good_axes[4];
+        //
+        // v2.0.20 (RC-1): per-axis P2-1 hold — `held[i]` is true
+        // only for the suspect axis (see `invalid_hold_axes`).
+        // A held axis keeps its last good output and its filter /
+        // ramp are not fed; every other axis is processed live and
+        // refreshes its own last-good slot.
+        let held = invalid_hold_axes(frame);
+        let steering_tuning = self.plan.steering;
+        if held[STEERING_SLOT] {
+            out.steering = self.last_good_axes[STEERING_SLOT];
         } else {
-            let steering_tuning = self.plan.steering;
             out.steering = process_steering_axis(
                 frame.axes_mv[STEERING_SLOT],
                 &steering_tuning,
                 &mut self.steering_filter,
             );
-            let accel_tuning = self.plan.accelerator;
+            self.last_good_axes[STEERING_SLOT] = out.steering;
+        }
+        let accel_tuning = self.plan.accelerator;
+        if held[ACCEL_SLOT] {
+            out.accelerator = self.last_good_axes[ACCEL_SLOT];
+        } else {
             out.accelerator = process_pedal_axis(
                 frame.axes_mv[ACCEL_SLOT],
                 &accel_tuning,
@@ -819,7 +839,12 @@ impl ProcessingPipeline {
                 &mut self.accel_ramp,
             )
             .0;
-            let brake_tuning = self.plan.brake;
+            self.last_good_axes[ACCEL_SLOT] = out.accelerator;
+        }
+        let brake_tuning = self.plan.brake;
+        if held[BRAKE_SLOT] {
+            out.brake = self.last_good_axes[BRAKE_SLOT];
+        } else {
             out.brake = process_pedal_axis(
                 frame.axes_mv[BRAKE_SLOT],
                 &brake_tuning,
@@ -827,7 +852,12 @@ impl ProcessingPipeline {
                 &mut self.brake_ramp,
             )
             .0;
-            let clutch_tuning = self.plan.clutch;
+            self.last_good_axes[BRAKE_SLOT] = out.brake;
+        }
+        let clutch_tuning = self.plan.clutch;
+        if held[CLUTCH_SLOT] {
+            out.clutch = self.last_good_axes[CLUTCH_SLOT];
+        } else {
             out.clutch = process_pedal_axis(
                 frame.axes_mv[CLUTCH_SLOT],
                 &clutch_tuning,
@@ -835,30 +865,37 @@ impl ProcessingPipeline {
                 &mut self.clutch_ramp,
             )
             .0;
-            let handbrake_tuning = self.plan.handbrake;
-            let (handbrake_value, handbrake_pressed) = process_pedal_axis(
+            self.last_good_axes[CLUTCH_SLOT] = out.clutch;
+        }
+        let handbrake_tuning = self.plan.handbrake;
+        // A held handbrake feeds the latch its held output for both
+        // value and pressed (same 0..=1 domain) — the latch state
+        // freezes with the output instead of toggling on a suspect
+        // sample. The last-good slot takes the LATCHED output below
+        // (as before), never the raw pedal value.
+        let (handbrake_value, handbrake_pressed) = if held[HANDBRAKE_SLOT] {
+            let held_value = self.last_good_axes[HANDBRAKE_SLOT];
+            (held_value, held_value)
+        } else {
+            process_pedal_axis(
                 frame.axes_mv[HANDBRAKE_SLOT],
                 &handbrake_tuning,
                 &mut self.handbrake_filter,
                 &mut self.handbrake_ramp,
-            );
-            // H1/H3: the latch holds the output at full after the input
-            // is released (and auto-release drops it on throttle).
-            // The accelerator is already processed above, so the
-            // 20% throttle test reads this tick's value.
-            out.handbrake = self.apply_handbrake_latch(
-                handbrake_value,
-                handbrake_pressed,
-                out.accelerator,
-                frame.axes_mv[HANDBRAKE_SLOT].is_some(),
-            );
-            self.last_good_axes = [
-                out.steering,
-                out.accelerator,
-                out.brake,
-                out.clutch,
-                out.handbrake,
-            ];
+            )
+        };
+        // H1/H3: the latch holds the output at full after the input
+        // is released (and auto-release drops it on throttle).
+        // The accelerator is already processed above, so the
+        // 20% throttle test reads this tick's value.
+        out.handbrake = self.apply_handbrake_latch(
+            handbrake_value,
+            handbrake_pressed,
+            out.accelerator,
+            frame.axes_mv[HANDBRAKE_SLOT].is_some(),
+        );
+        if !held[HANDBRAKE_SLOT] {
+            self.last_good_axes[HANDBRAKE_SLOT] = out.handbrake;
         }
 
         if self.plan.combine_pedals {
@@ -1251,6 +1288,43 @@ fn process_steering_axis(
     };
     value = apply_steering_scale(value, side_scale);
     apply_smoothing(filter, value, tuning.smoothing)
+}
+
+/// v2.0.20 (RC-1): which axes P2-1 holds on this frame, in slot
+/// order (steering, accel, brake, clutch, handbrake). No flag, no
+/// hold. Flag set: only the axes whose sample sits at rail (0 or
+/// `DEFAULT_MAX_MV` mV) are held — the board's rail-stuck
+/// criterion fires on exactly those. No axis at rail means the flag
+/// came from jitter or an I2C failure, which no frame value can
+/// identify, so every PRESENT axis is held (the pre-v2.0.20
+/// behaviour for present axes). A
+/// missing axis (`None`) is never held — there is no sample to
+/// distrust, and the axis processors already emit neutral for it;
+/// that also covers the fallback: a missing axis stays neutral
+/// instead of holding a stale last-good value.
+fn invalid_hold_axes(frame: &StreamFrame) -> [bool; 5] {
+    if !frame.flags.axis_invalid {
+        return [false; 5];
+    }
+    let slots = [
+        STEERING_SLOT,
+        ACCEL_SLOT,
+        BRAKE_SLOT,
+        CLUTCH_SLOT,
+        HANDBRAKE_SLOT,
+    ];
+    let mut held = [false; 5];
+    for (i, slot) in slots.iter().enumerate() {
+        held[i] = matches!(frame.axes_mv[*slot], Some(v) if v == 0 || v >= DEFAULT_MAX_MV);
+    }
+    if !held.iter().any(|held| *held) {
+        // No axis at rail: hold every PRESENT axis (a missing one
+        // stays neutral — see above).
+        for (i, slot) in slots.iter().enumerate() {
+            held[i] = frame.axes_mv[*slot].is_some();
+        }
+    }
+    held
 }
 
 /// Pedal chain for one tick: map → saturation → bite → deadzone →
@@ -2066,6 +2140,69 @@ mod tests {
         let out = pipe.process(&bad);
         assert!(approx(out.steering, 0.0));
         assert!(approx(out.accelerator, 0.0));
+    }
+
+    #[test]
+    fn axis_invalid_flag_holds_only_the_railed_axis() {
+        // v2.0.20 (RC-1): handbrake at rail (0, released) + steering
+        // moving + axis_invalid set — steering must keep flowing live
+        // (pre-fix it froze at its last good value); only the
+        // handbrake is held. With NO axis at rail the flag falls
+        // back to holding every present axis (jitter / I2C cause).
+        let mut pipe = ProcessingPipeline::new(plain_plan());
+        let out = pipe.process(&frame(&[(0, 3300), (1, 1800), (4, 1650)], &[], 0));
+        assert!(approx(out.steering, 1.0));
+        assert!(approx(out.accelerator, 0.5));
+        // Handbrake 1650 mV: (1650-300)/(3300-300) = 0.45.
+        assert!(
+            approx(out.handbrake, 0.45),
+            "handbrake baseline: {}",
+            out.handbrake
+        );
+        let flags = StreamFlags {
+            axis_invalid: true,
+            ..Default::default()
+        };
+        // Steering moves to 2550 (0.5), handbrake drops to rail 0.
+        let bad = StreamFrame::new(2, 5000, flags, &[(0, 2550), (1, 1800), (4, 0)], &[], 0);
+        let out = pipe.process(&bad);
+        assert!(
+            approx(out.steering, 0.5),
+            "steering must follow live: {}",
+            out.steering
+        );
+        assert!(
+            approx(out.accelerator, 0.5),
+            "accel must follow live: {}",
+            out.accelerator
+        );
+        assert!(
+            approx(out.handbrake, 0.45),
+            "railed handbrake held: {}",
+            out.handbrake
+        );
+        // No axis at rail: flag set, all values mid-range — everything holds.
+        let bad2 = StreamFrame::new(3, 5000, flags, &[(0, 300), (1, 300), (4, 300)], &[], 0);
+        let out = pipe.process(&bad2);
+        assert!(
+            approx(out.steering, 0.5),
+            "fallback holds steering: {}",
+            out.steering
+        );
+        assert!(
+            approx(out.accelerator, 0.5),
+            "fallback holds accel: {}",
+            out.accelerator
+        );
+        assert!(
+            approx(out.handbrake, 0.45),
+            "fallback holds handbrake: {}",
+            out.handbrake
+        );
+        // Flag clears: new values flow again.
+        let out = pipe.process(&frame(&[(0, 300), (4, 3300)], &[], 0));
+        assert!(approx(out.steering, -1.0));
+        assert!(approx(out.handbrake, 1.0));
     }
 
     #[test]

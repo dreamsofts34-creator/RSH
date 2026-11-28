@@ -1151,7 +1151,7 @@ mod tests {
         }
     }
 
-    /// Factory default blob (188 B, cfgVersion 1) as the board's live config.
+    /// Factory default blob (156 B, cfgVersion 1) as the board's live config.
     fn good_blob() -> Vec<u8> {
         factory_default_blob()
             .encode()
@@ -1188,9 +1188,9 @@ mod tests {
         blob.encode().expect("ADC2 blob encodes")
     }
 
-    /// A valid 1788 B blob (factory records + 100 unassigned `LED_STRIP`
+    /// A valid 1756 B blob (factory records + 100 unassigned `LED_STRIP`
     /// records, `pinA == 0xFF`): stages in two `SET_CFG` chunks
-    /// (1016 + 772) and reads back in two `GET_CFG` replies (1019 + 769).
+    /// (1016 + 740) and reads back in two `GET_CFG` replies (1019 + 737).
     /// Pinless LED records are the filler because the C++ validator
     /// counts EVERY record toward the limits — 100 pinless BUTTON
     /// records would be `n_btn = 103 > 64` (firmware UNSUPPORTED) —
@@ -1209,7 +1209,7 @@ mod tests {
             ));
         }
         let encoded = blob.encode().expect("big blob encodes");
-        assert_eq!(encoded.len(), 1788);
+        assert_eq!(encoded.len(), 1756);
         encoded
     }
 
@@ -1235,7 +1235,7 @@ mod tests {
         assert_eq!(txn.client().transport().stored, good_blob_v2());
         assert_eq!(txn.last_good_blob(), Some(good_blob_v2().as_slice()));
         assert_eq!(txn.staged_blob(), None);
-        // One GET_CFG (last-good read), one SET_CFG (188 B, one chunk),
+        // One GET_CFG (last-good read), one SET_CFG (156 B, one chunk),
         // one COMMIT, one CONFIRM.
         let board = txn.client().transport();
         assert_eq!(board.count_cmd(Opcode::GetCfg as u8), 1);
@@ -1353,10 +1353,10 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].offset, 0);
         assert_eq!(chunks[0].data.len(), 1016);
-        assert_eq!(chunks[0].total, 1788);
+        assert_eq!(chunks[0].total, 1756);
         assert_eq!(chunks[1].offset, 1016);
-        assert_eq!(chunks[1].data.len(), 772);
-        assert_eq!(chunks[1].total, 1788);
+        assert_eq!(chunks[1].data.len(), 740);
+        assert_eq!(chunks[1].total, 1756);
         txn.commit().await.expect("commit succeeds");
         txn.confirm().await.expect("confirm succeeds");
         assert_eq!(txn.client().transport().stored, big);
@@ -1368,7 +1368,7 @@ mod tests {
         let mut txn = txn_with(big.clone());
         let read = txn.read_current_blob().await.expect("read-back succeeds");
         assert_eq!(read, big);
-        // 1019 B first (board clamp), then the remaining 769 B.
+        // 1019 B first (board clamp), then the remaining 737 B.
         assert_eq!(txn.client().transport().count_cmd(Opcode::GetCfg as u8), 2);
     }
 

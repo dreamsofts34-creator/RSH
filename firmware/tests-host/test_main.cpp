@@ -583,6 +583,26 @@ int main() {
       inv = x.update(3300, 3300, true, (uint32_t)t, false);
     CHECK(inv == false);
     CHECK(inv == false);
+    // v2.0.20 (RC-1): released handbrake (railTest=false — inputs.cpp
+    // call site, I2C jaisa hi path) — rail 0 par 10 s + doosre axes
+    // move kar rahe hon to bhi VALID. Pehle rail test chalta tha:
+    // released handbrake `axisInvalidMask |= 0x10` lagata tha aur
+    // pipeline (P2-1) paanchon axes freeze kar deta tha.
+    AxisHealth hb;
+    inv = false;
+    for (int t = 0; t <= 10000; t += 5)
+      inv = hb.update(0, 4095, true, (uint32_t)t, false);
+    CHECK(inv == false);
+    // v2.0.20 (user patch rsh-fw-handbrake-fix.zip): global flag
+    // sirf bits 0-3 — handbrake bit 4 kabhi flag nahi uthata.
+    // Yehi asal freeze closer hai: railTest=false akela kaafi
+    // nahi tha, floating pin jitter rule (EMA > 150) se bhi 0x10
+    // lagata hai; mask bit 4 ko flag se bahar rakhta hai.
+    CHECK(rsh_axis_invalid_from_mask(0x00) == false);
+    CHECK(rsh_axis_invalid_from_mask(0x10) == false);  // handbrake only
+    CHECK(rsh_axis_invalid_from_mask(0x01) == true);   // steering
+    CHECK(rsh_axis_invalid_from_mask(0x08) == true);   // clutch
+    CHECK(rsh_axis_invalid_from_mask(0x1F) == true);   // sab + handbrake
   }
 
   // 8e) mV fallback / restore faisle (F13) + pedal button-mode cadence (F7)
@@ -786,11 +806,11 @@ int main() {
       0x00, 0x00, 0x00, 0x40, 0x00, 0x10, 0x00, 0xeb, 0x52, 0x52, 0x53, 0x48,
       0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
       0x00, 0x87, 0x9d};
-    // fw patch 4.0.7 (CRC16-CCITT-FALSE, LE: 0x5982 — patch byte badla
+    // fw patch 4.0.8 (CRC16-CCITT-FALSE, LE: 0xC1D6 — patch byte badla
     // to CRC bhi badla; protocol_v2_vectors.py ka ctrl_get_caps_reply bhi dekho).
     const uint8_t ctrl_reply[29] = {0x52, 0x53, 0x48, 0x43, 0x81, 0x01, 0x00, 0x12,
-      0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x04, 0x00, 0x07, 0x02,
-      0x02, 0x08, 0x40, 0x04, 0x06, 0x00, 0x00, 0x82, 0x59};
+      0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x04, 0x00, 0x08, 0x02,
+      0x02, 0x08, 0x40, 0x04, 0x06, 0x00, 0x00, 0xd6, 0xc1};
     rsh_v2_ctrl_t cf;
     CHECK(rsh_v2_ctrl_parse_structure(ctrl_caps, sizeof(ctrl_caps), &cf) == RSH_V2_OK);
     CHECK(cf.cmd == 0x01 && cf.req_id == 1 && cf.len == 0);
@@ -802,7 +822,7 @@ int main() {
     CHECK(rsh_v2_ctrl_parse_structure(ctrl_reply, sizeof(ctrl_reply), &cf) == RSH_V2_OK);
     CHECK(cf.cmd == 0x81 && cf.payload[0] == RSH_CTRL_OK && cf.len == 18);
     CHECK(cf.payload[13] == 64);  // nBtnMax (wire)
-    CHECK(cf.payload[9] == 7);    // fw patch 4.0.7
+    CHECK(cf.payload[9] == 8);    // fw patch 4.0.8
     CHECK(cf.payload[10] == 2 && cf.payload[11] == 2);  // proto 2.2
     // build roundtrip golden se match kare
     {
@@ -1050,8 +1070,8 @@ int main() {
     // RSH_CAPS_FW_* hi net.cpp HELLO reply ka bhi source hai (single source
     // of truth) — 4.0.0 hard-code dobara na aaye, is liye constants + string
     // dono yahan bandhe hain.
-    CHECK(RSH_CAPS_FW_MAJOR == 4 && RSH_CAPS_FW_MINOR == 0 && RSH_CAPS_FW_PATCH == 7);
-    CHECK(strcmp(FIRMWARE_VERSION, "4.0.7") == 0);
+    CHECK(RSH_CAPS_FW_MAJOR == 4 && RSH_CAPS_FW_MINOR == 0 && RSH_CAPS_FW_PATCH == 8);
+    CHECK(strcmp(FIRMWARE_VERSION, "4.0.8") == 0);
 
     // --- FW-11: default pin table mein naye modules ki rows ---
     RshCapsEntry table[20];
@@ -1092,7 +1112,7 @@ int main() {
       CHECK(blen == 18 + 8u * ntab);
       CHECK(body[0] == RSH_CTRL_OK);
       CHECK(memcmp(body + 1, mac, 6) == 0);
-      CHECK(body[7] == 4 && body[8] == 0 && body[9] == 7);   // fw 4.0.7 (Round 2 W3 FIX-1)
+      CHECK(body[7] == 4 && body[8] == 0 && body[9] == 8);   // fw 4.0.8 (Round 2 W3 FIX-1)
       CHECK(body[10] == 2 && body[11] == 2);                 // proto 2.2
       CHECK(body[12] == 8 && body[13] == 64 && body[14] == 4);
       CHECK(body[15] == 6 && body[16] == 0 && body[17] == ntab);
@@ -2294,7 +2314,7 @@ int main() {
     CHECK(rsh_caps_build_body(body, 81, mac, 6, 0, table, 8) == 0);  // 82 B body, 81 B buffer — chhota
     CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 41) == 0);
     CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 8) == 82);
-    CHECK(body[0] == RSH_CTRL_OK && body[7] == 4 && body[8] == 0 && body[9] == 7);  // fw 4.0.7 (Round 2 W3 FIX-1)
+    CHECK(body[0] == RSH_CTRL_OK && body[7] == 4 && body[8] == 0 && body[9] == 8);  // fw 4.0.8 (Round 2 W3 FIX-1)
     CHECK(body[10] == 2 && body[11] == 2);  // proto 2.2
     CHECK(body[12] == 8 && body[13] == 64 && body[14] == 4);
     CHECK(body[15] == 6 && body[17] == 8);
@@ -3870,6 +3890,59 @@ int main() {
     CHECK(rsh_cfg_blob_validate(dblob, dlen, NULL, NULL) == RSH_CTRL_UNSUPPORTED);
     CHECK(rsh_pinmap_from_blob(dblob, dlen, &dm) == 0);
 
+    // --- v2.0.20 (RC-2): 2.0.15-era legacy blob (11 records, 2
+    // ENCODER samet) — validator abhi bhi UNSUPPORTED kehta hai
+    // (SET_CFG fail-closed, upar), lekin BOOT migration strip
+    // karke load karti hai: 9 records, clutch record MAUJOOD.
+    // Yehi regression thi: 4.0.7 factory fallback (9 records,
+    // clutch NAHI) leta tha, clutch hamesha 0 rehta tha.
+    {
+      uint8_t legacy[11 * 16];
+      rsh_cfg_record(legacy + 0 * 16, RSH_CFG_TYPE_AXIS_ADC, 0, 0, 34, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(legacy + 1 * 16, RSH_CFG_TYPE_AXIS_ADC, 1, 0, 35, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(legacy + 2 * 16, RSH_CFG_TYPE_AXIS_ADC, 2, 0, 36, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(legacy + 3 * 16, RSH_CFG_TYPE_AXIS_ADC, 3, 0, 33, 0xFF, 0xFF, NULL);  // clutch
+      rsh_cfg_record(legacy + 4 * 16, RSH_CFG_TYPE_AXIS_ADC, 4, 0, 32, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(legacy + 5 * 16, RSH_CFG_TYPE_BATTERY, 0, 0, 39, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(legacy + 6 * 16, RSH_CFG_TYPE_BUTTON, 0, 0, 27, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(legacy + 7 * 16, RSH_CFG_TYPE_BUTTON, 1, 0, 13, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(legacy + 8 * 16, RSH_CFG_TYPE_BUTTON, 2, 0, 4, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(legacy + 9 * 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 19, 0xFF, NULL);
+      rsh_cfg_record(legacy + 10 * 16, RSH_CFG_TYPE_ENCODER, 1, 0, 16, 17, 0xFF, NULL);
+      uint8_t legblob[256];
+      size_t leglen = rsh_cfg_blob_build(legblob, legacy, 11, 1);
+      CHECK(leglen == 188);  // 8 + 11*16 + 4
+      // Validator abhi bhi reject karta hai (SET_CFG fail-closed).
+      CHECK(rsh_cfg_blob_validate(legblob, leglen, NULL, NULL) == RSH_CTRL_UNSUPPORTED);
+      RshPinMap legmap;
+      CHECK(rsh_pinmap_from_blob(legblob, leglen, &legmap) == 0);
+      // Boot migration: strip -> 9 records (156 B), validate OK,
+      // clutch record maujood (pin 33).
+      uint8_t migblob[256];
+      size_t miglen = rsh_cfg_strip_encoder_records(legblob, leglen, migblob);
+      CHECK(miglen == 156);
+      CHECK(rsh_cfg_blob_validate(migblob, miglen, NULL, NULL) == RSH_CTRL_OK);
+      CHECK(rsh_pinmap_from_blob(migblob, miglen, &legmap) == 1);
+      CHECK(legmap.clutch == 33);
+      CHECK(legmap.steer == 34);
+      CHECK(legmap.handbrake == 32);
+      rsh_cfg_txn_t migt;
+      rsh_cfg_txn_init(&migt);
+      CHECK(rsh_cfg_txn_load_current(&migt, migblob, miglen) == RSH_CTRL_OK);
+      // In-place strip bhi kaam karta hai (boot fw34_scratch jaisa).
+      uint8_t inplace[256];
+      memcpy(inplace, legblob, leglen);
+      CHECK(rsh_cfg_strip_encoder_records(inplace, leglen, inplace) == 156);
+      CHECK(rsh_cfg_blob_validate(inplace, 156, NULL, NULL) == RSH_CTRL_OK);
+      // Corrupt blob migrate nahi hota (CRC launder nahi hoti).
+      uint8_t corrupt[256];
+      memcpy(corrupt, legblob, leglen);
+      corrupt[20] ^= 0xFF;
+      CHECK(rsh_cfg_strip_encoder_records(corrupt, leglen, migblob) == 0);
+      // ENCODER-free blob par strip no-op hai (0).
+      CHECK(rsh_cfg_strip_encoder_records(migblob, miglen, migblob) == 0);
+    }
+
     // --- Round 2 W3 FIX-2: rsh_pinmap_uses_pin — fixed pedal-button pins
     // (25/26) blob ke kisi aur function ko diye gaye hon to 1 (inputs.cpp
     // unhein fixed button ke tor par parhna band karta hai — warna ek hi
@@ -4538,7 +4611,7 @@ int main() {
     CHECK(dec.frames_ok == 1);
   }
 
-  // ============ §34: firmware v4.0.7 (F-01..F-16, v2.2) ============
+  // ============ §34: firmware v4.0.8 (F-01..F-16, v2.2) ============
   // Net.cpp / rsh.ino wiring (AP open/password, serial HELO, horn OR)
   // host par nahi chalti — wo pio build + real-board HIL se cover hoti
   // hai (gate doc). Yahan pure logic hai. Pairing khatam (D1/D7):
@@ -4961,8 +5034,8 @@ int main() {
 
     // --- F-12: version single source (version.h + modules.h + config.h) ---
     CHECK(RSH_FW_VERSION_MAJOR == 4 && RSH_FW_VERSION_MINOR == 0 &&
-          RSH_FW_VERSION_PATCH == 7);
-    CHECK(strcmp(RSH_FW_VERSION_STRING, "4.0.7") == 0);
+          RSH_FW_VERSION_PATCH == 8);
+    CHECK(strcmp(RSH_FW_VERSION_STRING, "4.0.8") == 0);
     CHECK(strcmp(FIRMWARE_VERSION, RSH_FW_VERSION_STRING) == 0);
     CHECK(RSH_CAPS_FW_MAJOR == RSH_FW_VERSION_MAJOR &&
           RSH_CAPS_FW_MINOR == RSH_FW_VERSION_MINOR &&

@@ -234,14 +234,19 @@ impl ConfigBlob {
     }
 }
 
-/// The factory default blob (§3.6, Phase G C3): 188 B, 11 records,
+/// The factory default blob (§3.6, Phase G C3): 156 B, 9 records,
 /// `cfgVersion` 1. Axes 0:34, 1:35, 2:36, 4:32; battery 0:39;
-/// buttons 0:27, 1:33, 2:4; encoders 0:23/19, 1:16/17; LED strip 0:21.
-/// Clutch is OFF by default (no `AXIS_ADC` slot 3 record) and the
-/// shifter is sequential (no SHIFTER record).
+/// buttons 0:27, 1:33, 2:4; LED strip 0:21. Clutch is OFF by
+/// default (no `AXIS_ADC` slot 3 record) and the shifter is
+/// sequential (no SHIFTER record).
+/// v2.0.20 (item 6): the 2 ENCODER records (0:23/19, 1:16/17)
+/// are GONE — encoders were deleted in v2.0.19 and the firmware
+/// factory blob (`rsh_cfg_factory_blob`, 9 records, 156 B) never
+/// had them; the Rust blob still carried 11 records / 188 B, so
+/// PC and firmware disagreed on what "factory" means.
 #[must_use]
 pub fn factory_default_blob() -> ConfigBlob {
-    use record_type::{AXIS_ADC, BATTERY, BUTTON, ENCODER, LED_STRIP};
+    use record_type::{AXIS_ADC, BATTERY, BUTTON, LED_STRIP};
     ConfigBlob::new(
         1,
         vec![
@@ -253,8 +258,6 @@ pub fn factory_default_blob() -> ConfigBlob {
             ConfigRecord::new(BUTTON, 0, 27, 0xFF, 0xFF),
             ConfigRecord::new(BUTTON, 1, 33, 0xFF, 0xFF),
             ConfigRecord::new(BUTTON, 2, 4, 0xFF, 0xFF),
-            ConfigRecord::new(ENCODER, 0, 23, 19, 0xFF),
-            ConfigRecord::new(ENCODER, 1, 16, 17, 0xFF),
             ConfigRecord::new(LED_STRIP, 0, 21, 0xFF, 0xFF),
         ],
     )
@@ -431,13 +434,13 @@ mod tests {
     use super::{ConfigBlob, factory_default_blob};
 
     #[test]
-    fn factory_blob_is_188_bytes() {
+    fn factory_blob_is_156_bytes() {
         let blob = factory_default_blob();
         let encoded = blob.encode().expect("factory blob encodes");
-        assert_eq!(encoded.len(), 188);
+        assert_eq!(encoded.len(), 156);
         assert_eq!(encoded[0..4], *b"RSHG");
         assert_eq!(encoded[4], 2);
-        assert_eq!(encoded[5], 11);
+        assert_eq!(encoded[5], 9);
         let decoded = ConfigBlob::decode(&encoded).expect("factory blob decodes");
         assert_eq!(decoded, blob);
     }
